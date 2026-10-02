@@ -728,12 +728,12 @@ export const METRICS = Object.freeze({
 			'entity\u2019s prefix, ignored), unreadable, error; context = the observer, probe or render. moved/probe ' +
 			'per day is the re-slug rate. A steady stream of moved alternating between probe and render means the ' +
 			'endpoint and the page disagree about the canonical. ' +
-			'canonical_adopt = one emit per adoption decision of the change probe (changeProbe.adoptCanonical), ' +
-			'made only when the canonical the endpoint names is ANOTHER URL than the one probed: adopted (a target ' +
+			'canonical_adopt = one emit per adoption decision (entities.adopt), made only when an observation names ' +
+			'a canonical that is ANOTHER URL than the one observed: adopted (a target ' +
 			'filed due now), reactivated (a canonical-verdict suppression lifted, due now), would-adopt (either, in ' +
 			'a dry run — THE DRY-RUN NUMBER), exists (the canonical has a target in rotation — every duplicate ' +
-			'spelling, nightly), suppressed (its target is suppressed for a reason the probe does not overturn), ' +
-			'recent (adopted within retryAfter), capped (past maxPerPass), refused (unkeyable, off the domain ' +
+			'spelling, nightly), suppressed (its target is suppressed for a reason the origin\u2019s word does not overturn), ' +
+			'recent (adopted within retryAfter), capped (past maxPerHour on this node), refused (unkeyable, off the domain ' +
 			'allowlist, or not on a prerender route), error. ' +
 			'raw_cache = one emit per raw-document store attempt, split by outcome: `stored`, `stored-unshared`, ' +
 			'or the reason it was refused (not-200, staging, has-cookie, content-type, no-store, no-body, ' +
@@ -890,7 +890,7 @@ export const METRICS = Object.freeze({
 					'entity_gate = entity discovery gate evaluations, by outcome. entity_serve = entity-serve ' +
 					'evaluations of true misses, by outcome. entity_canonical = observations of an ' +
 					'entity\u2019s canonical (entities.enabled). canonical_adopt = the change probe\u2019s adoption ' +
-					'decisions (changeProbe.adoptCanonical). raw_cache = raw-document store ' +
+					'decisions (entities.adopt). raw_cache = raw-document store ' +
 					'attempts. negative_cache = the negative cache (render.negative): stores, refusals, re-checks and ' +
 					'dry-run verdicts. negative_gap = age of a stored 404 when a request for it arrived. gone_reopen = ' +
 					'gone-suppressed targets reopened on an origin 200. suppression_lifted = suppressions a render ' +
@@ -1164,7 +1164,7 @@ export const metrics = Object.freeze({
 	entityCanonical: (outcome, from) =>
 		server.recordAnalytics(true, 'prerender_ops', 'entity_canonical', outcome, from ?? null),
 
-	/** One adoption decision of the change probe (util/entity.js `createCanonicalObserver`) — a prerender_ops series. */
+	/** One adoption decision (util/entity.js `resolveCanonical`) — a prerender_ops series. */
 	canonicalAdopt: (outcome) => server.recordAnalytics(true, 'prerender_ops', 'canonical_adopt', outcome, null),
 
 	/**

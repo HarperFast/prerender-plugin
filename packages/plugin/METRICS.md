@@ -200,10 +200,10 @@ Notes that bite:
   what it did to the registry (`new`, `moved`, `same`, `older`, `foreign`, `unreadable`, `error`),
   context = the observer (`probe` or `render`). `moved`/`probe` per day is the re-slug rate; `moved`
   alternating between `probe` and `render` for the same entities means the endpoint and the page
-  disagree about the canonical. `canonical_adopt`: one emit per adoption decision, made only when the
-  canonical the endpoint names is another URL than the one probed: `adopted`, `reactivated`,
-  `would-adopt` (**the dry-run number**), `exists` (every duplicate spelling, nightly), `suppressed`,
-  `recent`, `capped`, `refused`, `error`.
+  disagree about the canonical. `canonical_adopt` (`entities.adopt`): one emit per adoption decision,
+  made only when an observation names a canonical that is another URL than the one observed: `adopted`,
+  `reactivated`, `would-adopt` (**the dry-run number**), `exists` (every duplicate spelling, nightly),
+  `suppressed`, `recent`, `capped` (past `maxPerHour` on this node), `refused`, `error`.
 - **The change probe's `probe_*` series changed shape in v0.97.0, and the table row above predates
   it.** (1) The pass counters are emitted **per probed batch as increments**, not once when a pass
   ends: a nine-hour pass is no longer one row that a dropped analytics window loses whole, and a pass

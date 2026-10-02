@@ -183,7 +183,7 @@ test('OFF (the default): no read, no write, nothing counted', async () => {
 	assert.deepEqual(writes, []);
 	assert.deepEqual(analytics, []);
 	applyOptions({});
-	assert.deepEqual(config.entities, { enabled: false });
+	assert.equal(config.entities.enabled, false);
 });
 
 test('a stored render reports the canonical its page declared', async () => {
@@ -199,24 +199,21 @@ test('a stored render reports the canonical its page declared', async () => {
 
 // ── adoption ─────────────────────────────────────────────────────────────────────────────────────
 
-const SETTINGS = { enabled: true, dryRun: false, maxPerPass: 500, retryAfter: 7 * 24 * HOUR };
+const SETTINGS = { enabled: true, dryRun: false, maxPerHour: 500, retryAfter: 7 * 24 * HOUR };
 const observer = ({
 	target = null,
 	settings = {},
 	probeDryRun = false,
 	now = Date.now,
-	passId = null,
 	fileTarget = null,
 	markAdopted = undefined,
 	otherSpelling = undefined,
 } = {}) => {
 	const filed = [];
 	const read = [];
-	const watch = entity.createCanonicalObserver({
+	const resolve = entity.createCanonicalResolver({
 		settings: { ...SETTINGS, ...settings },
-		probeDryRun,
 		now,
-		passId,
 		readTarget: async (url) => {
 			read.push(url);
 			return typeof target === 'function' ? target(url) : target;
@@ -225,6 +222,8 @@ const observer = ({
 		...(markAdopted ? { markAdopted } : {}),
 		...(otherSpelling ? { otherSpelling } : {}),
 	});
+	// The change probe's call: its pass's dry run rides on each observation.
+	const watch = ({ url, value }) => resolve({ url, value, from: 'probe', dryRun: probeDryRun });
 	return { watch, filed, read };
 };
 const adopts = () => ops('canonical_adopt').map(([outcome]) => outcome);
@@ -343,38 +342,27 @@ test('a canonical adopted within retryAfter is not filed again — a bad canonic
 	assert.equal(filed.length, 2);
 });
 
-test('at most maxPerPass a pass; a new observer is a new pass', async () => {
-	const { watch, filed } = observer({ settings: { maxPerPass: 2 } });
+test('at most maxPerHour an hour on this node, shared by every resolver; the next hour starts afresh', async () => {
+	let clock = Date.UTC(2026, 9, 2, 10, 0, 0);
+	const settings = { maxPerHour: 2 };
+	const one = observer({ settings, now: () => clock });
+	// Another resolver stands in for another worker thread, or another observer: one budget for the node.
+	const two = observer({ settings, now: () => clock });
 	const outcomes = [];
-	for (let id = 1; id <= 4; id++) {
-		outcomes.push(
-			(await watch({ url: `${ORIGIN}/product/prd-${id}/old.jsp`, value: `/product/prd-${id}/new.jsp` })).adopt
-		);
-	}
+	for (let id = 1; id <= 4; id++) outcomes.push((await reslug(id % 2 ? one.watch : two.watch, id)).adopt);
 	assert.deepEqual(outcomes, ['adopted', 'adopted', 'capped', 'capped']);
-	assert.equal(filed.length, 2);
-	const next = observer({ settings: { maxPerPass: 2 } });
-	assert.equal(
-		(await next.watch({ url: `${ORIGIN}/product/prd-9/old.jsp`, value: '/product/prd-9/new.jsp' })).adopt,
-		'adopted'
-	);
+	assert.equal(one.filed.length + two.filed.length, 2);
+	clock += HOUR;
+	assert.equal((await reslug(one.watch, 9)).adopt, 'adopted', 'a new hour, a new budget');
 });
 
 const reslug = (watch, id) =>
 	watch({ url: `${ORIGIN}/product/prd-${id}/old.jsp`, value: `/product/prd-${id}/new.jsp` });
 
-test('a RESUMED pass shares the cap of the pass it continues; a put that fails gives its slot back', async () => {
-	const settings = { maxPerPass: 1 };
-	assert.equal((await reslug(observer({ settings, passId: 1000 }).watch, 1)).adopt, 'adopted');
-	assert.equal(
-		(await reslug(observer({ settings, passId: 1000 }).watch, 2)).adopt,
-		'capped',
-		'a restart mid-pass does not buy a fresh cap'
-	);
+test('a put that fails gives its slot back', async () => {
 	let failing = true;
 	const flaky = observer({
-		settings,
-		passId: 2000,
+		settings: { maxPerHour: 1 },
 		fileTarget: async () => {
 			if (failing) throw new Error('write fault');
 		},
@@ -382,6 +370,7 @@ test('a RESUMED pass shares the cap of the pass it continues; a put that fails g
 	assert.equal((await reslug(flaky.watch, 3)).adopt, 'error');
 	failing = false;
 	assert.equal((await reslug(flaky.watch, 4)).adopt, 'adopted');
+	assert.equal((await reslug(flaky.watch, 5)).adopt, 'capped');
 });
 
 test('the adoption stands when only its memory fails to write', async () => {
@@ -446,23 +435,21 @@ test('a failed adoption is counted and swallowed', async () => {
 
 test('config: the registry is off by default; adoption is on but dry run, bounded', () => {
 	applyOptions({});
-	assert.deepEqual(config.entities, { enabled: false });
-	assert.deepEqual(config.changeProbe.adoptCanonical, {
-		enabled: true,
-		dryRun: true,
-		maxPerPass: 500,
-		retryAfter: 7 * 24 * HOUR,
+	assert.deepEqual(config.entities, {
+		enabled: false,
+		adopt: { enabled: true, dryRun: true, maxPerHour: 60, retryAfter: 7 * 24 * HOUR },
 	});
+	assert.equal('adoptCanonical' in config.changeProbe, false, 'one home: the registry\u2019s own group');
 });
 
 // ── wiring ─────────────────────────────────────────────────────────────────────────────────────
 
-test('the sweep wires one observer per pass; the canary wires none; the render result reports its canonical', async () => {
+test('the sweep wires the resolver with its pass\u2019s dry run; the canary wires none; the render result reports its canonical', async () => {
 	const SRC = new URL('../src/', import.meta.url).pathname;
 	const probe = await readFile(join(SRC, 'util', 'changeProbe.js'), 'utf8');
-	// The PASS's dry run (an operator's measure-only sweep sets it) and its origin (a resume shares the cap).
+	// The PASS's dry run: an operator's measure-only sweep sets it.
 	const wired =
-		/onCanonical: entitiesOn\(\) \? createCanonicalObserver\(\{ probeDryRun: limits\.dryRun, passId: passOrigin \}\)/g;
+		/onCanonical: entitiesOn\(\)\s*\? \(\{ url, value \}\) => resolveCanonical\(\{ url, value, from: 'probe', dryRun: limits\.dryRun \}\)/g;
 	assert.equal([...probe.matchAll(wired)].length, 1);
 	const queue = await readFile(join(SRC, 'resources', 'RenderQueue.js'), 'utf8');
 	assert.match(queue, /observeRenderedCanonical\(scheduleUrl, describing\.pageFacts,/);

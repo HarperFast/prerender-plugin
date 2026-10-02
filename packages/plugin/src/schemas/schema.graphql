@@ -172,8 +172,8 @@ type Entity @table(database: "render_service") {
 	# render claimed before a re-slug, landing after the probe saw it) does not.
 	canonicalAt: Date
 	firstSeenAt: Date
-	# The last canonical the change probe ADOPTED a target for, and when: a canonical that did not take is
-	# not re-filed until `changeProbe.adoptCanonical.retryAfter` has passed.
+	# The last canonical a target was ADOPTED for, and when: a canonical that did not take is not re-filed
+	# until `entities.adopt.retryAfter` has passed.
 	adoptedCanonical: String
 	adoptedAt: Date
 }
