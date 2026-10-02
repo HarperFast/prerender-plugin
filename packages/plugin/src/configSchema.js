@@ -1534,7 +1534,8 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'rule that maps `canonical` in `pageCheck.fields` (an endpoint field holding the canonical path or URL, ' +
 					'e.g. `{ slot: 6, fact: canonical, compare: path }`). Every probe of a URL on a route with an ' +
 					'`entityPrefix` records the canonical the endpoint names for its entity. When that is ANOTHER URL of ' +
-					'the same entity and no target holds it in rotation, its target is filed due now and urgent, as ' +
+					'the same entity and no target holds it in rotation (in any spelling: `%27` and an apostrophe are one ' +
+					'document), its target is filed due now and urgent, as ' +
 					'redirect adoption does — a target suppressed as a canonical verdict (`canonical-mismatch`, ' +
 					'`canonical-variant`) is reactivated the same way; one suppressed for any other reason is left alone.\n\n' +
 					'WHY: a product whose slug changes while it is out of stock is not in the sitemap, so its new ' +
@@ -1552,13 +1553,16 @@ export const configSchema = group('Prerender plugin configuration.', {
 					dryRun: option(
 						true,
 						'Count `would-adopt` and file nothing. The default, because the number to know first is how many ' +
-							'canonicals a pass would file. The probe\u2019s own `dryRun` files nothing either.'
+							'canonicals a pass would file: `would-adopt` plus `capped` (the cap counts would-adopts too). A ' +
+							'pass run as a dry run — the probe\u2019s own `dryRun`, or an operator\u2019s measure-only sweep — ' +
+							'files nothing either.'
 					),
 					maxPerPass: option(
 						500,
-						'Most targets one pass files on this node. Measured on one deployment, products re-slug ~100 ' +
-							'times a day cluster-wide; a site-wide re-spelling would file every product at once, so past ' +
-							'this the pass counts `capped` and leaves the rest to the sitemap and the next pass.',
+						'Most targets one pass files on this node, counted across the pass\u2019s resumes. Measured on one ' +
+							'deployment, products re-slug ~100 times a day cluster-wide; a site-wide re-spelling would file ' +
+							'every product at once, so past this the pass counts `capped` and leaves the rest to the sitemap ' +
+							'and the next pass.',
 						{ min: 0 }
 					),
 					retryAfter: option(

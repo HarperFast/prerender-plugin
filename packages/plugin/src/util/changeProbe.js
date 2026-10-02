@@ -2538,8 +2538,9 @@ export const runProbeSweepOnce = async ({
 			readCheck: config.changeProbe.serveCheck?.enabled ? readPageCheck : null,
 			skipCheckedSince: serveChecksArmed() ? (resume?.originStartedAt ?? startedAt) : null,
 			recordCheck: config.changeProbe.serveCheck?.enabled ? writePageCheck : null,
-			// One observer per pass: it counts this pass's adoptions against `adoptCanonical.maxPerPass`.
-			onCanonical: entitiesOn() ? createCanonicalObserver() : null,
+			// One observer per pass, counting adoptions by the pass's origin (a resume shares its cap), and
+			// filing nothing when THIS pass is a dry run — an operator's measure-only sweep included.
+			onCanonical: entitiesOn() ? createCanonicalObserver({ probeDryRun: limits.dryRun, passId: passOrigin }) : null,
 			guard: theMappingGuard(),
 			...limits,
 			// Rows this pass (or the pass it resumes) already probed — see `processOne`. The same for a

@@ -20,6 +20,8 @@ import { join } from 'node:path';
 const analytics = [];
 const entities = new Map(); // id -> row
 const writes = []; // ['put' | 'patch', id, data]
+const targets = new Map(); // url -> { state } for the sibling read
+const searches = [];
 let entityFault = null;
 
 before(async () => {
@@ -36,6 +38,13 @@ before(async () => {
 			return null;
 		}
 		static async put() {}
+		// The sibling read (`spelledOtherwise`): ascending keys from the condition, the projection, the limit.
+		static async *search(query, context) {
+			searches.push({ query, context });
+			const from = query.conditions[0].value;
+			const keys = [...targets.keys()].filter((key) => key >= from).sort();
+			for (const key of keys.slice(0, query.limit)) yield { url: key, state: targets.get(key).state ?? null };
+		}
 	}
 	globalThis.databases = {
 		coordination: {
@@ -97,8 +106,11 @@ beforeEach(() => {
 	analytics.length = 0;
 	entities.clear();
 	writes.length = 0;
+	targets.clear();
+	searches.length = 0;
 	entityFault = null;
 	configure();
+	entity.resetAdoptionCountsForTest();
 });
 
 const ops = (series) => analytics.filter((a) => a[1] === 'prerender_ops' && a[2] === series).map((a) => a.slice(3));
@@ -188,18 +200,30 @@ test('a stored render reports the canonical its page declared', async () => {
 // ── adoption ─────────────────────────────────────────────────────────────────────────────────────
 
 const SETTINGS = { enabled: true, dryRun: false, maxPerPass: 500, retryAfter: 7 * 24 * HOUR };
-const observer = ({ target = null, settings = {}, probeDryRun = false, now = Date.now } = {}) => {
+const observer = ({
+	target = null,
+	settings = {},
+	probeDryRun = false,
+	now = Date.now,
+	passId = null,
+	fileTarget = null,
+	markAdopted = undefined,
+	otherSpelling = undefined,
+} = {}) => {
 	const filed = [];
 	const read = [];
 	const watch = entity.createCanonicalObserver({
 		settings: { ...SETTINGS, ...settings },
 		probeDryRun,
 		now,
+		passId,
 		readTarget: async (url) => {
 			read.push(url);
 			return typeof target === 'function' ? target(url) : target;
 		},
-		fileTarget: async (url, data) => filed.push({ url, data }),
+		fileTarget: fileTarget ?? (async (url, data) => filed.push({ url, data })),
+		...(markAdopted ? { markAdopted } : {}),
+		...(otherSpelling ? { otherSpelling } : {}),
 	});
 	return { watch, filed, read };
 };
@@ -225,13 +249,52 @@ test('a canonical no target holds is ADOPTED: filed due now and urgent, and reme
 	assert.deepEqual(adopts(), ['adopted']);
 });
 
-test('the endpoint may name a path or a whole URL', async () => {
+test('the endpoint may name a /-rooted path or a whole URL — never a relative path', async () => {
 	const { watch, filed } = observer();
 	await watch({ url: OLD, value: CANON });
 	assert.equal(filed[0].url, CANON);
 	assert.equal(await watch({ url: OLD, value: '' }), null);
 	assert.equal(await watch({ url: OLD, value: null }), null);
 	assert.equal(await watch({ url: OLD, value: 42 }), null);
+	// Resolved against the probed URL's DIRECTORY this would invent `/product/prd-1/product/prd-1/x.jsp`,
+	// under the entity's own prefix.
+	assert.equal(await watch({ url: OLD, value: 'product/prd-1/x.jsp' }), null);
+	assert.equal(filed.length, 1);
+});
+
+test('a canonical spelled otherwise (`%27` for an apostrophe) is the SAME document: no move, no duplicate target', async () => {
+	const encoded = `${PRODUCT}levi%27s-501.jsp`;
+	const raw = `${PRODUCT}levi's-501.jsp`;
+	assert.ok(entity.sameDocument(encoded, raw));
+	assert.ok(!entity.sameDocument(`${PRODUCT}a%2Fb.jsp`, `${PRODUCT}a/b.jsp`), 'a reserved delimiter is not decoded');
+	// The registry holds the sitemap's spelling; the endpoint spells it raw.
+	await observe(encoded, { from: 'render', atMs: Date.now() - HOUR });
+	writes.length = 0;
+	assert.equal((await observe(raw)).outcome, 'same');
+	assert.deepEqual(writes, [], 'nothing written, and the stored spelling stands');
+	assert.equal(entities.get(PRODUCT).canonical, encoded);
+	// Probed at the canonical itself, spelled otherwise: nothing to adopt.
+	const probedAtIt = observer();
+	await probedAtIt.watch({ url: encoded, value: "/product/prd-1/levi's-501.jsp" });
+	assert.deepEqual(probedAtIt.read, []);
+	// Probed at a variant: the exact key has no target, but a target in rotation holds it spelled otherwise.
+	entities.clear();
+	targets.set(encoded, { state: null });
+	targets.set(OLD, { state: null });
+	const variant = observer();
+	assert.equal((await variant.watch({ url: OLD, value: "/product/prd-1/levi's-501.jsp" })).adopt, 'exists');
+	assert.deepEqual(variant.filed, []);
+	// The sibling read is one bounded, one-sided, node-local range under the entity's prefix.
+	assert.equal(searches.length, 1);
+	assert.deepEqual(searches[0].query.conditions, [
+		{ attribute: 'url', comparator: 'greater_than_equal', value: PRODUCT },
+	]);
+	assert.equal(searches[0].query.limit, entity.SIBLING_READ_LIMIT);
+	assert.deepEqual(searches[0].context, { replicateFrom: false });
+	// A SUPPRESSED other spelling holds nothing in rotation: adopted.
+	targets.set(encoded, { state: 'suppressed' });
+	entities.clear();
+	assert.equal((await observer().watch({ url: OLD, value: "/product/prd-1/levi's-501.jsp" })).adopt, 'adopted');
 });
 
 test('a canonical with a target in rotation is left alone — the ordinary duplicate spelling', async () => {
@@ -243,18 +306,22 @@ test('a canonical with a target in rotation is left alone — the ordinary dupli
 test('a canonical-verdict suppression is REACTIVATED, carrying its own declarations; any other is left', async () => {
 	for (const suppressedReason of ['canonical-mismatch', 'canonical-variant']) {
 		entities.clear();
+		const unlistedAt = new Date(Date.now() - 24 * HOUR);
 		const { watch, filed } = observer({
 			target: {
 				url: CANON,
 				state: 'suppressed',
 				suppressedReason,
 				sitemapUrl: `${ORIGIN}/sitemap-products-1.xml`,
-				renderInterval: 2 * HOUR,
+				// A Long column can come back as a BigInt.
+				renderInterval: BigInt(2 * HOUR),
+				unlistedAt,
 			},
 		});
 		assert.equal((await watch({ url: OLD, value: CANON })).adopt, 'reactivated', suppressedReason);
 		assert.equal(filed[0].data.sitemapUrl, `${ORIGIN}/sitemap-products-1.xml`);
 		assert.equal(filed[0].data.renderInterval, 2 * HOUR);
+		assert.equal(filed[0].data.unlistedAt, unlistedAt, 'or the sitemap arrival check could not see a rejoin');
 		assert.equal(filed[0].data.urgent, true);
 	}
 	for (const suppressedReason of ['http-gone', 'noindex', 'redirect-loop']) {
@@ -293,6 +360,46 @@ test('at most maxPerPass a pass; a new observer is a new pass', async () => {
 	);
 });
 
+const reslug = (watch, id) =>
+	watch({ url: `${ORIGIN}/product/prd-${id}/old.jsp`, value: `/product/prd-${id}/new.jsp` });
+
+test('a RESUMED pass shares the cap of the pass it continues; a put that fails gives its slot back', async () => {
+	const settings = { maxPerPass: 1 };
+	assert.equal((await reslug(observer({ settings, passId: 1000 }).watch, 1)).adopt, 'adopted');
+	assert.equal(
+		(await reslug(observer({ settings, passId: 1000 }).watch, 2)).adopt,
+		'capped',
+		'a restart mid-pass does not buy a fresh cap'
+	);
+	let failing = true;
+	const flaky = observer({
+		settings,
+		passId: 2000,
+		fileTarget: async () => {
+			if (failing) throw new Error('write fault');
+		},
+	});
+	assert.equal((await reslug(flaky.watch, 3)).adopt, 'error');
+	failing = false;
+	assert.equal((await reslug(flaky.watch, 4)).adopt, 'adopted');
+});
+
+test('the adoption stands when only its memory fails to write', async () => {
+	const { watch, filed } = observer({
+		markAdopted: async () => {
+			throw new Error('write fault');
+		},
+	});
+	assert.equal((await watch({ url: OLD, value: CANON })).adopt, 'adopted');
+	assert.equal(filed.length, 1);
+});
+
+test('an unreadable stored instant loses to any observation', async () => {
+	entities.set(PRODUCT, { id: PRODUCT, canonical: OLD, canonicalFrom: 'render', canonicalAt: 'not a date' });
+	assert.equal((await observe(CANON, { atMs: 1 })).outcome, 'moved');
+	assert.equal(entities.get(PRODUCT).canonical, CANON);
+});
+
 test('DRY RUN — its own or the probe’s: would-adopt, nothing filed, nothing remembered', async () => {
 	for (const options of [{ settings: { dryRun: true } }, { probeDryRun: true }]) {
 		entities.clear();
@@ -312,6 +419,10 @@ test('refused: a canonical that could not be a target — too long to key, or of
 	configure({ rest: { domains: ['shop.example.org'] } });
 	entities.clear();
 	assert.equal((await watch({ url: OLD, value: CANON })).adopt, 'refused');
+	// Under the entity's prefix, but a passthrough carve-out (an exclude pattern) owns the path.
+	configure({ rest: { excludePathPatterns: ['/search/'] } });
+	entities.clear();
+	assert.equal((await watch({ url: OLD, value: '/product/prd-1/search/x.jsp' })).adopt, 'refused');
 	assert.deepEqual(filed, []);
 });
 
@@ -349,7 +460,10 @@ test('config: the registry is off by default; adoption is on but dry run, bounde
 test('the sweep wires one observer per pass; the canary wires none; the render result reports its canonical', async () => {
 	const SRC = new URL('../src/', import.meta.url).pathname;
 	const probe = await readFile(join(SRC, 'util', 'changeProbe.js'), 'utf8');
-	assert.equal([...probe.matchAll(/onCanonical: entitiesOn\(\) \? createCanonicalObserver\(\) : null/g)].length, 1);
+	// The PASS's dry run (an operator's measure-only sweep sets it) and its origin (a resume shares the cap).
+	const wired =
+		/onCanonical: entitiesOn\(\) \? createCanonicalObserver\(\{ probeDryRun: limits\.dryRun, passId: passOrigin \}\)/g;
+	assert.equal([...probe.matchAll(wired)].length, 1);
 	const queue = await readFile(join(SRC, 'resources', 'RenderQueue.js'), 'utf8');
 	assert.match(queue, /observeRenderedCanonical\(scheduleUrl, describing\.pageFacts,/);
 });

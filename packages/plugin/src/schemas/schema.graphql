@@ -7,7 +7,8 @@
 #
 #   render_schedule  RenderSchedule                  — the hot render queue (isolated)
 #   render_service   Target, QueueStatus,            — URL registry (incl. indexability
-#                    QueueControl                      verdicts) + queue status + pause intent
+#                    QueueControl, Entity              verdicts) + queue status + pause intent
+#                                                      + each entity's current canonical
 #   config           ConfigOverride                  — operator-set config overrides (isolated
 #                                                      because it is SUBSCRIBED; see the type)
 #   page_cache       PrerenderedPage                 — rendered-HTML cache (blob writes)
@@ -166,8 +167,9 @@ type Entity @table(database: "render_service") {
 	canonical: String
 	# Which observer named it: 'probe' or 'render'.
 	canonicalFrom: String
-	# When that observer READ the origin. A later observation that disagrees moves the canonical; an earlier
-	# one (a render claimed before a re-slug, landing after the probe saw it) does not.
+	# When that observer READ the origin — when the CURRENT canonical was first observed; an unchanged
+	# observation writes nothing. A later observation that disagrees moves the canonical; an earlier one (a
+	# render claimed before a re-slug, landing after the probe saw it) does not.
 	canonicalAt: Date
 	firstSeenAt: Date
 	# The last canonical the change probe ADOPTED a target for, and when: a canonical that did not take is

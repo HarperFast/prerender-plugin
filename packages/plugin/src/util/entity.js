@@ -134,9 +134,34 @@ export const readEntity = async (key) => {
 };
 
 /**
+ * Do two keyed URLs name the same document, however a sub-delimiter is spelled? `%27` and `'` (and the rest
+ * `decodeURI` decodes: everything but the reserved delimiters) are one document at any origin that decodes
+ * them, and the change probe's own canonical comparator (`path`) already treats them so. An endpoint that
+ * spells a slug raw while the sitemap — and so the Target key — percent-encodes it must not read as a new
+ * canonical: that would adopt a duplicate target on every pass and flap the row against every render.
+ */
+export const sameDocument = (a, b) => a === b || (safeDecodeURI(a) ?? a) === (safeDecodeURI(b) ?? b);
+const safeDecodeURI = (value) => {
+	try {
+		return decodeURI(value);
+	} catch {
+		return null;
+	}
+};
+
+/**
  * Record that the origin, observed at `atMs` by `from` ('probe' | 'render'), names `canonical` as the
- * canonical of the entity `url` belongs to. Returns `{ outcome, key, canonical, row }`: `row` is the entity
- * as it stands after this observation (null when there is no entity). Never throws.
+ * canonical of the entity `url` belongs to. Returns `{ outcome, key, canonical, row }`: `canonical` is the
+ * keyed form the registry holds for it, `row` the entity as it stands after this observation (null when there
+ * is no entity). Never throws.
+ *
+ * `canonicalAt` is when the CURRENT canonical was first observed, not when it was last confirmed: an
+ * unchanged observation writes nothing, so a disagreeing observation wins when the origin was read after
+ * the canonical it contradicts was established.
+ *
+ * Every write is a PATCH naming the key (a patch of a missing row creates it, holding only what it names):
+ * two first observations racing — a render and a probe, or two nodes probing two spellings — then merge,
+ * and neither can erase what the adoption recorded on the row.
  */
 export async function observeCanonical({ url, canonical, from, atMs }) {
 	if (!entitiesOn()) return { outcome: null, key: null, canonical: null, row: null };
@@ -160,14 +185,17 @@ export async function observeCanonical({ url, canonical, from, atMs }) {
 				canonicalAt: new Date(atMs),
 				firstSeenAt: new Date(),
 			};
-			await table().put(entity.key, created);
+			await table().patch(entity.key, created);
 			return decided(CanonicalOutcome.NEW, { canonical: target, row: created });
 		}
-		if (row.canonical === target) return decided(CanonicalOutcome.SAME, { canonical: target, row });
+		// The same document, however spelled: the stored spelling stands, and nothing is written.
+		if (typeof row.canonical === 'string' && sameDocument(row.canonical, target)) {
+			return decided(CanonicalOutcome.SAME, { canonical: row.canonical, row });
+		}
 		// An unreadable stored instant loses to any observation: there is nothing to be newer than.
 		const storedAt = dateColumnMs(row.canonicalAt);
 		if (Number.isFinite(storedAt) && !(atMs > storedAt)) return decided(CanonicalOutcome.OLDER, { row });
-		const moved = { canonical: target, canonicalFrom: from, canonicalAt: new Date(atMs) };
+		const moved = { id: entity.key, canonical: target, canonicalFrom: from, canonicalAt: new Date(atMs) };
 		await table().patch(entity.key, moved);
 		return decided(CanonicalOutcome.MOVED, { canonical: target, row: { ...row, ...moved } });
 	} catch (e) {
@@ -178,7 +206,7 @@ export async function observeCanonical({ url, canonical, from, atMs }) {
 
 /**
  * A stored render's observation (resources/RenderQueue.js): the page's own declared canonical, at the
- * instant the origin was read — the store time less the longest render of the result. Never rejects.
+ * instant the origin was read, which the caller passes. Never rejects.
  */
 export const observeRenderedCanonical = async (url, pageFacts, readAtMs) => {
 	if (!entitiesOn() || typeof pageFacts?.canonical !== 'string') return;
@@ -199,82 +227,162 @@ const adoptable = (url) => {
 	return classifyPath(parsed.pathname).routeClass === PRERENDER;
 };
 
-const targetFields = ['url', 'state', 'suppressedReason', 'sitemapUrl', 'renderInterval'];
+const TARGET_FIELDS = Object.freeze(['url', 'state', 'suppressedReason', 'sitemapUrl', 'renderInterval', 'unlistedAt']);
+const SIBLING_FIELDS = Object.freeze(['url', 'state']);
 
 /**
- * The change probe's observer for ONE pass (util/changeProbe.js `runProbePass`, `observeCanonical`): given
- * the probed row's URL and the rule's mapped `canonical` slot value, it records the observation and, when the
- * canonical is another URL that no target in rotation holds, ADOPTS it — files its target due now and
- * urgent, as redirect adoption does, so the entity's canonical renders tonight instead of whenever traffic
- * finds it and its jitter comes round.
+ * Rows the sibling read covers. An entity measured with at most 4 targets; past this the read cannot see
+ * every spelling, and the canonical is adopted as if none matched — at most one duplicate a `retryAfter`.
+ */
+export const SIBLING_READ_LIMIT = 8;
+
+/**
+ * Does a target IN ROTATION under the entity's prefix name the same document as `canonical` in another
+ * spelling? One bounded, one-sided, node-local range read (`Target` is not residency-pinned), made only when
+ * the exact key has no target in rotation. The loop body never awaits, so the cursor closes before anything
+ * else runs (util/scan.js).
+ */
+const spelledOtherwise = async (key, canonical) => {
+	for await (const row of databases.render_service.Target.search(
+		{
+			conditions: [{ attribute: 'url', comparator: 'greater_than_equal', value: key }],
+			sort: { attribute: 'url' },
+			select: [...SIBLING_FIELDS],
+			limit: SIBLING_READ_LIMIT,
+		},
+		{ replicateFrom: false }
+	)) {
+		const url = row?.url;
+		if (typeof url !== 'string') continue;
+		if (!url.startsWith(key)) break;
+		if (url !== canonical && row.state !== 'suppressed' && sameDocument(url, canonical)) return true;
+	}
+	return false;
+};
+
+/**
+ * A canonical as an endpoint states it: an absolute URL, or a path rooted at `/` resolved against the probed
+ * URL's origin. Anything else — a relative path would resolve against the probed URL's DIRECTORY and invent
+ * a URL under the entity's own prefix — is no canonical at all.
+ */
+const canonicalFromValue = (value, probedUrl) => {
+	if (typeof value !== 'string' || value === '') return null;
+	if (!value.startsWith('/') && !URL.canParse(value)) return null;
+	try {
+		return new URL(value, probedUrl).href;
+	} catch {
+		return null;
+	}
+};
+
+// Adoptions per pass, by the pass's ORIGIN: a resumed pass and the pass it continues count against one cap.
+// The last few passes only — a node runs one pass at a time.
+const adoptedByPass = new Map();
+const PASSES_REMEMBERED = 8;
+const passCounter = (passId) => {
+	if (passId === null || passId === undefined) return { count: 0 };
+	let counter = adoptedByPass.get(passId);
+	if (!counter) {
+		counter = { count: 0 };
+		adoptedByPass.set(passId, counter);
+		if (adoptedByPass.size > PASSES_REMEMBERED) adoptedByPass.delete(adoptedByPass.keys().next().value);
+	}
+	return counter;
+};
+/** Tests: forget every pass's count. */
+export const resetAdoptionCountsForTest = () => adoptedByPass.clear();
+
+/**
+ * The change probe's observer for ONE pass (util/changeProbe.js `runProbePass`, `onCanonical`): given the
+ * probed row's URL and the rule's mapped `canonical` slot value, it records the observation and, when the
+ * canonical is another document than the one probed and no target in rotation holds it in any spelling,
+ * ADOPTS it — files its target due now and urgent, as redirect adoption does, so the entity's canonical
+ * renders tonight instead of whenever traffic finds it and its jitter comes round.
  *
- * Bounded three ways: `maxPerPass` per pass on this node; `retryAfter` per entity, so a canonical that did
- * not take (it 404s, or its page names another canonical after all) is filed at most once per window rather
- * than every night; and a dry run (`adoptCanonical.dryRun`, or the probe's own) that counts and writes no
- * target. The observation itself is written in a dry run too: it is an observation, not an action.
+ * Bounded three ways:
+ *   - `maxPerPass` per pass on this node, counted by the pass's origin (`passId`), so a resumed pass does not
+ *     start a fresh cap. A put that fails gives its slot back.
+ *   - `retryAfter` per entity, so a canonical that did not take (it 404s and is retired, or its page names
+ *     another canonical and is suppressed) is filed at most once per window. Such an entity costs one render
+ *     a window for as long as the endpoint keeps naming it.
+ *   - a dry run — `adoptCanonical.dryRun`, or the pass's own (`probeDryRun`: the caller passes the pass's
+ *     effective dry run, which an operator's measure-only sweep sets) — that counts and files nothing. In a
+ *     dry run the cap counts would-adopts too, so what arming files is `would-adopt + capped`, capped at
+ *     `maxPerPass`. The OBSERVATION is written in a dry run too: it is an observation, not an action.
  *
  * All I/O injectable for tests.
  */
 export const createCanonicalObserver = ({
 	settings = config.changeProbe.adoptCanonical,
 	probeDryRun = config.changeProbe.dryRun,
+	passId = null,
 	now = Date.now,
 	observe = observeCanonical,
-	readTarget = (url) => Target.get({ id: url, select: [...targetFields] }),
+	readTarget = (url) => Target.get({ id: url, select: [...TARGET_FIELDS] }),
+	otherSpelling = spelledOtherwise,
 	fileTarget = (url, data) => Target.put(url, data),
-	markAdopted = (key, data) => table().patch(key, data),
+	markAdopted = (key, data) => table().patch(key, { id: key, ...data }),
 } = {}) => {
-	let adopted = 0;
+	const adopted = passCounter(passId);
 	return async ({ url, value }) => {
 		if (!entitiesOn()) return null;
-		// A path (the consumer's seoURL) resolves against the probed URL's origin; an absolute URL stands.
-		let canonical = null;
-		try {
-			canonical = typeof value === 'string' && value !== '' ? new URL(value, url).href : null;
-		} catch {
-			canonical = null;
-		}
+		const canonical = canonicalFromValue(value, url);
 		if (!canonical) return null;
 		const observed = await observe({ url, canonical, from: 'probe', atMs: now() });
-		// The probed row IS the canonical, or there is nothing to adopt: it has a target by definition.
-		if (!observed.row || !observed.canonical || observed.canonical === url) return observed;
+		// The probed row IS the canonical (in any spelling), or there is nothing to adopt.
+		if (!observed.row || !observed.canonical || sameDocument(observed.canonical, url)) return observed;
 		if (!settings?.enabled) return observed;
 		const decided = (outcome) => {
 			metrics.canonicalAdopt(outcome);
 			return { ...observed, adopt: outcome };
 		};
+		let target;
 		try {
-			const target = await readTarget(observed.canonical);
+			target = await readTarget(observed.canonical);
 			if (target && target.state !== 'suppressed') return decided(AdoptOutcome.EXISTS);
+			if (await otherSpelling(observed.key, observed.canonical)) return decided(AdoptOutcome.EXISTS);
 			if (target && !REOPENABLE.has(target.suppressedReason)) return decided(AdoptOutcome.SUPPRESSED);
-			const nowMs = now();
-			const last = dateColumnMs(observed.row.adoptedAt);
-			if (observed.row.adoptedCanonical === observed.canonical && nowMs - last < settings.retryAfter) {
-				return decided(AdoptOutcome.RECENT);
-			}
-			if (!adoptable(observed.canonical)) return decided(AdoptOutcome.REFUSED);
-			if (adopted >= settings.maxPerPass) return decided(AdoptOutcome.CAPPED);
-			adopted++;
-			if (settings.dryRun || probeDryRun) return decided(AdoptOutcome.WOULD_ADOPT);
-			// `put` REPLACES the row (and is the reactivation that clears a suppression), so a suppressed row's
-			// own declarations ride along.
+		} catch (e) {
+			logger.warn?.(`[prerender] entity: reading ${observed.canonical} failed: ${e?.message ?? String(e)}`);
+			return decided(AdoptOutcome.ERROR);
+		}
+		const nowMs = now();
+		const last = dateColumnMs(observed.row.adoptedAt);
+		if (observed.row.adoptedCanonical === observed.canonical && nowMs - last < settings.retryAfter) {
+			return decided(AdoptOutcome.RECENT);
+		}
+		if (!adoptable(observed.canonical)) return decided(AdoptOutcome.REFUSED);
+		// Checked and taken in one synchronous step, so concurrent rows of a batch cannot overshoot it.
+		if (adopted.count >= settings.maxPerPass) return decided(AdoptOutcome.CAPPED);
+		adopted.count++;
+		if (settings.dryRun || probeDryRun) return decided(AdoptOutcome.WOULD_ADOPT);
+		// `put` REPLACES the row (and is the reactivation that clears a suppression and its strikes), so a
+		// suppressed row's own declarations ride along.
+		const interval = Number(target?.renderInterval);
+		try {
 			await fileTarget(observed.canonical, {
 				nextRenderTime: currentMinuteMs(nowMs),
 				urgent: true,
 				...(target?.sitemapUrl ? { sitemapUrl: target.sitemapUrl } : {}),
-				...(Number.isFinite(target?.renderInterval) && target.renderInterval > 0
-					? { renderInterval: target.renderInterval }
-					: {}),
+				...(target?.unlistedAt ? { unlistedAt: target.unlistedAt } : {}),
+				...(Number.isFinite(interval) && interval > 0 ? { renderInterval: interval } : {}),
 			});
-			await markAdopted(observed.key, { adoptedCanonical: observed.canonical, adoptedAt: new Date(nowMs) });
-			logger.info?.(
-				`[prerender] entity: ${target ? 'reactivated' : 'adopted'} ${observed.canonical}, the canonical the change ` +
-					`probe reports for ${observed.key} (probed at ${url})`
-			);
-			return decided(target ? AdoptOutcome.REACTIVATED : AdoptOutcome.ADOPTED);
 		} catch (e) {
+			adopted.count--;
 			logger.warn?.(`[prerender] entity: adopting ${observed.canonical} failed: ${e?.message ?? String(e)}`);
 			return decided(AdoptOutcome.ERROR);
 		}
+		// Filed. The memory of it is best-effort: losing it costs at most one more filing next pass, which then
+		// finds the target and reads `exists`.
+		try {
+			await markAdopted(observed.key, { adoptedCanonical: observed.canonical, adoptedAt: new Date(nowMs) });
+		} catch (e) {
+			logger.warn?.(`[prerender] entity: recording the adoption of ${observed.canonical} failed: ${e?.message ?? e}`);
+		}
+		logger.info?.(
+			`[prerender] entity: ${target ? 'reactivated' : 'adopted'} ${observed.canonical}, the canonical the change ` +
+				`probe reports for ${observed.key} (probed at ${url})`
+		);
+		return decided(target ? AdoptOutcome.REACTIVATED : AdoptOutcome.ADOPTED);
 	};
 };

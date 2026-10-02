@@ -334,14 +334,20 @@ changeProbe:
   - When two observations disagree, the newer wins. A render's instant is when it read the origin
     (store time less its longest render), so a render claimed before a re-slug can't undo the probe
     that saw it.
-  - An unchanged observation writes nothing.
-  - A canonical under another entity's prefix is ignored.
+  - An unchanged observation writes nothing, and neither does the same canonical spelled otherwise
+    (`%27` for an apostrophe). That is one document, as the probe's own `path` comparator already
+    treats it.
+  - A canonical under another entity's prefix is ignored, and so is a relative path (only an absolute
+    URL or a `/`-rooted path counts).
 - **Adoption.** When the probe reports a canonical that is another URL of the same entity, and no target
   holds it in rotation, its target is filed due now and urgent, as redirect adoption does.
   - A target suppressed as a canonical verdict (`canonical-mismatch`, `canonical-variant`) is reactivated
     the same way. One suppressed for any other reason (a 404, a noindex) is left alone.
-  - Bounded by `maxPerPass` per pass and node, by `retryAfter` per entity (a canonical that did not take is
-    filed once per window, not nightly), and by both dry runs.
+  - Bounded by `maxPerPass` per pass and node (a resumed pass shares its cap), by `retryAfter` per entity
+    (a canonical that did not take is filed once per window, not nightly, so it costs one render a week for
+    as long as the endpoint names it), and by both dry runs. A pass run as a dry run, including an
+    operator's measure-only sweep, files nothing.
+  - In a dry run, what arming would file is `would-adopt` plus `capped`.
 - **Why.** Measured on one deployment, products re-slug ~100 times a day and the product sitemap
   changes once a day. An out-of-stock product is not in the sitemap at all, so its new canonical
   arrived only by traffic discovery, with its first render jittered across the route's 96h interval.

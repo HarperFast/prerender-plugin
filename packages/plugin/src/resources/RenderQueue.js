@@ -458,14 +458,15 @@ async function syncQueueState(force = false, pending = null) {
 	return { status, ...desired };
 }
 
-// The longest render among a result's stored variants (ms), 0 when none says: how long before the store
-// the origin was read, at the latest.
-const longestRenderMs = (variants) => {
-	let longest = 0;
+// How long before the store a result's origin read began, at the earliest that can be told: the devices of a
+// job render IN TURN on one slot, so the first device's read began the sum of the stored renders before the
+// store. 0 when none says.
+const renderSpanMs = (variants) => {
+	let span = 0;
 	for (const variant of variants) {
-		if (typeof variant.renderTime === 'number' && variant.renderTime > longest) longest = variant.renderTime;
+		if (typeof variant.renderTime === 'number' && variant.renderTime > 0) span += variant.renderTime;
 	}
-	return longest;
+	return span;
 };
 
 export class RenderQueue extends Resource {
@@ -1071,10 +1072,10 @@ export class RenderQueue extends Resource {
 					complete: everyDevice,
 				}),
 				// The entity registry (util/entity.js): the canonical this page declared, observed when the origin
-				// was READ — the store time less the longest render — so a render claimed before a re-slug cannot
-				// outrank the probe that saw it. A point read, and a write only when the canonical moves; never
-				// rejects.
-				observeRenderedCanonical(scheduleUrl, describing.pageFacts, cachedAt - longestRenderMs(stored)).catch(() => {}),
+				// was READ — the store time less the stored renders, which run one after another — so a render
+				// claimed before a re-slug cannot outrank the probe that saw it. A point read, and a write only
+				// when the canonical moves; never rejects.
+				observeRenderedCanonical(scheduleUrl, describing.pageFacts, cachedAt - renderSpanMs(stored)).catch(() => {}),
 				...observed.map((variant) =>
 					recordReadinessExpectation({ url: scheduleUrl, deviceType: variant.deviceType }, variant.readiness)
 				),

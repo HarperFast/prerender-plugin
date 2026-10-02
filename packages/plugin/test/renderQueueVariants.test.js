@@ -1463,5 +1463,5 @@ test('a stored render tells the entity registry the canonical its page declared,
 	assert.equal(entity?.canonical, CANON);
 	assert.equal(entity.canonicalFrom, 'render');
 	const storedAt = stores.prerenderedPage.get(key(OLD, 'desktop')).lastCached;
-	assert.equal(entity.canonicalAt.getTime(), storedAt - 20, 'the store time less the longest render');
+	assert.equal(entity.canonicalAt.getTime(), storedAt - 30, 'the store time less the renders, which run in turn');
 });
