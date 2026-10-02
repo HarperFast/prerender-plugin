@@ -546,6 +546,7 @@ const renderer: Renderer = async (page, job) => {
 			job.httpResponse = { statusCode, headers: finalRes.headers() };
 			job.isIndexable = false;
 			job.reason = verdict.reason;
+			job.declaredCanonical = 'declaredCanonical' in verdict ? verdict.declaredCanonical : undefined;
 			return;
 		}
 	}
@@ -1142,6 +1143,7 @@ const renderer: Renderer = async (page, job) => {
 			job.isIndexable = verdict.isIndexable;
 			if (!verdict.isIndexable) {
 				job.reason = verdict.reason;
+				job.declaredCanonical = verdict.declaredCanonical;
 			}
 
 			if (job.isIndexable || job.isFromSitemap) {
@@ -1300,14 +1302,37 @@ export function indexVerdict(
 	signals: { canonicalHref: string | null; noindex: boolean },
 	pageUrl: string,
 	strict: boolean
-): { isIndexable: boolean; reason?: 'noindex' | 'canonical-variant' | 'canonical-mismatch' } {
+): {
+	isIndexable: boolean;
+	reason?: 'noindex' | 'canonical-variant' | 'canonical-mismatch';
+	declaredCanonical?: string;
+} {
 	const verdict = canonicalVerdict(signals.canonicalHref, pageUrl);
 	const disowned = verdict === 'elsewhere' || (verdict === 'variant' && strict);
 	if (!signals.noindex && !disowned) return { isIndexable: true };
+	const declaredCanonical = verdict === 'self' ? undefined : declaredCanonicalOf(signals.canonicalHref, pageUrl);
 	return {
 		isIndexable: false,
 		reason: signals.noindex ? 'noindex' : verdict === 'variant' ? 'canonical-variant' : 'canonical-mismatch',
+		...(declaredCanonical ? { declaredCanonical } : {}),
 	};
+}
+
+/**
+ * The URL a page's canonical link names, resolved exactly as {@link canonicalVerdict} resolved it to reach
+ * its verdict (against the rendered URL), without its fragment. Posted with a non-indexable result whose
+ * canonical names another URL: on a site where every spelling of a product is one document, the page that
+ * disowned this spelling has just said where the product lives now, and the plugin records it.
+ */
+function declaredCanonicalOf(canonicalHref: string | null, pageUrl: string): string | undefined {
+	if (!canonicalHref) return undefined;
+	try {
+		const url = new URL(canonicalHref, pageUrl);
+		url.hash = '';
+		return url.href;
+	} catch {
+		return undefined;
+	}
 }
 
 function extractIndexSignals(): { canonicalHref: string | null; noindex: boolean } {

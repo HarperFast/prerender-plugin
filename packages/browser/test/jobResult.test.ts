@@ -111,6 +111,30 @@ test('a noindex page posts outcome=non-indexable with the reason', async () => {
 	assert.equal(meta.reason, 'noindex');
 });
 
+test('a canonical verdict posts the canonical the page declared; a render with content never does', async () => {
+	const job = makeJob();
+	job.attemptStarted();
+	job.httpResponse = { statusCode: 200, headers: {} };
+	job.isIndexable = false;
+	job.reason = 'canonical-mismatch';
+	job.declaredCanonical = 'https://site.example.com/product/x-new-slug';
+	job.attemptEnded(undefined, undefined);
+	const meta = await send(job);
+	assert.equal(meta.outcome, 'non-indexable');
+	assert.equal(meta.declaredCanonical, 'https://site.example.com/product/x-new-slug');
+
+	// Absent, not null, when there is nothing to say: an older plugin never sees the key.
+	const plain = makeJob();
+	plain.attemptStarted();
+	plain.httpResponse = { statusCode: 200, headers: { 'content-type': 'text/html' } };
+	plain.isIndexable = true;
+	plain.declaredCanonical = 'https://site.example.com/product/x-new-slug'; // left over from an earlier attempt
+	plain.attemptEnded(undefined, '<html>ok</html>');
+	const stored = await send(plain);
+	assert.equal(stored.outcome, 'rendered');
+	assert.equal('declaredCanonical' in stored, false);
+});
+
 test('a failed render posts outcome=error with the attempt error and derived reason', async () => {
 	const job = makeJob();
 	job.attemptStarted();

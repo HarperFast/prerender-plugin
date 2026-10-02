@@ -219,6 +219,14 @@ export default class RenderJob {
 	 * redirect/error fallbacks so callers only set the values they alone can know.
 	 */
 	reason: string | undefined;
+	/**
+	 * The URL the page's canonical link names, when a non-indexable render's canonical names ANOTHER URL
+	 * (resolved against the rendered URL, fragment dropped). Unset otherwise, so the key is absent from
+	 * every result that has nothing to say and an older plugin never sees it. The plugin's entity registry
+	 * records it: on a site where every spelling of a product is one document, this is the origin naming
+	 * the product's canonical.
+	 */
+	declaredCanonical: string | undefined;
 
 	_httpResponse: OriginHttpResponse | null = null;
 
@@ -366,6 +374,8 @@ export default class RenderJob {
 			reason: this.content
 				? undefined
 				: (this.reason ?? (attemptError ? 'error' : this.redirectedTo ? 'redirect' : undefined)),
+			// Under the same rule as `reason`: a render that produced content has no verdict to explain.
+			declaredCanonical: this.content ? undefined : this.declaredCanonical,
 			// The failed attempt's detail — without it the plugin can only log "unknown
 			// prerender error". `phase` separates a navigation that never completed (slow
 			// origin) from a failure in the settle/serialize work. Anything can be thrown, so
@@ -425,6 +435,7 @@ export default class RenderJob {
 			documentReused: this.documentReused || undefined,
 			documentPrefetched: this.documentPrefetched || undefined,
 			reason: 'result-build-failed',
+			declaredCanonical: undefined,
 			error: {
 				name: (error as Error)?.name ?? 'Error',
 				message: (error as Error)?.message ?? String(error),
@@ -534,6 +545,8 @@ export type VariantMetadata = {
 	documentReused: true | undefined;
 	documentPrefetched: true | undefined;
 	reason: string | undefined;
+	/** See `RenderJob.declaredCanonical`: present only on a non-indexable result whose canonical names another URL. */
+	declaredCanonical: string | undefined;
 	error: { name: string; message: string; phase: string | undefined } | undefined;
 };
 
