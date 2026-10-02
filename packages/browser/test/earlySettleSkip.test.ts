@@ -94,6 +94,27 @@ test('a canonical naming another document skips the settle phase', async () => {
 	assert.equal(result.isIndexable, false);
 	assert.equal(result.reason, 'canonical-mismatch');
 	assert.equal(result.timings.settle, undefined);
+	assert.equal(result.declaredCanonical, `${base}/other`, 'the bail still says where the page points');
+});
+
+test('the post-settle verdict reports the declared canonical too, and an indexable page reports none', async () => {
+	const settled = await render('/canonical-elsewhere', { navigation: { skipSettleWhenNonIndexable: false } });
+	await settled.close();
+	assert.notEqual(settled.timings.settle, undefined, 'this one reached its verdict after the settle');
+	assert.equal(settled.reason, 'canonical-mismatch');
+	assert.equal(settled.declaredCanonical, `${base}/other`);
+
+	const fine = await render('/fine');
+	await fine.close();
+	assert.equal(fine.declaredCanonical, undefined);
+});
+
+test('a SITEMAP target whose canonical names another URL is serialized, and still reports where it points', async () => {
+	const listed = await render('/canonical-elsewhere', {}, true);
+	await listed.close();
+	assert.equal(listed.isIndexable, false);
+	assert.match(listed.html ?? '', /<link rel="canonical"/, 'a listed URL is captured anyway');
+	assert.equal(listed.declaredCanonical, `${base}/other`);
 });
 
 // A 404's settle is skipped BY THE BAIL, not by the `status >= 400` abort: that abort only stops
@@ -178,6 +199,7 @@ test('indexVerdict: the shared verdict both paths use', () => {
 	assert.deepEqual(indexVerdict({ canonicalHref: 'https://x.test/other', noindex: false }, page, false), {
 		isIndexable: false,
 		reason: 'canonical-mismatch',
+		declaredCanonical: 'https://x.test/other',
 	});
 	// noindex outranks a canonical verdict when both fire, so the reason stays the stronger signal.
 	assert.deepEqual(indexVerdict({ canonicalHref: 'https://x.test/other', noindex: true }, page, false), {
@@ -208,4 +230,43 @@ test('with the flag on, a client-side redirect to an INDEXABLE page still render
 	assert.match(result.html ?? '', /OK/, 'the destination must still be serialized');
 	assert.equal(new URL(result.redirectedTo!).pathname, '/fine');
 	assert.notEqual(result.timings.settle, undefined, 'and it must still settle');
+});
+
+test('indexVerdict: a canonical naming another URL is reported, resolved against the page and without its fragment', () => {
+	const page = 'https://x.test/product/prd-1/old-slug.jsp?color=red';
+	assert.equal(
+		indexVerdict({ canonicalHref: 'https://x.test/product/prd-1/new-slug.jsp', noindex: false }, page, false)
+			.declaredCanonical,
+		'https://x.test/product/prd-1/new-slug.jsp'
+	);
+	// Resolved exactly as the verdict resolved it, so a path-absolute href names the page's own origin.
+	assert.equal(
+		indexVerdict({ canonicalHref: '/product/prd-1/new-slug.jsp#top', noindex: false }, page, false).declaredCanonical,
+		'https://x.test/product/prd-1/new-slug.jsp'
+	);
+	// Only a canonical verdict reports it: a noindex page's canonical is not something to adopt a target from.
+	assert.equal(
+		'declaredCanonical' in indexVerdict({ canonicalHref: 'https://x.test/other', noindex: true }, page, false),
+		false
+	);
+	// A web URL of a keyable length, or nothing.
+	assert.equal(
+		'declaredCanonical' in indexVerdict({ canonicalHref: 'ftp://x.test/other', noindex: false }, page, false),
+		false
+	);
+	assert.equal(
+		'declaredCanonical' in
+			indexVerdict({ canonicalHref: `https://x.test/${'a'.repeat(3000)}`, noindex: false }, page, false),
+		false
+	);
+	// A strict variant names this document re-spelled: reported too, it is still the origin's spelling.
+	assert.equal(
+		indexVerdict({ canonicalHref: 'https://x.test/p%20q', noindex: false }, 'https://x.test/p+q', true)
+			.declaredCanonical,
+		'https://x.test/p%20q'
+	);
+	// Nothing to report: indexable, no canonical, or a noindex page whose canonical is itself.
+	assert.equal('declaredCanonical' in indexVerdict({ canonicalHref: page, noindex: false }, page, false), false);
+	assert.equal('declaredCanonical' in indexVerdict({ canonicalHref: null, noindex: true }, page, false), false);
+	assert.equal('declaredCanonical' in indexVerdict({ canonicalHref: page, noindex: true }, page, false), false);
 });
