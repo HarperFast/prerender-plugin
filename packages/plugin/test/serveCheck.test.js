@@ -422,7 +422,7 @@ test('every shortfall asks nothing: no budget slot (shed), a full queue (busy), 
 	assert.deepEqual(outcomes(), ['queued', 'shed']);
 	ops = [];
 	serveCheck.resetServeChecks();
-	await setup({ maxPending: 1 });
+	await setup({ maxPending: 1, concurrency: 4 });
 	serveCheck.__setServeCheckDepsForTest({
 		anchor: () => ANCHOR,
 		readCheck: async () => NO_CHECK,
@@ -460,6 +460,32 @@ test('every shortfall asks nothing: no budget slot (shed), a full queue (busy), 
 	serveCheck.resetServeChecks();
 	await consider(failing);
 	assert.equal(asked, 1);
+});
+
+test('`concurrency` is how many checks a worker has in flight (default 16) — the budget slot paces the origin', async () => {
+	const inFlightFor = async (options) => {
+		serveCheck.resetServeChecks();
+		ops = [];
+		await setup({ maxPending: 100, ...options });
+		let started = 0;
+		serveCheck.__setServeCheckDepsForTest({
+			anchor: () => ANCHOR,
+			readCheck: async () => NO_CHECK,
+			reserveSlot: () => {
+				started++;
+				return Date.now() + 60_000; // every slot a minute away: a started check waits in flight
+			},
+		});
+		for (let i = 0; i < 20; i++) {
+			serveCheck.considerServeCheck(served({ url: `https://shop.example.com/product/prd-n${i}/x.jsp` }));
+		}
+		for (let i = 0; i < 40; i++) await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(outcomes().filter((o) => o === 'queued').length, 20, JSON.stringify(outcomes()));
+		return started;
+	};
+	assert.equal(await inFlightFor({ concurrency: 2 }), 2, 'two in flight, eighteen queued behind them');
+	assert.equal(await inFlightFor({}), 16, 'the default');
+	serveCheck.resetServeChecks();
 });
 
 test('a raw document is checked from its STORED facts, and a disagreeing one is deleted', async () => {

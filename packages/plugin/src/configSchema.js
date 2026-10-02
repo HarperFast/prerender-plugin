@@ -1579,11 +1579,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 					share: option(
 						0.5,
 						'Of the node\u2019s `ratePerSecond`, the most a running pass leaves to these checks (and the ' +
-							'render re-check). It leaves what they USE \u2014 twice their rate over the last few seconds, ' +
-							'at least a tenth of the ceiling \u2014 so a quiet afternoon costs the pass about 10%, and a ' +
-							'burst of due pages at the anchor gets up to this share within seconds. A pass never runs ' +
-							'below 1 request/s, so below a `ratePerSecond` of 2 it leaves nothing and checks wait for ' +
-							'the pass to end.',
+							'render re-check). It leaves what they USE \u2014 their rate over the last few seconds, at ' +
+							'least a tenth of the ceiling, and twice that rate only while checks are WAITING for budget ' +
+							'\u2014 so a quiet afternoon costs the pass about 10%, a burst of due pages at the anchor ' +
+							'gets up to this share within seconds, and checks held back by something other than the ' +
+							'budget leave the pass the rest instead of idling it. A pass never runs below 1 request/s, ' +
+							'so below a `ratePerSecond` of 2 it leaves nothing and checks wait for the pass to end.',
 						{ min: 0, max: 1 }
 					),
 					maxPending: option(
@@ -1591,6 +1592,16 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'Checks queued per worker before more are dropped (`busy`). A dropped check is asked again ' +
 							'by the next request for that page.',
 						{ min: 1 }
+					),
+					concurrency: option(
+						16,
+						'Checks in flight per worker, each holding its place while it waits for its budget slot. ' +
+							'NOT the rate: the node-wide budget paces the requests, so this only has to be high ' +
+							'enough for the workers bots actually land on to fill it. A check is in flight for its slot ' +
+							'wait, the request and a record write, and bots need not spread evenly over workers: at a ' +
+							'fixed 4, one deployment measured ~5.8 checks/s with its whole 10/s budget free and queues ' +
+							'overflowing (`busy`).',
+						{ min: 1, max: 256 }
 					),
 					maxWait: option(
 						10 * MINUTE,

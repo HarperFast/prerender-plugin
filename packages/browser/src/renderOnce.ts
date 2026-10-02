@@ -97,6 +97,8 @@ export interface RenderResult {
 	isIndexable: boolean | undefined;
 	/** Why no cacheable content: 'noindex' | 'canonical-mismatch' | 'canonical-variant' | 'http-error' | 'redirect-loop' | 'redirect' | 'error'. */
 	reason: string | undefined;
+	/** The URL a non-indexable page's canonical names, when it names another URL (job.declaredCanonical). */
+	declaredCanonical: string | undefined;
 	/** Normalized redirect target (job.redirectedTo), if the final URL canonically differs. */
 	redirectedTo: string | undefined;
 	/** Raw page.url() at snapshot time (complements the normalized redirectedTo). */
@@ -290,6 +292,7 @@ export async function renderOnce(options: RenderOnceOptions): Promise<RenderResu
 			statusCode: job.httpResponse?.statusCode,
 			isIndexable: job.isIndexable,
 			reason: job.reason ?? (error ? 'error' : !html && job.redirectedTo ? 'redirect' : undefined),
+			declaredCanonical: job.declaredCanonical,
 			redirectedTo: job.redirectedTo,
 			finalUrl,
 			responseHeaders: job.httpResponse?.headers,

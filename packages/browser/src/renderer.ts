@@ -19,6 +19,7 @@ import {
 } from './readiness.js';
 import { responseLogSource } from './responseLog.js';
 import { extractPageClaims, PAGE_FACT_BOUNDS, STRUCTURED_OFFER_CAP } from './pageFacts.js';
+import { fragmentOnlySelfReferences } from './selfReferences.js';
 import {
 	DOCUMENT_REUSE_HEADER,
 	cookieHeaderOf,
@@ -545,6 +546,7 @@ const renderer: Renderer = async (page, job) => {
 			job.httpResponse = { statusCode, headers: finalRes.headers() };
 			job.isIndexable = false;
 			job.reason = verdict.reason;
+			job.declaredCanonical = 'declaredCanonical' in verdict ? verdict.declaredCanonical : undefined;
 			return;
 		}
 	}
@@ -1142,6 +1144,8 @@ const renderer: Renderer = async (page, job) => {
 			if (!verdict.isIndexable) {
 				job.reason = verdict.reason;
 			}
+			// Assigned on every verdict, so an earlier attempt's never outlives a later one's.
+			job.declaredCanonical = verdict.declaredCanonical;
 
 			if (job.isIndexable || job.isFromSitemap) {
 				// Before postProcess: it may strip nodes, and this must describe the page as
@@ -1159,7 +1163,12 @@ const renderer: Renderer = async (page, job) => {
 				job.structuredOffers = claims?.structuredOffers ?? null;
 				job.pageFacts = claims?.pageFacts ?? null;
 				const ppStart = Date.now();
-				const content = await page.evaluate(postProcess, config.postProcess, config.block.urlPatterns);
+				// Self-references made fragment-only (selfReferences.ts), so the snapshot is correct at every
+				// URL it is served at, not only the one it was rendered at.
+				const content = fragmentOnlySelfReferences(
+					await page.evaluate(postProcess, config.postProcess, config.block.urlPatterns),
+					rawPageUrl
+				);
 				timings.postProcess = Date.now() - ppStart;
 				return content;
 			}
@@ -1294,15 +1303,42 @@ export function indexVerdict(
 	signals: { canonicalHref: string | null; noindex: boolean },
 	pageUrl: string,
 	strict: boolean
-): { isIndexable: boolean; reason?: 'noindex' | 'canonical-variant' | 'canonical-mismatch' } {
+): {
+	isIndexable: boolean;
+	reason?: 'noindex' | 'canonical-variant' | 'canonical-mismatch';
+	declaredCanonical?: string;
+} {
 	const verdict = canonicalVerdict(signals.canonicalHref, pageUrl);
 	const disowned = verdict === 'elsewhere' || (verdict === 'variant' && strict);
 	if (!signals.noindex && !disowned) return { isIndexable: true };
-	return {
-		isIndexable: false,
-		reason: signals.noindex ? 'noindex' : verdict === 'variant' ? 'canonical-variant' : 'canonical-mismatch',
-	};
+	const reason = signals.noindex ? 'noindex' : verdict === 'variant' ? 'canonical-variant' : 'canonical-mismatch';
+	// Only a CANONICAL verdict reports where the page points: a noindex page's canonical is a statement made by
+	// a page that asked not to be indexed, and is not what the plugin adopts targets from.
+	const declaredCanonical = reason === 'noindex' ? undefined : declaredCanonicalOf(signals.canonicalHref, pageUrl);
+	return { isIndexable: false, reason, ...(declaredCanonical ? { declaredCanonical } : {}) };
 }
+
+/**
+ * The URL a page's canonical link names, resolved exactly as {@link canonicalVerdict} resolved it to reach
+ * its verdict (against the rendered URL), without its fragment. Posted with a non-indexable result whose
+ * canonical names another URL: on a site where every spelling of a product is one document, the page that
+ * disowned this spelling has just said where the product lives now, and the plugin records it.
+ */
+function declaredCanonicalOf(canonicalHref: string | null, pageUrl: string): string | undefined {
+	if (!canonicalHref) return undefined;
+	try {
+		const url = new URL(canonicalHref, pageUrl);
+		url.hash = '';
+		// A web page's URL, of a length that could ever be a cache key; anything else is not worth posting.
+		if (url.protocol !== 'https:' && url.protocol !== 'http:') return undefined;
+		return url.href.length <= DECLARED_CANONICAL_MAX ? url.href : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Longest declared canonical posted: past this no Harper primary key could hold it (the limit is ~1,978 bytes). */
+const DECLARED_CANONICAL_MAX = 2048;
 
 function extractIndexSignals(): { canonicalHref: string | null; noindex: boolean } {
 	let canonicalHref: string | null = null;

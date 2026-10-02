@@ -111,6 +111,38 @@ test('a noindex page posts outcome=non-indexable with the reason', async () => {
 	assert.equal(meta.reason, 'noindex');
 });
 
+test('a canonical verdict posts the canonical the page declared — with or without content; an indexable render never does', async () => {
+	const job = makeJob();
+	job.attemptStarted();
+	job.httpResponse = { statusCode: 200, headers: {} };
+	job.isIndexable = false;
+	job.reason = 'canonical-mismatch';
+	job.declaredCanonical = 'https://site.example.com/product/x-new-slug';
+	job.attemptEnded(undefined, undefined);
+	const meta = await send(job);
+	assert.equal(meta.outcome, 'non-indexable');
+	assert.equal(meta.declaredCanonical, 'https://site.example.com/product/x-new-slug');
+
+	// A sitemap target is serialized even when non-indexable: its content and its declared canonical both post.
+	const listed = makeJob();
+	listed.attemptStarted();
+	listed.httpResponse = { statusCode: 200, headers: { 'content-type': 'text/html' } };
+	listed.isIndexable = false;
+	listed.declaredCanonical = 'https://site.example.com/product/x-new-slug';
+	listed.attemptEnded(undefined, '<html>listed</html>');
+	const stored = await send(listed);
+	assert.equal(stored.outcome, 'rendered');
+	assert.equal(stored.declaredCanonical, 'https://site.example.com/product/x-new-slug');
+
+	// Absent, not null, when there is nothing to say: an older plugin never sees the key.
+	const plain = makeJob();
+	plain.attemptStarted();
+	plain.httpResponse = { statusCode: 200, headers: { 'content-type': 'text/html' } };
+	plain.isIndexable = true;
+	plain.attemptEnded(undefined, '<html>ok</html>');
+	assert.equal('declaredCanonical' in (await send(plain)), false);
+});
+
 test('a failed render posts outcome=error with the attempt error and derived reason', async () => {
 	const job = makeJob();
 	job.attemptStarted();
