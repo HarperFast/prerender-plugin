@@ -144,8 +144,10 @@ export const readEntity = async (key) => {
  * spells a slug raw while the sitemap — and so the Target key — percent-encodes it must not read as a new
  * canonical: that would adopt a duplicate target on every pass and flap the row against every render.
  */
-export const sameDocument = (a, b) => a === b || (safeDecodeURI(a) ?? a) === (safeDecodeURI(b) ?? b);
+export const sameDocument = (a, b) =>
+	typeof a === 'string' && typeof b === 'string' && (a === b || (safeDecodeURI(a) ?? a) === (safeDecodeURI(b) ?? b));
 const safeDecodeURI = (value) => {
+	if (typeof value !== 'string') return null;
 	try {
 		return decodeURI(value);
 	} catch {
@@ -284,15 +286,15 @@ const canonicalFromValue = (value, probedUrl) => {
 // documents on any worker), so a per-thread counter would multiply the cap by the thread count. Two lanes: real
 // adoptions, and dry-run ones, so a dry run measures what the cap would do without spending the slots an armed
 // node's real adoptions need (an operator's measure-only sweep on an armed node, for one).
-const BUDGET_SAB_KEY = 'entity_adopt_budget_v2';
+const BUDGET_SAB_KEY = 'entity_adopt_budget_v3';
 const REAL = 0;
 const DRY = 1;
 let budgetCell = null;
-const budgetI32 = () =>
-	(budgetCell ??= new Int32Array(getSab(BUDGET_SAB_KEY, hourlyBudgetLength(2) * Int32Array.BYTES_PER_ELEMENT)));
+const budgetCells = () =>
+	(budgetCell ??= new BigInt64Array(getSab(BUDGET_SAB_KEY, hourlyBudgetLength(2) * BigInt64Array.BYTES_PER_ELEMENT)));
 
 /** The node's adoption budget (util/hourlyBudget.js): lane 0 real adoptions, lane 1 dry-run ones. */
-export const adoptionBudget = createHourlyBudget(budgetI32);
+export const adoptionBudget = createHourlyBudget(budgetCells);
 /** Tests: an empty budget. */
 export const resetAdoptionCountsForTest = () => adoptionBudget.reset();
 
@@ -386,7 +388,7 @@ export const createCanonicalResolver = ({
 				...(Number.isFinite(interval) && interval > 0 ? { renderInterval: interval } : {}),
 			});
 		} catch (e) {
-			budget.release(REAL);
+			budget.release(REAL, nowMs);
 			logger.warn?.(`[prerender] entity: adopting ${observed.canonical} failed: ${e?.message ?? String(e)}`);
 			return decided(AdoptOutcome.ERROR);
 		}

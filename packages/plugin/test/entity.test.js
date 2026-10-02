@@ -503,3 +503,10 @@ test('retryAfter is per ENTITY: two spellings naming each other cannot reactivat
 	assert.equal((await watch({ url: CANON, value: OLD })).adopt, 'recent');
 	assert.equal(filed.length, 1);
 });
+
+test('sameDocument compares two URLs, never a coerced non-string', () => {
+	assert.equal(entity.sameDocument(null, 'null'), false);
+	assert.equal(entity.sameDocument(undefined, 'undefined'), false);
+	assert.equal(entity.sameDocument(null, null), false);
+	assert.equal(entity.sameDocument(`${PRODUCT}levi%27s.jsp`, `${PRODUCT}levi's.jsp`), true);
+});
