@@ -2422,7 +2422,8 @@ function entityServe(ctx, data, filter) {
 }
 
 // Who told the entity registry (plugin `entity_canonical` / `canonical_adopt` context), in the order a re-slug is
-// usually seen: the origin documents crawlers pull, the renders, the serve-time checks, the nightly probe.
+// usually seen: the origin documents crawlers pull, the renders, the serve-time checks, the nightly probe. A move
+// is a re-slug, or one observer correcting another (an endpoint and a page that disagree flap between them).
 const ENTITY_OBSERVERS = [
 	['origin', 'proxied origin documents'],
 	['render', 'renders'],
@@ -2490,7 +2491,7 @@ function entityRegistry(ctx, data) {
 		body: [
 			stats([
 				stat(
-					'Re-slugs seen',
+					'Canonical moves',
 					fmtCount(seen('moved')),
 					byObserver((from) => seen('moved', from))
 				),

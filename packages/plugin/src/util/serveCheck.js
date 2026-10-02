@@ -406,6 +406,8 @@ const runCheck = async (item, gen = generation) => {
 		return;
 	}
 	let verdict;
+	// When the origin was asked: the instant the registry stamps this check's observation with.
+	const askedAt = Date.now();
 	try {
 		verdict = item.source === 'document' ? await checkDocument(item) : await checkEndpoint(item);
 	} catch (e) {
@@ -421,7 +423,7 @@ const runCheck = async (item, gen = generation) => {
 	// adopts the new canonical) now, rather than at the next nightly pass. Never throws.
 	if (typeof verdict.originCanonical === 'string' && verdict.originCanonical !== '') {
 		try {
-			await deps.resolveCanonical({ url: item.url, value: verdict.originCanonical, from: 'check' });
+			await deps.resolveCanonical({ url: item.url, value: verdict.originCanonical, from: 'check', atMs: askedAt });
 		} catch {
 			// a registry fault never costs the check
 		}

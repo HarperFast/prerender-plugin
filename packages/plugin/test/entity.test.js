@@ -453,7 +453,7 @@ test('the sweep wires the resolver with its pass\u2019s dry run; the canary wire
 	assert.equal([...probe.matchAll(wired)].length, 1);
 	const queue = await readFile(join(SRC, 'resources', 'RenderQueue.js'), 'utf8');
 	// A stored page's own canonical, and the one a canonical verdict declared (browser >= 1.40.0).
-	assert.match(queue, /observeRenderedCanonical\(\s*scheduleUrl,\s*describing\.pageFacts\?\.canonical,/);
+	assert.match(queue, /observeRenderedCanonical\(\s*scheduleUrl,\s*describing\.pageFacts\?\.canonical \?\?/);
 	assert.match(queue, /observeRenderedCanonical\(\s*url,\s*verdict\.declaredCanonical,/);
 });
 
@@ -471,6 +471,10 @@ test('a render that names another canonical ADOPTS it too, and every adoption sa
 		entities.clear();
 		analytics.length = 0;
 		filed.length = 0;
+		// A crawler's proxied miss moves a row the registry holds; the probe made it.
+		if (from === 'origin') {
+			entities.set(PRODUCT, { id: PRODUCT, canonical: OLD, canonicalFrom: 'probe', canonicalAt: new Date(1) });
+		}
 		const result = await resolve({ url: OLD, value: CANON, from });
 		assert.equal(result.adopt, 'adopted', from);
 		assert.deepEqual(
@@ -478,7 +482,7 @@ test('a render that names another canonical ADOPTS it too, and every adoption sa
 			[CANON]
 		);
 		assert.deepEqual(ops('canonical_adopt'), [['adopted', from]]);
-		assert.deepEqual(ops('entity_canonical'), [['new', from]]);
+		assert.deepEqual(ops('entity_canonical'), [[from === 'origin' ? 'moved' : 'new', from]]);
 	}
 });
 
@@ -535,4 +539,27 @@ test('retryAfter is per ENTITY: two spellings naming each other cannot reactivat
 	// The origin now names the OLD spelling again (a re-slug back, or an inconsistent copy at the edge).
 	assert.equal((await watch({ url: CANON, value: OLD })).adopt, 'recent');
 	assert.equal(filed.length, 1);
+});
+
+test('a crawler’s proxied miss moves a row the registry holds, and creates none; a canonical with a query is foreign', async () => {
+	const resolve = entity.createCanonicalResolver({ readTarget: async () => ({ url: CANON, state: null }) });
+	const untracked = await resolve({ url: OLD, value: CANON, from: 'origin' });
+	assert.equal(untracked.outcome, 'untracked');
+	assert.equal(entities.size, 0, 'no row from crawler traffic');
+	assert.deepEqual(ops('entity_canonical'), [['untracked', 'origin']]);
+	// The probe's row exists: the origin observation moves it.
+	entities.set(PRODUCT, { id: PRODUCT, canonical: OLD, canonicalFrom: 'probe', canonicalAt: new Date(1) });
+	assert.equal((await resolve({ url: OLD, value: CANON, from: 'origin' })).outcome, 'moved');
+	// A canonical carrying a query the route keys is no entity's one document.
+	configure({
+		rest: {
+			ingress: {
+				mode: 'forwarded',
+				routes: [
+					{ match: 'prefix', path: '/product/prd-', queryParams: ['color'], entityPrefix: '^/product/prd-[^/]+/' },
+				],
+			},
+		},
+	});
+	assert.equal((await observe(`${CANON}?color=red`, { from: 'render' })).outcome, 'foreign');
 });

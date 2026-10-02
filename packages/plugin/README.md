@@ -341,8 +341,10 @@ origin, exactly as before:
 - **The spelling has no target the render path keeps.** A spelling with no row of its own is answered,
   and so is one whose own target was suppressed as a canonical verdict (`canonical-mismatch`,
   `canonical-variant`): its own render found that the page names its canonical elsewhere. Measured on
-  one deployment, one crawler made ~11k such misses a day. A row in rotation (a new canonical arriving
-  from the sitemap) or one suppressed about the URL itself (a 404, a noindex) is `has-target`.
+  one deployment, one crawler made ~11k such misses a day. Such a spelling is answered only with the page
+  its own verdict named (`Target.suppressedCanonical`, browser ≥ 1.40.0), or with a page confirmed after
+  that verdict; otherwise it is `moved`. A row in rotation (a new canonical arriving from the sitemap) or
+  one suppressed about the URL itself (a 404, a noindex) is `has-target`.
 - **One candidate.** One target of the entity in rotation has a page for this device that is a 200,
   indexable, inside its own expiry (not SWR), and not covered by an invalidation it predates. When more
   than one does, the [entity registry](#the-entity-registry-and-adopting-the-canonical-the-origin-names-entities)
@@ -425,15 +427,17 @@ entities:
   - `check`: a serve-time check, from the endpoint's canonical slot or the origin document's canonical.
   - `origin`: a miss proxied to the origin on an `entityServe` route. Its canonical is read off the head
     as the crawler's bytes stream by (at most 128 KiB, and at most 32 at once per worker), so it costs no
-    second request and nothing the response waits on.
+    second request and nothing the response waits on. It moves a row the registry already holds and never
+    creates one (`untracked`), so a crawler asking for invented product ids cannot create rows; a URL with a
+    query string is not read, and the tap stops with `ingress.entityServe.enabled`.
   - When two observations disagree, the newer wins. A render's instant is when it read the origin
     (store time less the sum of its renders), so a render claimed before a re-slug can't undo the probe
     that saw it.
   - An unchanged observation writes nothing, and neither does the same canonical spelled otherwise
     (`%27` for an apostrophe). That is one document, as the probe's own `path` comparator already
     treats it.
-  - A canonical under another entity's prefix is ignored, and so is a relative path (only an absolute
-    URL or a `/`-rooted path counts).
+  - A canonical under another entity's prefix is ignored, and so is one with a query string, and a relative
+    path (only an absolute URL or a `/`-rooted path counts).
 - **Adoption.** When any observer names a canonical that is another URL of the same entity than the one
   it observed, and no target holds it in rotation, its target is filed due now and urgent, as redirect
   adoption does.

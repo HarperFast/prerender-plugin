@@ -79,7 +79,11 @@ test('the crawler gets every byte, and the resolver hears the canonical as an OR
 	assert.notEqual(tapped, resource, 'a tapped resource carries the crawler’s branch');
 	assert.deepEqual(await drain(tapped.content), bytes);
 	await settled();
-	assert.deepEqual(told, [{ url: URL_ASKED, value: CANONICAL, from: 'origin' }]);
+	assert.deepEqual(
+		told.map(({ atMs, ...rest }) => rest),
+		[{ url: URL_ASKED, value: CANONICAL, from: 'origin' }]
+	);
+	assert.ok(Number.isFinite(told[0].atMs), 'stamped with when the document arrived');
 	assert.equal(originCanonical.tapsInFlight(), 0);
 });
 
@@ -190,4 +194,57 @@ test('tapsOriginCanonical: a GET, on an entityServe route with an entity prefix,
 	assert.equal(originCanonical.tapsOriginCanonical({ entityServe: true }, 'GET'), false);
 	applyOptions({});
 	assert.equal(originCanonical.tapsOriginCanonical(route, 'GET'), false, 'registry off');
+});
+
+test('an UNSENT tapped response lets go: its branch is cancelled, and the source once the tap has its prefix', async () => {
+	let cancelled = false;
+	let at = 0;
+	const bytes = Buffer.from(DOCUMENT('z'.repeat(2 * 1024 * 1024)));
+	const source = new ReadableStream({
+		pull(controller) {
+			if (at >= bytes.length) return controller.close();
+			controller.enqueue(new Uint8Array(bytes.subarray(at, at + 16 * 1024)));
+			at += 16 * 1024;
+		},
+		cancel() {
+			cancelled = true;
+		},
+	});
+	const told = [];
+	const tapped = originCanonical.tapOriginCanonical(
+		{ statusCode: 200, headers: { 'content-type': 'text/html' }, content: source, releaseBody() {} },
+		{ url: URL_ASKED, resolve: async (o) => told.push(o) }
+	);
+	// A local 304, or a client gone: the response never reads its body.
+	await tapped.releaseBody();
+	await settled();
+	await new Promise((r) => setTimeout(r, 20));
+	assert.equal(cancelled, true, 'the source is cancelled, not drained');
+	assert.ok(at <= originCanonical.TAP_MAX_BYTES + 32 * 1024, `read ${at} bytes of ${bytes.length}`);
+	assert.equal(told.length, 1, 'the tap still read its canonical');
+	assert.equal(originCanonical.tapsInFlight(), 0);
+});
+
+test('stacked under the raw-cache capture, both copies are whole and the canonical is read', async () => {
+	const { teeForCapture } = await import('../src/util/rawCache.js');
+	const bytes = Buffer.from(DOCUMENT('w'.repeat(300 * 1024)));
+	const { resource } = resourceOf(bytes, {}, 200, 8 * 1024);
+	const told = [];
+	const tapped = originCanonical.tapOriginCanonical(resource, { url: URL_ASKED, resolve: async (o) => told.push(o) });
+	const { downstream, captured } = teeForCapture(tapped.content, 4 * 1024 * 1024);
+	assert.deepEqual(await drain(downstream), bytes, 'the crawler’s copy');
+	assert.deepEqual((await captured).bytes, bytes, 'the raw cache’s copy');
+	await settled();
+	assert.equal(told.length, 1);
+});
+
+test('no tap for a URL with a query string, or with the entity serve’s master switch off', async () => {
+	const { applyOptions } = await import('../src/config.js');
+	const route = { entityServe: true, entityPrefix: /^\/product\/prd-[^/]+\//y };
+	applyOptions({ entities: { enabled: true } });
+	assert.equal(originCanonical.tapsOriginCanonical(route, 'GET', URL_ASKED), true);
+	assert.equal(originCanonical.tapsOriginCanonical(route, 'GET', `${URL_ASKED}?color=red`), false);
+	applyOptions({ entities: { enabled: true }, ingress: { entityServe: { enabled: false } } });
+	assert.equal(originCanonical.tapsOriginCanonical(route, 'GET', URL_ASKED), false);
+	applyOptions({});
 });

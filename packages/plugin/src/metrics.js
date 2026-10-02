@@ -731,7 +731,9 @@ export const METRICS = Object.freeze({
 			'util/entity.js), by what it did to the registry: new (the entity\u2019s first row), moved (the canonical ' +
 			'changed — a re-slug, or one observation correcting another), same (nothing written), older (a ' +
 			'disagreeing observation made before the stored one, ignored), foreign (a canonical under another ' +
-			'entity\u2019s prefix, ignored), unreadable, error; context = the observer: probe (the change probe\u2019s ' +
+			'entity\u2019s prefix, or carrying a query string, ignored), untracked (a crawler\u2019s proxied miss of an ' +
+			'entity with no row: no row is created from crawler traffic), unreadable, error; context = the observer: ' +
+			'probe (the change probe\u2019s ' +
 			'mapped canonical), render (a stored page\u2019s canonical, or the one a canonical verdict declared), ' +
 			'check (a serve-time check\u2019s endpoint or document) or origin (a proxied origin document on an ' +
 			'entityServe route). moved per day is the re-slug rate; which observer moves it first says how fast a ' +
@@ -933,7 +935,7 @@ export const METRICS = Object.freeze({
 					'(gated, would-gate, suppressed-only, no-siblings, no-prefix, error). entity_serve: the outcome ' +
 					'(served, would-serve, no-prefix, has-query, has-target, no-sibling, no-page, not-indexable, stale, ' +
 					'invalidated, ambiguous, unconfirmed, moved, not-self-canonical, unreadable, error). entity_canonical: the outcome ' +
-					'(new, moved, same, older, foreign, unreadable, error). canonical_adopt: the outcome (adopted, ' +
+					'(new, moved, same, older, foreign, untracked, unreadable, error). canonical_adopt: the outcome (adopted, ' +
 					'reactivated, would-adopt, exists, suppressed, recent, capped, refused, error). raw_cache: THE OUTCOME — stored, ' +
 					'stored-unshared, or the refusal name; this is the slot the console reads that panel from. ' +
 					'negative_cache: the outcome — stored/stored-unshared; a refusal (has-cookie, private, no-store, ' +
@@ -1171,7 +1173,7 @@ export const metrics = Object.freeze({
 
 	/**
 	 * One observation of an entity's canonical (util/entity.js) — a prerender_ops series. `outcome` is what it
-	 * did to the registry (new, moved, same, older, foreign, unreadable, error); `from` is the observer: 'probe',
+	 * did to the registry (new, moved, same, older, foreign, untracked, unreadable, error); `from` is the observer: 'probe',
 	 * 'render', 'check' or 'origin'.
 	 */
 	entityCanonical: (outcome, from) =>

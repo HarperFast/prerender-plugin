@@ -23,9 +23,9 @@
  * Only a GET answered 200 with an HTML content type, on an `entityServe` route, with the registry on.
  */
 
+import { config } from '../config.js';
 import { entitiesOn, resolveCanonical } from './entity.js';
 import { charsetOfContentType, createDocumentFactsScanner, documentFactsOf } from './documentFacts.js';
-import { discardStream } from './rawCache.js';
 
 /** How far into a document a tap reads. The canonical is in the head: measured, `</head>` at ~8% of a product page. */
 export const TAP_MAX_BYTES = 128 * 1024;
@@ -40,9 +40,19 @@ export const tapsInFlight = () => inFlight;
 const HTML = /^\s*text\/html\b/i;
 const IDENTITY = new Set(['', 'identity']);
 
-/** Does a proxied response for `route` and `method` get tapped at all? No I/O. */
-export const tapsOriginCanonical = (route, method) =>
-	method === 'GET' && route?.entityServe === true && route.entityPrefix instanceof RegExp && entitiesOn();
+/**
+ * Does a proxied response for `route`, `method` and `url` get tapped at all? No I/O. Only a GET with no query
+ * string (a param the route keys can change the document, and a crawler chooses its value), on an `entityServe`
+ * route, with the registry on and the entity serve's master switch on — the one switch an operator stops the
+ * entity serve's bot-path work with.
+ */
+export const tapsOriginCanonical = (route, method, url) =>
+	method === 'GET' &&
+	route?.entityServe === true &&
+	route.entityPrefix instanceof RegExp &&
+	!URL.parse(url ?? '')?.search &&
+	config.ingress?.entityServe?.enabled !== false &&
+	entitiesOn();
 
 /**
  * Tap `resource` (a `fetchOriginResource` result) for the canonical its document declares, observed for the
@@ -63,16 +73,20 @@ export const tapOriginCanonical = (resource, { url, resolve = resolveCanonical }
 		return resource;
 	}
 	inFlight++;
+	// The origin built this document just before its headers arrived: that is the observation's instant.
+	const atMs = Date.now();
 	readCanonical(branch, headers)
-		.then((canonical) => (canonical ? resolve({ url, value: canonical, from: 'origin' }) : null))
+		.then((canonical) => (canonical ? resolve({ url, value: canonical, from: 'origin', atMs }) : null))
 		.catch((e) => logger.warn?.(`[prerender] origin canonical not read for ${url}: ${e?.message ?? String(e)}`))
 		// ALWAYS: a slot not returned is a permanent loss of taps on this worker.
 		.finally(() => {
 			inFlight--;
 		});
-	// `releaseBody` replaced, as the raw cache's capture does: an unsent response drains its branch instead of
-	// destroying the source out from under the tap.
-	return { ...resource, content: downstream, releaseBody: () => discardStream(downstream) };
+	// `releaseBody` replaced: the tee has locked the source, so the original release cannot run. An unsent response
+	// (a local 304, a client gone) CANCELS its branch rather than draining it. The source is cancelled once the
+	// tap's branch, bounded at TAP_MAX_BYTES, has let go too, so nothing is read past the tap's prefix and a
+	// stalled origin pins nothing. (A raw-cache capture stacked on this replaces it with its own drain, as before.)
+	return { ...resource, content: downstream, releaseBody: () => downstream.cancel().catch(() => {}) };
 };
 
 /** The absolute canonical a document's head declares, or null. Reads at most `TAP_MAX_BYTES`. */

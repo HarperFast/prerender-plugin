@@ -620,7 +620,7 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	// entityServe route every spelling is one document, so every fetch that reaches here — a miss, a stale or an
 	// invalidated page — says where the product lives now. Read off the head as the bytes stream by: no second
 	// origin request, and nothing this response waits on.
-	const observed = tapsOriginCanonical(info.route, request.method)
+	const observed = tapsOriginCanonical(info.route, request.method, cacheUrl)
 		? tapOriginCanonical(resource, { url: cacheUrl })
 		: resource;
 	// Keep what we just fetched, for the next crawler asking the same question. The capture rides the

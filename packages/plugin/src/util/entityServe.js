@@ -98,7 +98,7 @@ import { config } from '../config.js';
 import { metrics } from '../metrics.js';
 import { CacheKey } from './cacheKey.js';
 import { entityPrefixOf, inRotation } from './entityGate.js';
-import { entitiesOn, readEntity, sameDocument } from './entity.js';
+import { canonicalFormOf, entitiesOn, readEntity, sameDocument } from './entity.js';
 import { resolveServeStatus } from './pageFreshness.js';
 import { resolveInvalidation } from './invalidation.js';
 import { queryAllowlistFor, routeScopeForEntry } from './routeClass.js';
@@ -109,7 +109,7 @@ import { materializeCachedBody } from './cachedBody.js';
 import { documentFactsOf } from './documentFacts.js';
 import { headersToObject } from './headers.js';
 import { canonicalizeUrl } from './url.js';
-import { dateColumnMs } from './time.js';
+import { dateColumnMs, MINUTE } from './time.js';
 
 /**
  * Every outcome of one evaluation, as recorded on `prerender_ops` / `entity_serve`. Exactly one per
@@ -157,6 +157,16 @@ export const EntityServeOutcome = Object.freeze({
 });
 
 /**
+ * How long before its store or its check a candidate's confirmation READ the origin, at most. The registry stamps
+ * every observation with when the origin was read (a render's store time less its renders, a check's request),
+ * but a page row carries only its store time and a check its write time. So a confirmation is taken as made this
+ * much earlier, and an observation of another canonical in that gap vetoes it: the safe direction, since the gap
+ * is where a re-slug can land between the candidate's read and its store. Renders run seconds; this covers a slow
+ * one and its result post.
+ */
+export const CONFIRMATION_READ_SLACK_MS = 2 * MINUTE;
+
+/**
  * Rows one evaluation reads under the prefix — every target of the entity, its spellings suppressed or
  * not, and this spelling's own row if it has one. Larger than the discovery gate's 3 because this read
  * must prove a NEGATIVE (no second candidate, no row of its own), and only a read that ends before the
@@ -168,7 +178,13 @@ export const ENTITY_READ_LIMIT = 8;
 
 // What the read projects: each row's key and state, and — for this spelling's own row — why it was suppressed.
 // An ARRAY: a string `select` projects to a bare scalar.
-export const ENTITY_ROW_SELECT = Object.freeze(['url', 'state', 'suppressedReason']);
+export const ENTITY_ROW_SELECT = Object.freeze([
+	'url',
+	'state',
+	'suppressedReason',
+	'suppressedAt',
+	'suppressedCanonical',
+]);
 
 // A spelling whose own target is suppressed as a CANONICAL VERDICT is answered: its own render found that the
 // page names its canonical elsewhere, which is exactly the case this serve exists for. Measured on one
@@ -213,8 +229,14 @@ export const readEntityRows = async ({ table, prefix, url, limit = ENTITY_READ_L
 			ended = true;
 			break;
 		}
-		if (key === url) own = { state: row.state ?? null, suppressedReason: row.suppressedReason ?? null };
-		else if (inRotation(row)) keys.push(key);
+		if (key === url) {
+			own = {
+				state: row.state ?? null,
+				suppressedReason: row.suppressedReason ?? null,
+				suppressedAt: row.suppressedAt ?? null,
+				suppressedCanonical: row.suppressedCanonical ?? null,
+			};
+		} else if (inRotation(row)) keys.push(key);
 	}
 	return { own, inRotation: keys, complete: !unreadable && (ended || read < limit) };
 };
@@ -433,11 +455,28 @@ export async function resolveEntityServe({
 			}
 			confirmedAtMs = Math.max(lastCachedMs, check.checkedAtMs);
 		}
+		// When the origin was last READ in confirming it (see CONFIRMATION_READ_SLACK_MS).
+		const confirmedReadAt = confirmedAtMs - CONFIRMATION_READ_SLACK_MS;
+		// THE SPELLING'S OWN VERDICT, when it is suppressed as one: its render said the product lives elsewhere. If
+		// that verdict is newer than the candidate's confirmation, it is the newest word on the entity, and the
+		// candidate is answered only when the verdict NAMED it (`suppressedCanonical`, browser >= 1.40.0). A verdict
+		// that named another URL, or that predates the field, falls through as `moved` until the candidate is
+		// confirmed again — which the nightly pass and the serve-time check do. Independent of the registry.
+		if (rows.own) {
+			const disownedAt = dateColumnMs(rows.own.suppressedAt);
+			const verdictNamed =
+				typeof rows.own.suppressedCanonical === 'string'
+					? (canonicalFormOf(rows.own.suppressedCanonical) ?? rows.own.suppressedCanonical)
+					: null;
+			if (!(disownedAt <= confirmedReadAt) && !(verdictNamed && sameDocument(verdictNamed, url))) {
+				return decided(EntityServeOutcome.MOVED);
+			}
+		}
 		// THE REGISTRY'S VETO. The origin named another canonical AFTER this page was last confirmed: a re-slug it
 		// predates, seen by whichever observer got there first. Until the page re-renders (and is suppressed) or
 		// a check confirms it again, it is not handed to other spellings. An unreadable instant vetoes: there is
 		// no telling which came first.
-		if (named && !sameDocument(named, url) && !(dateColumnMs(registry.canonicalAt) <= confirmedAtMs)) {
+		if (named && !sameDocument(named, url) && !(dateColumnMs(registry.canonicalAt) <= confirmedReadAt)) {
 			return decided(EntityServeOutcome.MOVED);
 		}
 

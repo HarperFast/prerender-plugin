@@ -227,7 +227,8 @@ const page = (over = {}) => {
 		...over,
 	};
 };
-const target = (url, state = null, suppressedReason = null) => targets.set(url, { url, state, suppressedReason });
+const target = (url, state = null, suppressedReason = null, over = {}) =>
+	targets.set(url, { url, state, suppressedReason, suppressedAt: null, suppressedCanonical: null, ...over });
 const keyOf = (url, device = 'desktop') => `${url}|${device}`;
 // The entity, as it stands on the measured origin: one canonical target in rotation with a fresh page,
 // an old slug suppressed beside it, and nothing at all for the spelling a crawler asks for.
@@ -385,8 +386,9 @@ test('has-target: a spelling with a target the render path keeps — in rotation
 test('a spelling suppressed as a CANONICAL VERDICT is answered: its own render said the product lives elsewhere', async () => {
 	for (const reason of ['canonical-mismatch', 'canonical-variant']) {
 		targets.clear();
-		entity();
-		target(VARIANT, 'suppressed', reason);
+		entity(); // rendered at ANCHOR + 1h
+		// Its verdict is older than the canonical's render: the render is the newer word, whatever it named.
+		target(VARIANT, 'suppressed', reason, { suppressedAt: new Date(ANCHOR - HOUR) });
 		analytics.length = 0;
 		const res = await handleBotRequest(request(VARIANT));
 		await drain(res.body);
@@ -472,7 +474,7 @@ test('the read is one bounded, one-sided, node-local PK range with the minimal p
 		{ attribute: 'url', comparator: 'greater_than_equal', value: `${ORIGIN}/product/prd-1/` },
 	]);
 	assert.equal(query.limit, entityServe.ENTITY_READ_LIMIT);
-	assert.deepEqual(query.select, ['url', 'state', 'suppressedReason']);
+	assert.deepEqual(query.select, ['url', 'state', 'suppressedReason', 'suppressedAt', 'suppressedCanonical']);
 	assert.deepEqual(context, { replicateFrom: false });
 });
 
@@ -1042,6 +1044,8 @@ test('a miss that reaches the origin teaches the registry the canonical its docu
 		comparesCanonical: () => true,
 	});
 	const next = NEW_SLUG();
+	// The probe recorded the product last night, at its old slug: a crawler's miss moves a row, never creates one.
+	entityRows.set(PREFIX(), registryRow(`${ORIGIN}/product/prd-1/old-slug.jsp`, ANCHOR, 'probe'));
 	// No sibling in rotation: the spelling falls through to the origin, whose document names the new slug.
 	target(`${ORIGIN}/product/prd-1/old-slug.jsp`, 'suppressed', 'canonical-mismatch');
 	origin.body = `<!doctype html><html><head><link rel="canonical" href="${next}"><title>t</title></head><body>${'x'.repeat(4096)}</body></html>`;
@@ -1069,4 +1073,32 @@ test('no tap with the registry off, on a route that does not opt in, or for a HE
 	await drain((await handleBotRequest(request(VARIANT, 'HEAD'))).body);
 	await settle(100);
 	assert.equal(entityRows.size, 0);
+});
+
+// ── review of 0.102.0 ────────────────────────────────────────────────────────────────────────────────
+
+test('a suppressed spelling whose verdict is NEWER than the candidate’s confirmation is answered only with the page it named', async () => {
+	const disowned = new Date(ANCHOR + 2 * HOUR); // after the candidate's render at ANCHOR + 1h
+	const cases = [
+		[{ suppressedAt: disowned }, 'moved', 'a verdict that predates the field: no telling what it named'],
+		[{ suppressedAt: disowned, suppressedCanonical: CANON }, 'served', 'it named this very page'],
+		[{ suppressedAt: disowned, suppressedCanonical: NEW_SLUG() }, 'moved', 'it named another canonical'],
+		[{ suppressedAt: 'not a date', suppressedCanonical: CANON }, 'served', 'named it: the instant does not matter'],
+		[{ suppressedAt: 'not a date' }, 'moved', 'an unreadable instant, and nothing named'],
+		[{ suppressedAt: new Date(ANCHOR) }, 'served', 'older than the render: the render is the newer word'],
+	];
+	for (const [over, expected, why] of cases) {
+		targets.clear();
+		entity();
+		target(VARIANT, 'suppressed', 'canonical-mismatch', over);
+		assert.equal((await evaluate()).outcome, expected, why);
+	}
+});
+
+test('the registry veto allows for the gap between a candidate’s origin read and its store', async () => {
+	entity(); // stored at ANCHOR + 1h, read up to CONFIRMATION_READ_SLACK_MS before that
+	withRegistry(registryRow(NEW_SLUG(), ANCHOR + HOUR - 30_000));
+	assert.equal((await evaluate()).outcome, 'moved', 'seen 30s before the store: the render may have read before it');
+	withRegistry(registryRow(NEW_SLUG(), ANCHOR + HOUR - entityServe.CONFIRMATION_READ_SLACK_MS - 1000));
+	assert.equal((await evaluate()).outcome, 'served', 'well before the render: the render is the newer word');
 });

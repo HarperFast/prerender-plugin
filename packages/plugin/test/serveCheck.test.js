@@ -847,7 +847,11 @@ test('a field scoped away from a URL (pathPattern) cannot decide its check there
 test('a check tells the entity registry the canonical the endpoint named — agree or not, never from a disarmed field', async () => {
 	const { setApi } = await setup();
 	const told = [];
-	const resolveCanonical = async (observation) => told.push(observation);
+	const before = Date.now();
+	const resolveCanonical = async ({ atMs, ...observation }) => {
+		assert.ok(atMs >= before && atMs <= Date.now(), 'stamped with when the origin was asked');
+		told.push(observation);
+	};
 	serveCheck.__setServeCheckDepsForTest({ ...currentDeps(), resolveCanonical });
 	await consider(served());
 	assert.deepEqual(told, [{ url: URL_A, value: '/product/prd-a/red-shoe.jsp', from: 'check' }], 'an agreeing check');
@@ -890,7 +894,7 @@ test('a document check tells the registry the canonical the origin document decl
 		'</head><body></body></html>';
 	serveCheck.__setServeCheckDepsForTest({
 		...currentDeps(),
-		resolveCanonical: async (observation) => told.push(observation),
+		resolveCanonical: async ({ atMs, ...observation }) => told.push(observation),
 		fetchDocument: async () => ({
 			statusCode: 200,
 			headers: { 'content-type': 'text/html' },

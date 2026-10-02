@@ -1408,7 +1408,7 @@ test('the entity-serve panel names the newer fall-throughs and what an evaluatio
 	assert.match(text, /median · p95/);
 });
 
-test('the registry panel: re-slugs seen by the observer that saw them, and the adoption dry-run number', async () => {
+test('the registry panel: canonical moves by the observer that saw them, and the adoption dry-run number', async () => {
 	const analytics = {
 		...ANALYTICS,
 		series: [
@@ -1432,7 +1432,7 @@ test('the registry panel: re-slugs seen by the observer that saw them, and the a
 	const text = everything(ctx);
 	assert.match(text, /Entity registry/);
 	assert.match(text, /adoption dry run/);
-	assert.match(text, /Re-slugs seen/);
+	assert.match(text, /Canonical moves/);
 	assert.match(text, /60 proxied origin documents · 25 renders · 15 the nightly probe/);
 	assert.match(text, /Would adopt/);
 	assert.match(text, /70 under the hourly budget · 5 past it/);
