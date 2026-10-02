@@ -3103,9 +3103,13 @@ export const configSchema = group('Prerender plugin configuration.', {
 			'`entities.adopt`. Observations on `prerender_ops` / `entity_canonical`.',
 		{
 			enabled: option(
-				false,
-				'Keep the registry. Off by default: on, the first probe pass writes one row per probed entity (paced ' +
-					'by the probe) and renders fill in the rest; after that it writes only when a canonical moves.'
+				true,
+				'Keep the registry. ON by default, and inert for any route without an `ingress.routes[].entityPrefix`: ' +
+					'that prefix is the opt-in. On a route with one, the first probe pass writes one row per probed ' +
+					'entity (paced by the probe) and renders fill in the rest; after that it writes only when a canonical ' +
+					'moves. Nothing a crawler sees changes with it alone: adoption is dry run by default ' +
+					'(`entities.adopt.dryRun`), and the entity serve needs its own opt-in. Off removes every registry ' +
+					'read and write, and the entity serve then has no `moved` veto and no tie-break.'
 			),
 			adopt: group(
 				'ADOPT A CANONICAL NO TARGET HOLDS (util/entity.js `resolveCanonical`, issue #166). When an observation ' +
@@ -3122,7 +3126,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'observations are the origin\u2019s own answers for the entity, so a crawler-invented spelling ' +
 					'cannot make one invent a canonical. Outcomes on `prerender_ops` / `canonical_adopt`.',
 				{
-					enabled: option(true, 'Switch. Inert until `entities.enabled`, so leaving it on costs nothing until then.'),
+					enabled: option(
+						true,
+						'Switch. Files nothing while `dryRun` is on, and nothing at all with the registry off.'
+					),
 					dryRun: option(
 						true,
 						'Count `would-adopt` and file nothing. The default, because the number to know first is how many ' +

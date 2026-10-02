@@ -182,7 +182,7 @@ Notes that bite:
   unlike the `route`/`bot` gates, `entity` is evaluated only for URLs with no target row, so it counts
   refused mints rather than gated misses on known targets.
 - **The entity registry is `prerender_ops` / `entity_canonical` and `canonical_adopt`** (v0.101.0,
-  `entities.enabled`). `entity_canonical`: one emit per observation of an entity's canonical, detail =
+  `entities.enabled`, on by default for routes with an `entityPrefix`). `entity_canonical`: one emit per observation of an entity's canonical, detail =
   what it did to the registry (`new`, `moved`, `same`, `older`, `foreign`, `unreadable`, `error`),
   context = the observer (`probe` or `render`). `moved`/`probe` per day is the re-slug rate; `moved`
   alternating between `probe` and `render` for the same entities means the endpoint and the page

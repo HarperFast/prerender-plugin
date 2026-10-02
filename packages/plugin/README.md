@@ -322,10 +322,14 @@ holding the entity's current canonical URL ([#166](https://github.com/HarperFast
 
 ```yaml
 entities:
-  enabled: true
+  enabled: true # the default: a route opts in by declaring entityPrefix
   adopt:
     dryRun: true # the default: count would-adopt, file nothing
 ```
+
+On by default, because the route's `entityPrefix` is already the opt-in. A deployment with no such route
+has no entities and the registry does nothing. Alone it changes nothing a crawler sees: adoption files
+nothing until `adopt.dryRun: false`, and the entity serve needs its own `entityServe`.
 
 - **Written by observations of the origin only.** The change probe's mapped `canonical` slot is one
   observer; it is the endpoint's own answer for the product id. A stored render's declared

@@ -160,7 +160,8 @@ type Target @table(database: "render_service") @export {
 # origin — the change probe's mapped `canonical` slot and a stored render's declared canonical — and only
 # when the canonical MOVES (an unchanged observation writes nothing). Replicated and NOT residency-pinned,
 # like `Target`: writes are rare, and every node answers a point read locally. Not @export: internal state,
-# read through the admin API. Inert unless `entities.enabled`.
+# read through the admin API. On by default (`entities.enabled`), and empty for a deployment whose routes declare
+# no `entityPrefix`.
 type Entity @table(database: "render_service") {
 	id: String @primaryKey
 	# The canonical URL (a Target key) the newest observation named.
