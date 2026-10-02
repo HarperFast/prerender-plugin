@@ -1497,11 +1497,18 @@ export const runProbePass = async ({
 		// THE ENTITY'S CANONICAL, as the origin's endpoint names it now (util/entity.js). Before the baseline
 		// logic, because it is a statement about the origin, not about this row's history: a re-baselined or a
 		// changed row reports its product's canonical all the same. Only from an ARMED mapped field — one the
-		// mapping guard disarmed is suspected of being mapped wrong, and must not file targets.
+		// mapping guard disarmed is suspected of being mapped wrong, and must not file targets. The hook is an
+		// add-on to the pass, so its failure is logged and the row carries on: it must never end the pass.
 		if (onCanonical) {
 			const field = canonicalFieldOf(rule);
 			const slots = field && (!guard || guard.isArmed(rule, field)) ? valuesOf() : null;
-			if (slots) await onCanonical({ url: row.url, value: slots[field.slot] });
+			if (slots) {
+				try {
+					await onCanonical({ url: row.url, value: slots[field.slot] });
+				} catch (e) {
+					logger.warn?.(`[prerender] change-probe: entity registry failed for ${row.url}: ${e?.message ?? String(e)}`);
+				}
+			}
 		}
 
 		// RULE CHANGED, NOT CONTENT. A baseline is only comparable to an observation made the same

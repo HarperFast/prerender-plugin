@@ -2820,6 +2820,33 @@ test('the entity registry is told the canonical slot of every probe that answere
 	assert.deepEqual(told, []);
 });
 
+test('an entity registry that throws, synchronously or not, costs the pass nothing', async () => {
+	const signature = await apiSig({ seoUrl: '/product/prd-a/new-spelling.jsp' });
+	for (const fail of [
+		() => {
+			throw new Error('sync');
+		},
+		async () => {
+			throw new Error('async');
+		},
+	]) {
+		const told = [];
+		const onCanonical = (observation) => (observation.url === URL_A ? fail() : told.push(observation.url));
+		const { stats, written } = await runMappedPass({
+			rows: [row(URL_A), row(URL_B)],
+			answers: { [URL_A]: signature, [URL_B]: signature },
+			onCanonical,
+		});
+		assert.deepEqual(told, [URL_B], 'the next row is still probed and reported');
+		assert.deepEqual(
+			written.map(({ url }) => url),
+			[URL_A, URL_B],
+			'the failing row still seeds its baseline'
+		);
+		assert.equal(stats.failed, 0);
+	}
+});
+
 test('CAUGHT UP: the origin changed and the page ALREADY shows the new value -> baseline moves, nothing triggered', async () => {
 	// A cadence render landed after the rename: re-rendering again would buy nothing.
 	const before = await apiSig();
