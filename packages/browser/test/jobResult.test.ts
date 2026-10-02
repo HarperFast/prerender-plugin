@@ -111,7 +111,7 @@ test('a noindex page posts outcome=non-indexable with the reason', async () => {
 	assert.equal(meta.reason, 'noindex');
 });
 
-test('a canonical verdict posts the canonical the page declared; a render with content never does', async () => {
+test('a canonical verdict posts the canonical the page declared — with or without content; an indexable render never does', async () => {
 	const job = makeJob();
 	job.attemptStarted();
 	job.httpResponse = { statusCode: 200, headers: {} };
@@ -123,16 +123,24 @@ test('a canonical verdict posts the canonical the page declared; a render with c
 	assert.equal(meta.outcome, 'non-indexable');
 	assert.equal(meta.declaredCanonical, 'https://site.example.com/product/x-new-slug');
 
+	// A sitemap target is serialized even when non-indexable: its content and its declared canonical both post.
+	const listed = makeJob();
+	listed.attemptStarted();
+	listed.httpResponse = { statusCode: 200, headers: { 'content-type': 'text/html' } };
+	listed.isIndexable = false;
+	listed.declaredCanonical = 'https://site.example.com/product/x-new-slug';
+	listed.attemptEnded(undefined, '<html>listed</html>');
+	const stored = await send(listed);
+	assert.equal(stored.outcome, 'rendered');
+	assert.equal(stored.declaredCanonical, 'https://site.example.com/product/x-new-slug');
+
 	// Absent, not null, when there is nothing to say: an older plugin never sees the key.
 	const plain = makeJob();
 	plain.attemptStarted();
 	plain.httpResponse = { statusCode: 200, headers: { 'content-type': 'text/html' } };
 	plain.isIndexable = true;
-	plain.declaredCanonical = 'https://site.example.com/product/x-new-slug'; // left over from an earlier attempt
 	plain.attemptEnded(undefined, '<html>ok</html>');
-	const stored = await send(plain);
-	assert.equal(stored.outcome, 'rendered');
-	assert.equal('declaredCanonical' in stored, false);
+	assert.equal('declaredCanonical' in (await send(plain)), false);
 });
 
 test('a failed render posts outcome=error with the attempt error and derived reason', async () => {

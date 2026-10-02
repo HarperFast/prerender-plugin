@@ -1143,8 +1143,9 @@ const renderer: Renderer = async (page, job) => {
 			job.isIndexable = verdict.isIndexable;
 			if (!verdict.isIndexable) {
 				job.reason = verdict.reason;
-				job.declaredCanonical = verdict.declaredCanonical;
 			}
+			// Assigned on every verdict, so an earlier attempt's never outlives a later one's.
+			job.declaredCanonical = verdict.declaredCanonical;
 
 			if (job.isIndexable || job.isFromSitemap) {
 				// Before postProcess: it may strip nodes, and this must describe the page as
@@ -1310,12 +1311,11 @@ export function indexVerdict(
 	const verdict = canonicalVerdict(signals.canonicalHref, pageUrl);
 	const disowned = verdict === 'elsewhere' || (verdict === 'variant' && strict);
 	if (!signals.noindex && !disowned) return { isIndexable: true };
-	const declaredCanonical = verdict === 'self' ? undefined : declaredCanonicalOf(signals.canonicalHref, pageUrl);
-	return {
-		isIndexable: false,
-		reason: signals.noindex ? 'noindex' : verdict === 'variant' ? 'canonical-variant' : 'canonical-mismatch',
-		...(declaredCanonical ? { declaredCanonical } : {}),
-	};
+	const reason = signals.noindex ? 'noindex' : verdict === 'variant' ? 'canonical-variant' : 'canonical-mismatch';
+	// Only a CANONICAL verdict reports where the page points: a noindex page's canonical is a statement made by
+	// a page that asked not to be indexed, and is not what the plugin adopts targets from.
+	const declaredCanonical = reason === 'noindex' ? undefined : declaredCanonicalOf(signals.canonicalHref, pageUrl);
+	return { isIndexable: false, reason, ...(declaredCanonical ? { declaredCanonical } : {}) };
 }
 
 /**
@@ -1329,11 +1329,16 @@ function declaredCanonicalOf(canonicalHref: string | null, pageUrl: string): str
 	try {
 		const url = new URL(canonicalHref, pageUrl);
 		url.hash = '';
-		return url.href;
+		// A web page's URL, of a length that could ever be a cache key; anything else is not worth posting.
+		if (url.protocol !== 'https:' && url.protocol !== 'http:') return undefined;
+		return url.href.length <= DECLARED_CANONICAL_MAX ? url.href : undefined;
 	} catch {
 		return undefined;
 	}
 }
+
+/** Longest declared canonical posted: past this no Harper primary key could hold it (the limit is ~1,978 bytes). */
+const DECLARED_CANONICAL_MAX = 2048;
 
 function extractIndexSignals(): { canonicalHref: string | null; noindex: boolean } {
 	let canonicalHref: string | null = null;
