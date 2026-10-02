@@ -61,7 +61,7 @@ import { dispatcherFor, configuredStagingIp } from './upstream.js';
 import { cacheKeysOf } from '../resources/Target.js';
 import { resolveVerification, writeVerification } from './pageVerification.js';
 import { checkSparesProbe, readPageCheck, writePageCheck } from './pageCheck.js';
-import { createCanonicalObserver, entitiesOn } from './entity.js';
+import { entitiesOn, resolveCanonical } from './entity.js';
 import { walkUrlRange } from './urlWalk.js';
 import { runDetached } from './detach.js';
 import { getSab } from './coordination.js';
@@ -1383,7 +1383,7 @@ export const runProbePass = async ({
 	// Told the rate each batch was paced at and the backoff on it (`(rate, originThrottle, loadThrottle)`),
 	// so a sweep can publish the budget it leaves (`publishSweepHeadroom`).
 	onPace = () => {},
-	// The entity registry's observer (util/entity.js `createCanonicalObserver`), told `{ url, value }` — the
+	// The entity registry's observer (util/entity.js `resolveCanonical`), told `{ url, value }` — the
 	// probed URL and its rule's mapped `canonical` slot — after every probe that answered. Null = none: the
 	// registry is off, or this is the canary, which detects and adopts nothing.
 	onCanonical = null,
@@ -2545,9 +2545,11 @@ export const runProbeSweepOnce = async ({
 			readCheck: config.changeProbe.serveCheck?.enabled ? readPageCheck : null,
 			skipCheckedSince: serveChecksArmed() ? (resume?.originStartedAt ?? startedAt) : null,
 			recordCheck: config.changeProbe.serveCheck?.enabled ? writePageCheck : null,
-			// One observer per pass, counting adoptions by the pass's origin (a resume shares its cap), and
-			// filing nothing when THIS pass is a dry run — an operator's measure-only sweep included.
-			onCanonical: entitiesOn() ? createCanonicalObserver({ probeDryRun: limits.dryRun, passId: passOrigin }) : null,
+			// The entity registry: every answered probe's canonical, filing nothing when THIS pass is a dry run —
+			// an operator's measure-only sweep included.
+			onCanonical: entitiesOn()
+				? ({ url, value }) => resolveCanonical({ url, value, from: 'probe', dryRun: limits.dryRun })
+				: null,
 			guard: theMappingGuard(),
 			...limits,
 			// Rows this pass (or the pass it resumes) already probed — see `processOne`. The same for a

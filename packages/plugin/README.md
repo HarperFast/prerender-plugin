@@ -323,8 +323,7 @@ holding the entity's current canonical URL ([#166](https://github.com/HarperFast
 ```yaml
 entities:
   enabled: true
-changeProbe:
-  adoptCanonical:
+  adopt:
     dryRun: true # the default: count would-adopt, file nothing
 ```
 
@@ -343,10 +342,10 @@ changeProbe:
   holds it in rotation, its target is filed due now and urgent, as redirect adoption does.
   - A target suppressed as a canonical verdict (`canonical-mismatch`, `canonical-variant`) is reactivated
     the same way. One suppressed for any other reason (a 404, a noindex) is left alone.
-  - Bounded by `maxPerPass` per pass and node (a resumed pass shares its cap), by `retryAfter` per entity
-    (a canonical that did not take is filed once per window, not nightly, so it costs one render a week for
-    as long as the endpoint names it), and by both dry runs. A pass run as a dry run, including an
-    operator's measure-only sweep, files nothing.
+  - Bounded by `maxPerHour` per node, shared by every worker thread and every observer; by `retryAfter`
+    per entity (a canonical that did not take is filed once per window, not nightly, so it costs one render
+    a week for as long as the origin names it); and by both dry runs. A probe pass run as a dry run,
+    including an operator's measure-only sweep, files nothing.
   - In a dry run, what arming would file is `would-adopt` plus `capped`.
 - **Why.** Measured on one deployment, products re-slug ~100 times a day and the product sitemap
   changes once a day. An out-of-stock product is not in the sitemap at all, so its new canonical
