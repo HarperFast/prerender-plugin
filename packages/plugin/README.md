@@ -351,8 +351,10 @@ origin, exactly as before:
   already declares the new one, and serving it at every spelling would spread that contradiction. So
   **map `canonical` in the probe rule's `pageCheck.fields`**, and keep its slot out of
   `ignoreChanges` so a re-spell is a change the sweep acts on. An unconfirmed page is offered to the
-  serve-time check, under that check's own switches and budget. Outside anchored mode there is no
-  anchor: set `ingress.entityServe.maxConfirmAge`, or nothing is ever confirmed.
+  serve-time check, under that check's own switches and budget, in a dry run too. A `held` check (a
+  systematic disagreement on another field, served at its own URL anyway) confirms; a `mismatch` does
+  not. Outside anchored mode there is no anchor: set `ingress.entityServe.maxConfirmAge`, or nothing is
+  ever confirmed.
 - **It names itself.** The served bytes' own `<link rel=canonical>`, read off the head, must
   canonicalize to that target's URL. `isIndexable` alone cannot say this, because a page with no
   canonical is indexable too.
@@ -370,9 +372,11 @@ fetch two spellings of one product from the origin and compare everything except
 The canonical, title, description, offers and breadcrumbs must be identical, and both must name the
 same canonical URL.
 
-**Arm the entity gate with it.** A spelling a minting crawler asks for gets a target on its first
-miss, and from then on it is never entity-served. With the gate in dry run, `entityServe` answers only
-the first request for each such spelling. Armed, the gate never mints them.
+**Arm the entity gate with it.** A spelling this does not answer (every one, in a dry run) goes to the
+origin, and a minting crawler's miss mints it. From then on it is never entity-served (`has-target`).
+Armed, the gate never mints such a spelling. A served spelling is never minted either, because it was
+not a miss. So with the gate in dry run, `would-serve` counts only each spelling's first request: arm
+the gate first, or read `would-serve` as a floor.
 
 **Rollout.** Deploy with `dryRun: true`. Read `prerender_ops` / `entity_serve`: `would-serve` is what
 arming would answer, and the other outcomes say why the rest fall through. Then set `dryRun: false`.

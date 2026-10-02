@@ -485,6 +485,13 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 			info.entity = { url: serve.url, cacheKey: serve.cacheKey };
 			return serve.page;
 		}
+		// A FALL-THROUGH HERE MAY BE BEHIND VALIDATORS THIS PLUGIN HANDED OUT. An earlier entity serve gave
+		// this spelling's crawler the canonical snapshot's own validators (`page.snapshotValidators`): its
+		// `If-Modified-Since` is a render time, newer than an origin's or a raw document's `Last-Modified`
+		// that does not track content, so it would answer 304 and keep the old snapshot — after its
+		// canonical was invalidated, expired or re-spelled, which is exactly why this fell through. So it is
+		// treated like a page row this request will not serve: the crawler's validators decide nothing.
+		if (config.page.snapshotValidators) info.stripConditionals = true;
 	}
 
 	// THE RAW-DOCUMENT CACHE (util/rawCache.js), and note the status it is gated on: `miss` ONLY.
@@ -591,8 +598,9 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	// publish date) is older than that, so `If-Modified-Since` answered 304 locally and the crawler
 	// kept the pre-change snapshot of a page the probe had just expired — on exactly the path Merchant
 	// Center checks prices against. Only a TRUE miss and a raw serve keep ordinary conditional
-	// handling: nothing this plugin served can be behind their validators.
-	info.stripConditionals = Boolean(page) || info.cacheStatus === 'invalidated';
+	// handling: nothing this plugin served can be behind their validators — except on an entity-serve
+	// route, where an earlier entity serve can be (set above).
+	info.stripConditionals = Boolean(page) || info.cacheStatus === 'invalidated' || info.stripConditionals === true;
 	//
 	// A HEAD GOES UPSTREAM AS A HEAD. Sent as a GET, the origin built and sent a full document that
 	// nothing would read: `deliverResource` drops the body of a HEAD, and the undici stream behind it

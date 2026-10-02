@@ -310,9 +310,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 					're-render, the old page names its old slug while the origin declares the new one; served at ' +
 					'every spelling, the contradiction would spread. Confirmation since the anchor bounds it to what ' +
 					'the page already serves at its own URL.\n\n' +
-					'ARM THE ENTITY GATE WITH IT. A spelling a minting crawler asks for gets a target on its first ' +
-					'miss, and a spelling with a target is never entity-served. With `ingress.entityGate.dryRun: ' +
-					'true` this answers only the first request for each such spelling.\n\n' +
+					'ARM THE ENTITY GATE WITH IT. A spelling this does not answer (every one, in a dry run) goes to ' +
+					'the origin, and a minting crawler\u2019s miss mints it; a spelling with a target is never ' +
+					'entity-served. With `ingress.entityGate.dryRun: true` only each spelling\u2019s first request ' +
+					'can be answered, and `would-serve` undercounts what arming would answer by its repeats (read ' +
+					'as `has-target`). A served spelling is never minted: it was not a miss.\n\n' +
 					'Observed on `prerender_ops` / `entity_serve`, one emit per evaluation by outcome.',
 				{
 					enabled: option(
@@ -325,7 +327,9 @@ export const configSchema = group('Prerender plugin configuration.', {
 						true,
 						'Evaluate and count, but answer every miss as before. The default, because the number to know ' +
 							'first is how many misses it WOULD answer — `entity_serve` outcome `would-serve` — and why the ' +
-							'rest fall through. Turn it off to serve.'
+							'rest fall through. Turn it off to serve. Unconfirmed candidates are offered to the serve-time ' +
+							'check in a dry run too: confirming them is that check\u2019s ordinary job, under its own ' +
+							'switches and budget.'
 					),
 					maxConfirmAge: option(
 						0,

@@ -61,11 +61,18 @@
  *
  * ── WHAT IT NEEDS BESIDE IT ───────────────────────────────────────────────────────────────────
  *
- * The entity discovery gate, ARMED. A spelling a crawler is allowed to mint gets a Target on its first
- * miss (`handlePageScheduling`), and from then on guard 1 refuses it: with the gate in dry run, this
- * answers only the first request for each spelling a minting crawler asks for. Armed, the gate does not
- * mint a spelling whose entity is in rotation, so it never gets a row and every request for it can be
- * served from here.
+ * The entity discovery gate, ARMED. A spelling this does not answer — every one, in a dry run — goes to
+ * the origin, and that miss mints it for a crawler allowed to mint (`handlePageScheduling`); from then on
+ * guard 1 refuses it. Armed, the gate does not mint a spelling whose entity is in rotation. A served
+ * spelling is never minted either way: it was not a miss. So with the gate in dry run, `would-serve`
+ * counts only each spelling's first request, and its repeats read `has-target`.
+ *
+ * `held` CONFIRMS. A held row is a disagreement on some other field that re-rendering cannot fix, and its
+ * page is served with it at its own URL anyway; the canonical, the only thing this guard is about, agreed.
+ *
+ * A DRY RUN STILL OFFERS. An unconfirmed candidate is offered to the serve-time check in a dry run too,
+ * which then asks the origin and acts on what it finds under its own switches: confirming a page is that
+ * check's ordinary job, and the dry-run number would otherwise undercount what arming confirms.
  *
  * Every failure falls through: an error, an unreadable row or body, a scan that cannot read the canonical.
  * Nothing here can serve a page the guards did not pass, and nothing here can fail a request.
@@ -79,7 +86,7 @@ import { resolveServeStatus } from './pageFreshness.js';
 import { resolveInvalidation } from './invalidation.js';
 import { queryAllowlistFor, routeScopeForEntry } from './routeClass.js';
 import { readPageCheck } from './pageCheck.js';
-import { lastAnchorAt, serveChecksArmed } from './changeProbe.js';
+import { lastAnchorAt } from './changeProbe.js';
 import { checkComparesFact, considerServeCheck, serveChecksOn } from './serveCheck.js';
 import { materializeCachedBody } from './cachedBody.js';
 import { documentFactsOf } from './documentFacts.js';
@@ -258,31 +265,29 @@ const headersOf = (headers) => {
 };
 
 /**
- * Offer an unconfirmed candidate to the serve-time check (util/serveCheck.js), detached from the response.
- * The check decides for itself whether it is due, deduped and within budget; this only hands it the page.
- * The row is re-read here, outside the request, and its bytes are read only when the check would use them.
+ * Offer an unconfirmed candidate to the serve-time check (util/serveCheck.js). The check decides for itself
+ * whether it is due, deduped and within budget, against THIS threshold as well as its own, so a check the
+ * entity serve cannot use (before `maxConfirmAge`) is not taken as covering it. The bytes are a loader the
+ * check calls only once it is due — most offers are turned away by its dedupe first, and a blob read for
+ * each would be the expensive half of the offer — and it re-reads the row as it stands then.
  */
-const offerCheck = ({ url, cacheKey, deviceType, botName, route }) => {
+const offerCheck = ({ url, cacheKey, page, threshold, deviceType, botName, route }) => {
 	if (!serveChecksOn()) return;
-	setImmediate(async () => {
-		try {
-			const page = await deps.readPage(cacheKey);
-			if (!page) return;
-			const body = serveChecksArmed() ? await deps.readBody(page) : null;
-			considerServeCheck({
-				kind: 'page',
-				url,
-				lastCachedMs: dateColumnMs(page.lastCached),
-				body: body?.ok ? body.body : undefined,
-				headers: page.headers ?? null,
-				cacheKey,
-				deviceType,
-				botName,
-				route,
-			});
-		} catch (e) {
-			logger.warn?.(`[prerender] entity serve: offering ${url} to the serve-time check failed: ${e?.message ?? e}`);
-		}
+	considerServeCheck({
+		kind: 'page',
+		url,
+		lastCachedMs: dateColumnMs(page.lastCached),
+		body: async () => {
+			const row = await deps.readPage(cacheKey);
+			const read = row ? await deps.readBody(row) : null;
+			return read?.ok ? read.body : null;
+		},
+		headers: page.headers ?? null,
+		cacheKey,
+		dueSince: threshold,
+		deviceType,
+		botName,
+		route,
 	});
 };
 
@@ -361,7 +366,9 @@ export async function resolveEntityServe({
 			const check = Number.isFinite(threshold) ? await deps.readCheck(url) : null;
 			if (!confirmedAt(threshold, lastCachedMs, check)) {
 				// Ask for one — only a check that compares the canonical can ever confirm it.
-				if (check && deps.comparesCanonical(url, route)) deps.offerCheck({ url, cacheKey, deviceType, botName, route });
+				if (check && deps.comparesCanonical(url, route)) {
+					deps.offerCheck({ url, cacheKey, page, threshold, deviceType, botName, route });
+				}
 				return decided(EntityServeOutcome.UNCONFIRMED);
 			}
 		}

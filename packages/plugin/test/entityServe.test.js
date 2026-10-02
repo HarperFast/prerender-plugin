@@ -27,6 +27,8 @@ const checks = new Map(); // url -> PageCheck row
 const puts = [];
 const searches = [];
 let searchFault = null;
+const sabs = new Map();
+const visitRows = new Map();
 
 const origin = { server: null, port: 0, requests: [] };
 let ORIGIN = '';
@@ -67,7 +69,7 @@ let ANCHOR;
 
 before(async () => {
 	origin.server = http.createServer((req, res) => {
-		origin.requests.push({ method: req.method, url: req.url });
+		origin.requests.push({ method: req.method, url: req.url, headers: req.headers });
 		res.writeHead(200, { 'content-type': 'text/html' });
 		res.end('<html>origin</html>');
 	});
@@ -115,7 +117,16 @@ before(async () => {
 	}
 	globalThis.databases = {
 		coordination: {
-			SharedBuffer: { primaryStore: { getUserSharedBuffer: (_k, b) => b, tryLock: () => true, unlock() {} } },
+			SharedBuffer: {
+				primaryStore: {
+					getUserSharedBuffer(key, initial) {
+						if (!sabs.has(key)) sabs.set(key, initial);
+						return sabs.get(key);
+					},
+					tryLock: () => true,
+					unlock() {},
+				},
+			},
 		},
 		render_service: { Target: TargetBase, QueueControl: class {}, QueueStatus: class {} },
 		render_schedule: { RenderSchedule: class {} },
@@ -134,7 +145,16 @@ before(async () => {
 		},
 		raw_cache: { RawPage: { get: async () => null, put: async () => {} } },
 		negative_cache: { NegativePage: { get: async () => null } },
-		crawl_stats: { CrawlSketch: class {}, VisitFilter: class {} },
+		crawl_stats: {
+			CrawlSketch: class {},
+			// The demand tracker's ring rows (util/visitFilter.js), enough of the table to round-trip one slice.
+			VisitFilter: {
+				get: async (id) => (visitRows.has(id) ? { ...visitRows.get(id) } : null),
+				put: async (id, data) => visitRows.set(id, { id, ...data }),
+				delete: async (id) => visitRows.delete(id),
+				search: async () => [...visitRows.values()].map((row) => ({ ...row })),
+			},
+		},
 	};
 	({ applyOptions, config } = await import('../src/config.js'));
 	configure();
@@ -499,9 +519,14 @@ test('what does NOT confirm: an agreement that never compared the canonical, an 
 test('an unconfirmed canonical is OFFERED to the serve-time check — and only when a check could confirm it', async () => {
 	entity({ lastCached: new Date(ANCHOR - 2 * HOUR) });
 	await evaluate();
-	assert.deepEqual(offered, [
-		{ url: CANON, cacheKey: keyOf(CANON), deviceType: 'desktop', botName: 'Bingbot', route: compiledRoute() },
-	]);
+	assert.equal(offered.length, 1);
+	const [offer] = offered;
+	assert.equal(offer.url, CANON);
+	assert.equal(offer.cacheKey, keyOf(CANON));
+	assert.equal(offer.threshold, ANCHOR, 'the entity serve’s own threshold rides along');
+	assert.equal(offer.deviceType, 'desktop');
+	assert.equal(offer.botName, 'Bingbot');
+	assert.equal(offer.route, compiledRoute());
 	offered = [];
 	entityServe.__setEntityServeDepsForTest({
 		anchor: () => ANCHOR,
@@ -629,6 +654,239 @@ test('the sweep records checks for entity-serve routes even with serve-time chec
 		configure({ entityServe: { enabled: false }, rest: { changeProbe: { serveCheck: { enabled: false } } } });
 		assert.equal(pageCheckRecorder(), null, 'nothing reads them at all: the pre-feature pass');
 	} finally {
+		configure();
+	}
+});
+
+// ── review round: the offer, the canonical's serve-time check, validators, demand ──────────────────
+
+/** Arm the serve-time check on a route whose `documentCheck` compares the canonical (or not). */
+const armServeChecks = ({ documentCheck = ['canonical'], fetched = [], writes = [], bases = [] } = {}) => {
+	configure({
+		route: { documentCheck },
+		rest: { changeProbe: { enabled: true, dryRun: false, serveCheck: { enabled: true, dryRun: false } } },
+	});
+	serveCheck.resetServeChecks();
+	serveCheck.__setServeCheckDepsForTest({
+		anchor: () => ANCHOR,
+		reserveSlot: () => Date.now(),
+		healthy: () => {},
+		pushback: () => {},
+		recordBreadth: () => {},
+		readBasis: async (kind, key) => {
+			bases.push(key);
+			return dateMs(pages.get(key)?.lastCached);
+		},
+		// The origin's document now: the same canonical the page declares.
+		fetchDocument: async (url, deviceType) => {
+			fetched.push({ url, deviceType });
+			return {
+				statusCode: 200,
+				headers: { 'content-type': 'text/html; charset=utf-8' },
+				body: Readable.from([Buffer.from(SNAPSHOT(CANON))]),
+			};
+		},
+		writeCheck: async (url, basisAtMs, details) => {
+			writes.push({ url, basisAtMs, ...details });
+			await writePageCheck(url, basisAtMs, details);
+		},
+	});
+	// The REAL offer and the real "does a check compare the canonical" — nothing stubbed.
+	entityServe.__setEntityServeDepsForTest({ anchor: () => ANCHOR });
+};
+const disarmServeChecks = () => {
+	serveCheck.__setServeCheckDepsForTest();
+	serveCheck.resetServeChecks();
+	configure();
+};
+const dateMs = (value) => (value ? new Date(value).getTime() : NaN);
+let Readable;
+let writePageCheck;
+before(async () => {
+	({ Readable } = await import('node:stream'));
+	({ writePageCheck } = await import('../src/util/pageCheck.js'));
+});
+
+test('the request that finds a canonical unconfirmed is what gets it confirmed — and the next one is served', async () => {
+	const fetched = [];
+	const writes = [];
+	armServeChecks({ fetched, writes });
+	try {
+		entity({ lastCached: new Date(ANCHOR - 2 * HOUR) });
+		assert.equal((await evaluate()).outcome, 'unconfirmed');
+		await serveCheck.serveChecksSettledForTest();
+		assert.deepEqual(fetched, [{ url: CANON, deviceType: 'desktop' }], 'the CANONICAL was checked, for this device');
+		assert.equal(writes.length, 1);
+		assert.equal(writes[0].url, CANON);
+		assert.equal(writes[0].outcome, 'agree');
+		assert.equal(writes[0].canonicalAgreed, true);
+		analytics.length = 0;
+		assert.equal((await evaluate()).outcome, 'served', 'confirmed by that check');
+	} finally {
+		disarmServeChecks();
+	}
+});
+
+test('no offer when no check compares the canonical — and an offer the check turns away reads no blob', async () => {
+	const fetched = [];
+	armServeChecks({ documentCheck: ['title'], fetched });
+	try {
+		let reads = 0;
+		entity({
+			lastCached: new Date(ANCHOR - 2 * HOUR),
+			content: {
+				bytes: async () => {
+					reads++;
+					return gzipSync(Buffer.from(SNAPSHOT(CANON)));
+				},
+			},
+		});
+		assert.equal((await evaluate()).outcome, 'unconfirmed');
+		await serveCheck.serveChecksSettledForTest();
+		assert.deepEqual(fetched, [], 'a check of the title alone can never confirm the canonical');
+		assert.equal(reads, 0);
+
+		// A check the serve-time check finds covered (it ran, compared no canonical) is turned away BEFORE the
+		// loader runs: no blob read for it.
+		armServeChecks({ fetched });
+		checks.set(CANON, {
+			url: CANON,
+			checkedAt: new Date(ANCHOR + 60_000),
+			basisAt: new Date(ANCHOR - 2 * HOUR),
+			outcome: 'inconclusive',
+			canonicalAgreed: false,
+		});
+		assert.equal((await evaluate()).outcome, 'unconfirmed');
+		await serveCheck.serveChecksSettledForTest();
+		assert.deepEqual(fetched, [], 'one ask per window: the same check would find the same nothing');
+		assert.equal(reads, 0, 'turned away by the check’s cheap gates, so the body was never read');
+	} finally {
+		disarmServeChecks();
+	}
+});
+
+test('a check older than maxConfirmAge is not taken as covering the offer: the entity’s threshold rides along', async () => {
+	const fetched = [];
+	armServeChecks({ fetched });
+	try {
+		configure({
+			route: { documentCheck: ['canonical'] },
+			entityServe: { maxConfirmAge: HOUR },
+			rest: { changeProbe: { enabled: true, dryRun: false, serveCheck: { enabled: true, dryRun: false } } },
+		});
+		entityServe.__setEntityServeDepsForTest({ anchor: () => ANCHOR });
+		entity({ lastCached: new Date(ANCHOR - 2 * HOUR) });
+		// Agreed on the canonical after the anchor, but more than an hour ago.
+		checks.set(CANON, {
+			url: CANON,
+			checkedAt: new Date(Date.now() - 2 * HOUR),
+			basisAt: new Date(ANCHOR - 2 * HOUR),
+			outcome: 'agree',
+			canonicalAgreed: true,
+		});
+		assert.equal((await evaluate({ settings: config.ingress.entityServe })).outcome, 'unconfirmed');
+		await serveCheck.serveChecksSettledForTest();
+		assert.deepEqual(fetched, [{ url: CANON, deviceType: 'desktop' }], 'asked again, for the entity serve’s window');
+	} finally {
+		disarmServeChecks();
+	}
+});
+
+test('an ARMED serve-time check of an entity serve compares the canonical’s own row and key', async () => {
+	const fetched = [];
+	const writes = [];
+	const bases = [];
+	armServeChecks({ fetched, writes, bases });
+	try {
+		// Confirmed for the entity serve by a check after the anchor, while the serve-time check's own window
+		// (`maxAge` one minute, every URL sampled) is later than that check: so it is due for the canonical.
+		entity({ lastCached: new Date(ANCHOR - 2 * HOUR) });
+		checks.set(CANON, {
+			url: CANON,
+			checkedAt: new Date(ANCHOR + 60_000),
+			basisAt: new Date(ANCHOR - 2 * HOUR),
+			outcome: 'agree',
+			canonicalAgreed: true,
+		});
+		configure({
+			route: { documentCheck: ['canonical'] },
+			rest: {
+				changeProbe: {
+					enabled: true,
+					dryRun: false,
+					serveCheck: { enabled: true, dryRun: false, maxAge: 60_000, sample: 1 },
+				},
+			},
+		});
+		const res = await handleBotRequest(request(VARIANT));
+		await drain(res.body);
+		assert.equal(res.headers.get('x-harper-cache'), 'entity');
+		await serveCheck.serveChecksSettledForTest();
+		assert.deepEqual(bases, [keyOf(CANON)], 'the served copy is the CANONICAL’s row — the spelling has none');
+		assert.deepEqual(fetched, [{ url: CANON, deviceType: 'desktop' }]);
+		assert.equal(writes.at(-1).url, CANON);
+		assert.equal(writes.at(-1).outcome, 'agree', 'compared, not dropped as superseded');
+	} finally {
+		disarmServeChecks();
+	}
+});
+
+test('an entity serve answers a conditional request against its own validators', async () => {
+	entity();
+	const first = await handleBotRequest(request(VARIANT));
+	await drain(first.body);
+	const etag = first.headers.get('etag');
+	const conditional = request(VARIANT);
+	conditional.headers.obj['if-none-match'] = etag;
+	const res = await handleBotRequest(conditional);
+	assert.equal(res.status, 304);
+	assert.equal(res.headers.get('x-harper-cache'), 'entity');
+	assert.deepEqual(origin.requests, []);
+});
+
+test('a FALL-THROUGH on an entity route does not let a validator this plugin handed out decide a 304', async () => {
+	// An earlier entity serve gave the crawler the snapshot's render time; now the canonical is stale.
+	entity({ expiresAt: new Date(Date.now() - 60_000) });
+	const conditional = request(VARIANT);
+	conditional.headers.obj['if-modified-since'] = new Date(Date.now() + HOUR).toUTCString();
+	conditional.headers.obj['if-none-match'] = 'W/"1-desktop"';
+	const res = await handleBotRequest(conditional);
+	await drain(res.body);
+	assert.equal(res.status, 200, 'the origin’s document, not a 304 off our own old validator');
+	assert.equal(origin.requests.length, 1);
+	assert.equal(origin.requests[0].headers['if-modified-since'], undefined, 'not forwarded to the origin');
+	assert.equal(origin.requests[0].headers['if-none-match'], undefined);
+	// With snapshot validators off, nothing this plugin served carries one: ordinary handling.
+	configure({ rest: { page: { snapshotValidators: false } } });
+	origin.requests = [];
+	const plain = request(VARIANT);
+	plain.headers.obj['if-modified-since'] = new Date(Date.now() + HOUR).toUTCString();
+	const res2 = await handleBotRequest(plain);
+	await drain(res2.body);
+	assert.ok(origin.requests[0].headers['if-modified-since'], 'forwarded as before');
+});
+
+test('an entity serve is demand for the CANONICAL — the URL that owns the target — never the spelling', async () => {
+	const { flushSlices, refreshMerged, visitedWithin, resetVisitFilter } = await import('../src/util/visitFilter.js');
+	const { resetHeldSabs } = await import('../src/util/coordination.js');
+	configure({
+		rest: { demand: { enabled: true, sliceMs: HOUR, slices: 16, bitsPerSlice: 1 << 20, hashes: 7, bots: ['*'] } },
+	});
+	resetVisitFilter();
+	try {
+		entity();
+		const res = await handleBotRequest(request(VARIANT));
+		await drain(res.body);
+		assert.equal(res.headers.get('x-harper-cache'), 'entity');
+		await flushSlices();
+		await refreshMerged();
+		assert.equal(visitedWithin(CANON, 2 * HOUR), true);
+		assert.equal(visitedWithin(VARIANT, 2 * HOUR), false);
+	} finally {
+		resetVisitFilter();
+		visitRows.clear();
+		sabs.clear();
+		resetHeldSabs();
 		configure();
 	}
 });

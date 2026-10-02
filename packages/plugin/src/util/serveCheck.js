@@ -239,6 +239,12 @@ const remember = (url, nowMs) => {
  * as stored, `cacheKey` its row) or 'raw' (a stored origin document: `facts` is its stored JSON, `rawKey`
  * its row). `lastCachedMs` is when that page was rendered or that document captured; `deviceType` the
  * device it was served for.
+ *
+ * For a page offered rather than served (util/entityServe.js), `body` may be a function resolving to the
+ * bytes: it is called only once the check is due, past every cheap refusal, so an offer the dedupe or a
+ * covering check turns away costs no blob read. `dueSince` raises the threshold to the caller's own (the
+ * later of the two wins), so a page the caller needs checked since an instant is not taken as covered by a
+ * check before it.
  */
 export const considerServeCheck = (served) => {
 	if (!isOn()) return;
@@ -257,7 +263,8 @@ const gate = async (served) => {
 	const plan = planFor(served.kind, served.url, served.route);
 	if (!plan) return;
 	const nowMs = Date.now();
-	const threshold = checkThreshold(served.url, nowMs);
+	const own = checkThreshold(served.url, nowMs);
+	const threshold = Number.isFinite(served.dueSince) && !(own >= served.dueSince) ? served.dueSince : own;
 	// Not due: never (no anchor and no maxAge for it), or its own render/capture is recent enough.
 	if (!Number.isFinite(threshold) || served.lastCachedMs >= threshold) return;
 	// Remembered BEFORE the read: two requests for one URL on one worker would otherwise both pass here
@@ -306,7 +313,7 @@ const headersOf = (headers) => {
 
 /** The served snapshot's facts, read off the bytes the bot was just sent. */
 const servedFacts = async (served, want) => {
-	const body = served.body;
+	const body = typeof served.body === 'function' ? await served.body() : served.body;
 	if (!body || typeof body.length !== 'number' || body.length === 0) return null;
 	const bytes = Buffer.isBuffer(body)
 		? body
@@ -494,7 +501,8 @@ const evidenceOf = (value) => fnv1a32(JSON.stringify(value ?? null)).toString(16
  * The served page's facts against the rule's endpoint: 'mismatch' when any ARMED mapped field disagrees
  * (naming the first, with a digest of the endpoint's value for it), 'agree' when at least one compared and
  * agreed and none disagreed, else 'inconclusive'. The same comparators, and the same armed set, as the sweep.
- * `canonicalAgreed`: an armed field on the page's `canonical` compared and agreed, and none disagreed.
+ * `canonicalAgreed`: an armed field on the page's `canonical` compared and agreed, and no armed field on the
+ * canonical disagreed. Other fields may disagree: a mismatch elsewhere still says what the canonical did.
  */
 export const compareWithEndpoint = (rule, values, facts, { pageUrl = null, isArmed = () => true } = {}) => {
 	const ctx = { pageUrl, vocabulary: rule.pageCheck?.vocabulary ?? null };
