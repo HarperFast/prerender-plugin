@@ -162,6 +162,10 @@ export function applyDebugHeaders(headers, request, resource, info) {
 	if (info.url) {
 		headers.set('x-harper-url', info.url);
 	}
+	// An entity serve: the key whose render answered — `x-harper-cache-key` stays the key that was asked for.
+	if (info.entity?.cacheKey) {
+		headers.set('x-harper-entity', info.entity.cacheKey);
+	}
 	// The class is the answer to "why wasn't this served from cache" — emitted even with no
 	// matched route, which is exactly the unclassified case worth seeing.
 	if (info.routeClass) {
@@ -306,9 +310,9 @@ export function deliverResource(resource, request, info = {}) {
 		body = body.stream();
 	}
 
-	// 'cache' and 'rendered' are the sources whose body is a rendered snapshot; 'raw' and 'negative'
-	// are the origin's own stored bytes, and 'origin' its live ones.
-	const snapshot = info.source === 'cache' || info.source === 'rendered';
+	// 'cache', 'rendered' and 'entity' (another URL's cached render) are the sources whose body is a rendered
+	// snapshot; 'raw' and 'negative' are the origin's own stored bytes, and 'origin' its live ones.
+	const snapshot = info.source === 'cache' || info.source === 'rendered' || info.source === 'entity';
 	let headers = buildResponseHeaders(resource, snapshot, resource.deviceType ?? info.deviceType);
 
 	// A CONDITIONAL REQUEST MUST NOT BE ABLE TO UNDO AN INVALIDATION, and it could, by two

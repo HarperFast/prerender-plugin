@@ -81,6 +81,19 @@ test('an agreeing check stores a 16-character digest of its observation, never t
 	assert.equal(read.basisAtMs, 1_000);
 });
 
+test('canonicalAgreed round-trips, and a row written before it existed reads as false', async () => {
+	await pageCheck.writePageCheck(URL_A, 1_000, { outcome: 'agree', canonicalAgreed: true });
+	assert.equal(rows.get(URL_A).canonicalAgreed, true);
+	assert.equal((await pageCheck.readPageCheck(URL_A)).canonicalAgreed, true);
+	// Only a literal true is an agreement.
+	await pageCheck.writePageCheck(URL_A, 1_000, { outcome: 'agree', canonicalAgreed: 'yes' });
+	assert.equal(rows.get(URL_A).canonicalAgreed, false);
+	// A pre-0.100.0 row has no such column.
+	rows.set(URL_A, { url: URL_A, checkedAt: new Date(2_000), basisAt: new Date(1_000), outcome: 'agree' });
+	assert.equal((await pageCheck.readPageCheck(URL_A)).canonicalAgreed, false);
+	assert.equal(pageCheck.NO_CHECK.canonicalAgreed, false);
+});
+
 test('the sweep skips exactly when its baseline is the observation the check saw', async () => {
 	const rule = { fingerprint: 'f1' };
 	const since = Date.now() - 60_000;

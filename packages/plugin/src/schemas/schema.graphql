@@ -492,6 +492,15 @@ type PageCheck @table(database: "verification", expiration: 604800) @sealed {
 	# unchanged. A digest, not the observation: a product observation runs ~1 KB, this row is written for
 	# nearly every URL the nightly pass probes, and it replicates to every node.
 	observedDigest: String
+	# Whether this check COMPARED the page's canonical with the origin's (a mapped `canonical` field on the
+	# rule's endpoint, or `canonical` in the route's `documentCheck`) and they AGREED. An outcome alone cannot
+	# say so: 'agree' is "nothing compared disagreed", and a field disarmed by the mapping guard or a null
+	# endpoint slot compares nothing. The entity serve (util/entityServe.js) serves one URL's render at the
+	# entity's other spellings only on this evidence (or a render since its threshold), because a page whose
+	# canonical the origin has moved would carry the contradiction to every spelling. Absent on a row written
+	# before v0.100.0, which reads as false. ADDING THIS COLUMN to the @sealed table needs the workers restarted
+	# (a deploy does that), not a config reload.
+	canonicalAgreed: Boolean
 }
 
 type PrerenderedPage @table(database: "page_cache") @export {

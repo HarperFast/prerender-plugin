@@ -2847,6 +2847,44 @@ test('an entity registry that throws, synchronously or not, costs the pass nothi
 	}
 });
 
+test('a recorded check says whether the CANONICAL compared and agreed — the entity serve\u2019s confirmation', async () => {
+	const signature = await apiSig();
+	const record = async (guard) => {
+		const recorded = [];
+		await runMappedPass({
+			rows: [row(URL_A)],
+			answers: { [URL_A]: signature },
+			stored: { [URL_A]: { signature, pageFacts: await RECORD() } },
+			recordCheck: async (url, basisAtMs, details) => recorded.push({ url, basisAtMs, ...details }),
+			...(guard ? { guard } : {}),
+		});
+		return recorded;
+	};
+	const agreed = await record(null);
+	assert.equal(agreed.length, 1);
+	assert.equal(agreed[0].canonicalAgreed, true);
+	assert.equal(agreed[0].basisAtMs, RENDERED_AT.getTime());
+	// The canonical's field disarmed by the mapping guard: the rest still prove the check, the canonical
+	// proves nothing.
+	const { guard } = guardFor();
+	const disarmed = await record({ ...guard, isArmed: (_rule, field) => field.fact !== 'canonical' });
+	assert.equal(disarmed.length, 1);
+	assert.equal(disarmed[0].canonicalAgreed, false);
+});
+
+test('a RE-SPELL records no check at all: the page is re-rendered, and nothing confirms the old canonical', async () => {
+	const signature = await apiSig({ seoUrl: '/product/prd-a/red-running-shoe.jsp' });
+	const recorded = [];
+	const { triggered } = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		stored: { [URL_A]: { signature, pageFacts: await RECORD() } },
+		recordCheck: async (url) => recorded.push(url),
+	});
+	assert.deepEqual(triggered, [URL_A]);
+	assert.deepEqual(recorded, []);
+});
+
 test('CAUGHT UP: the origin changed and the page ALREADY shows the new value -> baseline moves, nothing triggered', async () => {
 	// A cadence render landed after the rename: re-rendering again would buy nothing.
 	const before = await apiSig();
@@ -3947,7 +3985,10 @@ test('an agreeing comparison is RECORDED as a check, whether or not an invalidat
 		recordCheck: async (url, basisAtMs, options) => recorded.push({ url, basisAtMs, ...options }),
 	});
 	assert.deepEqual(verified, [], 'no invalidation armed: no verification, which would exempt from one');
-	assert.deepEqual(recorded, [{ url: URL_A, basisAtMs: CLAIM_AT.getTime(), signature: AGREE_SIG }]);
+	// The proof here is the claim pair (price, availability) alone: it says nothing about the canonical.
+	assert.deepEqual(recorded, [
+		{ url: URL_A, basisAtMs: CLAIM_AT.getTime(), signature: AGREE_SIG, canonicalAgreed: false },
+	]);
 });
 
 test('a comparison that never happened is not recorded as a check', async () => {

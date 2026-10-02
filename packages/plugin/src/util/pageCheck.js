@@ -25,9 +25,10 @@ export const NO_CHECK = Object.freeze({
 	field: null,
 	evidence: null,
 	observedDigest: null,
+	canonicalAgreed: false,
 });
 
-const SELECT = ['url', 'checkedAt', 'basisAt', 'outcome', 'field', 'evidence', 'observedDigest'];
+const SELECT = ['url', 'checkedAt', 'basisAt', 'outcome', 'field', 'evidence', 'observedDigest', 'canonicalAgreed'];
 const stringOrNull = (value) => (typeof value === 'string' && value !== '' ? value : null);
 
 /**
@@ -48,7 +49,8 @@ export const observationDigest = (signature) =>
 /**
  * `url`'s last check: when it ran and the `lastCached` it covered (ms, NaN when never, unreadable, or the
  * read failed), its outcome, the field a disagreement named and the digest of what the origin said for it,
- * and the digest of an agreeing endpoint check's observation (`observationDigest`).
+ * the digest of an agreeing endpoint check's observation (`observationDigest`), and whether it compared the
+ * page's canonical with the origin's and they agreed (false for a row written before that was recorded).
  * A row written before `outcome` existed was an agreement. `select` is an array: a string projects to a
  * bare scalar.
  */
@@ -63,6 +65,7 @@ export const readPageCheck = async (url) => {
 			field: stringOrNull(row.field),
 			evidence: stringOrNull(row.evidence),
 			observedDigest: stringOrNull(row.observedDigest),
+			canonicalAgreed: row.canonicalAgreed === true,
 		};
 	} catch (e) {
 		metrics.serveCheck('read-error', null);
@@ -96,12 +99,13 @@ export const checkSparesProbe = (check, stored, rule, sinceMs) =>
 /**
  * Record a check of the page whose `lastCached` was `basisAtMs`: `outcome` 'agree' (with the endpoint's
  * `signature` when there was one, stored as its digest), 'mismatch' or 'held' (with the `field` and the
- * digest of what the origin said for it, `evidence`), 'inconclusive' or 'failed'. Never throws.
+ * digest of what the origin said for it, `evidence`), 'inconclusive' or 'failed'; and `canonicalAgreed`
+ * when the check compared the page's canonical with the origin's and they agreed. Never throws.
  */
 export const writePageCheck = async (
 	url,
 	basisAtMs,
-	{ outcome = 'agree', field = null, evidence = null, signature = null } = {}
+	{ outcome = 'agree', field = null, evidence = null, signature = null, canonicalAgreed = false } = {}
 ) => {
 	if (!Number.isFinite(basisAtMs)) return;
 	try {
@@ -113,6 +117,7 @@ export const writePageCheck = async (
 			field: stringOrNull(field),
 			evidence: stringOrNull(evidence),
 			observedDigest: observationDigest(signature),
+			canonicalAgreed: canonicalAgreed === true,
 		});
 	} catch (e) {
 		metrics.serveCheck('write-error', null);

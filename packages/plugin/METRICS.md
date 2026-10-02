@@ -181,6 +181,20 @@ Notes that bite:
   gate name `entity` (never in a dry run), so every view of what the gates hold out includes them;
   unlike the `route`/`bot` gates, `entity` is evaluated only for URLs with no target row, so it counts
   refused mints rather than gated misses on known targets.
+- **The entity serve is `bot_serve` source and status `entity`, and `prerender_ops` / `entity_serve`**
+  (v0.100.0, `ingress.routes[].entityServe`). A true miss for a spelling with no page and no target of
+  its own, answered from the cached render of its entity's canonical URL. It counts toward origin
+  offload (source is not `origin`) and `page_age`, but it is its own status, never `hit`: it is
+  coverage by inference, one render answering many URLs, so `route_serve` shows how much of a route's
+  traffic is answered that way. `entity_serve` is one emit per evaluation of a true miss on an
+  opted-in route, detail = outcome, context = bot: `served`, `would-serve` (every guard passed under
+  `ingress.entityServe.dryRun`; the miss path answered it — **the dry-run number**, to read against
+  `bot_serve` `origin`/`miss` on the route), or the guard that fell through: `has-target`,
+  `no-sibling`, `no-page`, `not-indexable`, `stale`, `invalidated`, `ambiguous`, `unconfirmed`,
+  `not-self-canonical`, `unreadable`, `no-prefix`, `error`. Read `has-target` with the entity gate in
+  mind: in a gate dry run every spelling a minting crawler asks for again has a target by then.
+  `unconfirmed` climbs right after the anchor and falls as the pass and the serve-time checks
+  confirm canonicals. If a route stays there, no check compares its `canonical`.
 - **The entity registry is `prerender_ops` / `entity_canonical` and `canonical_adopt`** (v0.101.0,
   `entities.enabled`). `entity_canonical`: one emit per observation of an entity's canonical, detail =
   what it did to the registry (`new`, `moved`, `same`, `older`, `foreign`, `unreadable`, `error`),
