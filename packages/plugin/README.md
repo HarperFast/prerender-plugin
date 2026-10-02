@@ -427,7 +427,7 @@ entities:
     as the crawler's bytes stream by (at most 128 KiB, and at most 32 at once per worker), so it costs no
     second request and nothing the response waits on.
   - When two observations disagree, the newer wins. A render's instant is when it read the origin
-    (store time less its longest render), so a render claimed before a re-slug can't undo the probe
+    (store time less the sum of its renders), so a render claimed before a re-slug can't undo the probe
     that saw it.
   - An unchanged observation writes nothing, and neither does the same canonical spelled otherwise
     (`%27` for an apostrophe). That is one document, as the probe's own `path` comparator already
@@ -440,10 +440,13 @@ entities:
   - A target suppressed as a canonical verdict (`canonical-mismatch`, `canonical-variant`) is reactivated
     the same way. One suppressed for any other reason (a 404, a noindex) is left alone.
   - Bounded by `maxPerHour` per node, shared by every worker thread and every observer; by `retryAfter`
-    per entity (a canonical that did not take is filed once per window, not nightly, so it costs one render
-    a week for as long as the origin names it); and by both dry runs. A probe pass run as a dry run,
-    including an operator's measure-only sweep, files nothing.
-  - In a dry run, what arming would file is `would-adopt` plus `capped`.
+    per entity, whichever canonical (a canonical that did not take is filed once per window, not nightly,
+    so it costs one render a week for as long as the origin names it, and two spellings naming each other
+    cannot reactivate each other in turn); and by both dry runs. A probe pass run as a dry run, including
+    an operator's measure-only sweep, files nothing.
+  - In a dry run, what arming would file is `would-adopt` plus `capped`. A dry run remembers each entity
+    it would have adopted (`wouldAdoptAt`), so a repeat inside `retryAfter` reads `recent` as it would
+    armed, and it spends its own lane of the hourly budget, never an armed node's real slots.
 - **Why.** Measured on one deployment, products re-slug ~100 times a day and the product sitemap
   changes once a day. An out-of-stock product is not in the sitemap at all, so its new canonical
   arrived only by traffic discovery, with its first render jittered across the route's 96h interval.

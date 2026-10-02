@@ -3199,9 +3199,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 					dryRun: option(
 						true,
 						'Count `would-adopt` and file nothing. The default, because the number to know first is how many ' +
-							'canonicals arming would file: `would-adopt` plus `capped` (the budget counts would-adopts too). ' +
-							'A change-probe pass run as a dry run \u2014 the probe\u2019s own `dryRun`, or an operator\u2019s ' +
-							'measure-only sweep \u2014 files nothing either.'
+							'canonicals arming would file: `would-adopt` plus `capped`. A dry run remembers each entity it ' +
+							'would have adopted, so a repeat inside `retryAfter` reads `recent` as it would armed, and counts ' +
+							'against its own lane of the hourly budget, never an armed node\u2019s real slots. A change-probe ' +
+							'pass run as a dry run \u2014 the probe\u2019s own `dryRun`, or an operator\u2019s measure-only ' +
+							'sweep \u2014 files nothing either.'
 					),
 					maxPerHour: option(
 						60,
@@ -3213,9 +3215,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 					),
 					retryAfter: option(
 						7 * DAY,
-						'An entity whose adopted canonical did not take (it 404s, or its page names another canonical ' +
-							'after all) is not filed again for this long, so a bad canonical costs one render per window, ' +
-							'not one per observation.',
+						'An entity adopted once is not adopted again for this long, whichever canonical is named then: a ' +
+							'canonical that did not take (it 404s, or its page names another canonical after all) costs one ' +
+							'render per window, not one per observation, and two spellings that name each other cannot ' +
+							'reactivate each other in turn.',
 						{ unit: 'ms', min: HOUR }
 					),
 				}

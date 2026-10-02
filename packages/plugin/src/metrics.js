@@ -742,8 +742,9 @@ export const METRICS = Object.freeze({
 			'filed due now), reactivated (a canonical-verdict suppression lifted, due now), would-adopt (either, in ' +
 			'a dry run — THE DRY-RUN NUMBER), exists (the canonical has a target in rotation — every duplicate ' +
 			'spelling, nightly), suppressed (its target is suppressed for a reason the origin\u2019s word does not overturn), ' +
-			'recent (adopted within retryAfter), capped (past maxPerHour on this node), refused (unkeyable, off the domain ' +
-			'allowlist, or not on a prerender route), error; context = the observer that named it. ' +
+			'recent (the entity was adopted, or in a dry run would have been, within retryAfter), capped (past maxPerHour ' +
+			'on this node), refused (unkeyable, off the domain allowlist, or not on a prerender route), error; context = ' +
+			'the observer that named it. ' +
 			'raw_cache = one emit per raw-document store attempt, split by outcome: `stored`, `stored-unshared`, ' +
 			'or the reason it was refused (not-200, staging, has-cookie, content-type, no-store, no-body, ' +
 			'oversize, capture-failed, write-failed, vary-device). READ THE REFUSALS, not the successes — a route that is ' +

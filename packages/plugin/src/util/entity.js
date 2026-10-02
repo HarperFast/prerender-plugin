@@ -56,8 +56,9 @@ import { CacheKey } from './cacheKey.js';
 import { entityPrefixOf } from './entityGate.js';
 import { classifyPath, matchRoute, PRERENDER, queryAllowlistFor } from './routeClass.js';
 import { canonicalizeUrl } from './url.js';
-import { currentMinuteMs, dateColumnMs, HOUR } from './time.js';
+import { currentMinuteMs, dateColumnMs } from './time.js';
 import { getSab } from './coordination.js';
+import { createHourlyBudget, hourlyBudgetLength } from './hourlyBudget.js';
 import { Target } from '../resources/Target.js';
 
 const table = () => databases.render_service.Entity;
@@ -70,6 +71,8 @@ const ENTITY_SELECT = Object.freeze([
 	'canonicalAt',
 	'adoptedCanonical',
 	'adoptedAt',
+	'wouldAdoptCanonical',
+	'wouldAdoptAt',
 ]);
 
 /** Every outcome of observing a canonical (`prerender_ops` / `entity_canonical`). */
@@ -90,7 +93,7 @@ export const CanonicalOutcome = Object.freeze({
 	ERROR: 'error',
 });
 
-/** Every outcome of the probe's adoption check (`prerender_ops` / `canonical_adopt`). */
+/** Every outcome of an adoption check (`prerender_ops` / `canonical_adopt`). */
 export const AdoptOutcome = Object.freeze({
 	/** A target created for the canonical, due now. */
 	ADOPTED: 'adopted',
@@ -102,7 +105,7 @@ export const AdoptOutcome = Object.freeze({
 	EXISTS: 'exists',
 	/** Its target is suppressed for a reason the origin's word does not overturn (a 404, a noindex). */
 	SUPPRESSED: 'suppressed',
-	/** Adopted within `retryAfter` already: a canonical that did not take is not re-filed every night. */
+	/** The entity was adopted (or, in a dry run, would have been) within `retryAfter`, whichever canonical. */
 	RECENT: 'recent',
 	/** Past `entities.adopt.maxPerHour` on this node this hour. */
 	CAPPED: 'capped',
@@ -285,52 +288,22 @@ const canonicalFromValue = (value, probedUrl) => {
 	}
 };
 
-// THE ADOPTION BUDGET: adoptions this hour on this node, shared by every worker thread — [hourSinceEpoch, count]
-// in a shared buffer (util/coordination.js `getSab`). Every source can adopt (the probe on its worker, renders
-// and serve-time checks and proxied documents on any worker), so a per-thread counter would multiply the cap by
-// the thread count. Hours since the epoch fit an int32 for a quarter of a million years.
-//
-// The window rolls forward only, and whoever wins the roll zeroes the count — the same shape as
-// util/invalidationReenqueue.js `reserveSlot`, for the same reasons: a straggler carrying an older hour must not
-// zero a count the new hour has spent, and a loser of a race costs or grants at most one adoption. This bounds
-// render load from a burst (a site-wide re-spelling), it is not a safety property.
-const BUDGET_SAB_KEY = 'entity_adopt_budget_v1';
-const B_HOUR = 0;
-const B_COUNT = 1;
+// THE ADOPTION BUDGET: adoptions this hour on this node, shared by every worker thread (util/hourlyBudget.js, over
+// a shared buffer). Every source can adopt (the probe on its worker, renders and serve-time checks and proxied
+// documents on any worker), so a per-thread counter would multiply the cap by the thread count. Two lanes: real
+// adoptions, and dry-run ones, so a dry run measures what the cap would do without spending the slots an armed
+// node's real adoptions need (an operator's measure-only sweep on an armed node, for one).
+const BUDGET_SAB_KEY = 'entity_adopt_budget_v2';
+const REAL = 0;
+const DRY = 1;
 let budgetCell = null;
-const budgetI32 = () => (budgetCell ??= new Int32Array(getSab(BUDGET_SAB_KEY, 8)));
+const budgetI32 = () =>
+	(budgetCell ??= new Int32Array(getSab(BUDGET_SAB_KEY, hourlyBudgetLength(2) * Int32Array.BYTES_PER_ELEMENT)));
 
-/** The node's adoption budget: `reserve(limit)` takes a slot this hour (false past `limit`); `release()` returns one. */
-export const adoptionBudget = Object.freeze({
-	reserve(limit, nowMs = Date.now()) {
-		const cell = budgetI32();
-		const hour = Math.floor(nowMs / HOUR);
-		const observed = Atomics.load(cell, B_HOUR);
-		if (hour > observed && Atomics.compareExchange(cell, B_HOUR, observed, hour) === observed) {
-			Atomics.store(cell, B_COUNT, 0);
-		}
-		for (let attempt = 0; attempt < 8; attempt++) {
-			const used = Atomics.load(cell, B_COUNT);
-			if (used >= limit) return false;
-			if (Atomics.compareExchange(cell, B_COUNT, used, used + 1) === used) return true;
-		}
-		// Eight lost races: other workers are spending the budget right now. Refusing is the safe direction.
-		return false;
-	},
-	release() {
-		const cell = budgetI32();
-		for (let attempt = 0; attempt < 8; attempt++) {
-			const used = Atomics.load(cell, B_COUNT);
-			if (used <= 0 || Atomics.compareExchange(cell, B_COUNT, used, used - 1) === used) return;
-		}
-	},
-});
+/** The node's adoption budget (util/hourlyBudget.js): lane 0 real adoptions, lane 1 dry-run ones. */
+export const adoptionBudget = createHourlyBudget(budgetI32);
 /** Tests: an empty budget. */
-export const resetAdoptionCountsForTest = () => {
-	const cell = budgetI32();
-	Atomics.store(cell, B_HOUR, 0);
-	Atomics.store(cell, B_COUNT, 0);
-};
+export const resetAdoptionCountsForTest = () => adoptionBudget.reset();
 
 /**
  * RESOLVE A CANONICAL: record an observation of the origin naming `value` as the canonical of the entity `url`
@@ -346,13 +319,16 @@ export const resetAdoptionCountsForTest = () => {
  * Bounded three ways:
  *   - `entities.adopt.maxPerHour` per node, across every worker and every source (`adoptionBudget`). A put that
  *     fails gives its slot back.
- *   - `retryAfter` per entity, so a canonical that did not take (it 404s and is retired, or its page names
- *     another canonical and is suppressed) is filed at most once per window. Such an entity costs one render a
- *     window for as long as the origin keeps naming it.
+ *   - `retryAfter` per ENTITY, whichever canonical: an entity adopted within it is `recent`. So a canonical that
+ *     did not take (it 404s and is retired, or its page names another canonical and is suppressed) costs one
+ *     render a window for as long as the origin keeps naming it, and two spellings that name each other (an
+ *     origin re-slugging back, or serving two inconsistent copies) cannot reactivate each other in turn.
  *   - a dry run — `entities.adopt.dryRun`, or the caller's own (`dryRun`: the change probe passes its pass's
- *     effective dry run, which an operator's measure-only sweep sets) — that counts and files nothing. In a dry
- *     run the budget counts would-adopts too, so what arming files is `would-adopt + capped`, capped at
- *     `maxPerHour`. The OBSERVATION is written in a dry run too: it is an observation, not an action.
+ *     effective dry run, which an operator's measure-only sweep sets) — that counts and files nothing. A dry run
+ *     REMEMBERS what it would have filed (`wouldAdoptAt`), so a repeat observation within `retryAfter` reads
+ *     `recent` exactly as it would armed, and spends its own lane of the budget, so `would-adopt + capped` is
+ *     what arming files and a dry run never spends an armed node's slots. The OBSERVATION is written in a dry
+ *     run too: it is an observation, not an action.
  *
  * All I/O injectable for tests (`createCanonicalResolver`).
  */
@@ -390,13 +366,23 @@ export const createCanonicalResolver = ({
 			return decided(AdoptOutcome.ERROR);
 		}
 		const nowMs = now();
-		const last = dateColumnMs(observed.row.adoptedAt);
-		if (observed.row.adoptedCanonical === observed.canonical && nowMs - last < adopt.retryAfter) {
-			return decided(AdoptOutcome.RECENT);
-		}
+		const dry = Boolean(adopt.dryRun || dryRun);
+		// Per entity, whichever canonical: the last real adoption, or — in a dry run — the last one it would have made.
+		const last = dateColumnMs(dry ? observed.row.wouldAdoptAt : observed.row.adoptedAt);
+		if (nowMs - last < adopt.retryAfter) return decided(AdoptOutcome.RECENT);
 		if (!adoptable(observed.canonical)) return decided(AdoptOutcome.REFUSED);
-		if (!budget.reserve(adopt.maxPerHour, nowMs)) return decided(AdoptOutcome.CAPPED);
-		if (adopt.dryRun || dryRun) return decided(AdoptOutcome.WOULD_ADOPT);
+		if (!budget.reserve(adopt.maxPerHour, nowMs, dry ? DRY : REAL)) return decided(AdoptOutcome.CAPPED);
+		if (dry) {
+			// Remembered, so the dry-run number counts entities, not observations. Best-effort, like the real memory.
+			try {
+				await markAdopted(observed.key, { wouldAdoptCanonical: observed.canonical, wouldAdoptAt: new Date(nowMs) });
+			} catch (e) {
+				logger.warn?.(
+					`[prerender] entity: recording a would-adopt of ${observed.canonical} failed: ${e?.message ?? e}`
+				);
+			}
+			return decided(AdoptOutcome.WOULD_ADOPT);
+		}
 		// `put` REPLACES the row (and is the reactivation that clears a suppression and its strikes), so a
 		// suppressed row's own declarations ride along.
 		const interval = Number(target?.renderInterval);
@@ -409,7 +395,7 @@ export const createCanonicalResolver = ({
 				...(Number.isFinite(interval) && interval > 0 ? { renderInterval: interval } : {}),
 			});
 		} catch (e) {
-			budget.release();
+			budget.release(REAL);
 			logger.warn?.(`[prerender] entity: adopting ${observed.canonical} failed: ${e?.message ?? String(e)}`);
 			return decided(AdoptOutcome.ERROR);
 		}

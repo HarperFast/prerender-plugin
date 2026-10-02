@@ -210,8 +210,8 @@ Notes that bite:
   the endpoint and the page disagree about the canonical. `canonical_adopt` (`entities.adopt`): one emit
   per adoption decision, made only when an observation names a canonical that is another URL than the
   one observed, context = the observer: `adopted`, `reactivated`, `would-adopt` (**the dry-run
-  number**), `exists` (every duplicate spelling, nightly), `suppressed`, `recent`, `capped` (past
-  `maxPerHour` on this node), `refused`, `error`.
+  number**), `exists` (every duplicate spelling, nightly), `suppressed`, `recent` (the entity was adopted, or in a dry run would have
+  been, within `retryAfter`), `capped` (past `maxPerHour` on this node), `refused`, `error`.
 - **The change probe's `probe_*` series changed shape in v0.97.0, and the table row above predates
   it.** (1) The pass counters are emitted **per probed batch as increments**, not once when a pass
   ends: a nine-hour pass is no longer one row that a dropped analytics window loses whole, and a pass
