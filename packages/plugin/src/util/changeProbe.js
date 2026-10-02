@@ -61,6 +61,7 @@ import { dispatcherFor, configuredStagingIp } from './upstream.js';
 import { cacheKeysOf } from '../resources/Target.js';
 import { resolveVerification, writeVerification } from './pageVerification.js';
 import { checkSparesProbe, readPageCheck, writePageCheck } from './pageCheck.js';
+import { createCanonicalObserver, entitiesOn } from './entity.js';
 import { walkUrlRange } from './urlWalk.js';
 import { runDetached } from './detach.js';
 import { getSab } from './coordination.js';
@@ -1300,6 +1301,15 @@ const bump = (table, rule, key) => {
 	table[rule][key] = (table[rule][key] ?? 0) + 1;
 };
 
+// A rule's mapped `canonical` field (the first, when it maps several), memoized per compiled rule.
+const canonicalFields = new WeakMap();
+const canonicalFieldOf = (rule) => {
+	if (!canonicalFields.has(rule)) {
+		canonicalFields.set(rule, (rule.pageCheck?.fields ?? []).find((field) => field.fact === 'canonical') ?? null);
+	}
+	return canonicalFields.get(rule);
+};
+
 export const runProbePass = async ({
 	rows,
 	rules,
@@ -1373,6 +1383,10 @@ export const runProbePass = async ({
 	// Told the rate each batch was paced at and the backoff on it (`(rate, originThrottle, loadThrottle)`),
 	// so a sweep can publish the budget it leaves (`publishSweepHeadroom`).
 	onPace = () => {},
+	// The entity registry's observer (util/entity.js `createCanonicalObserver`), told `{ url, value }` — the
+	// probed URL and its rule's mapped `canonical` slot — after every probe that answered. Null = none: the
+	// registry is off, or this is the canary, which detects and adopts nothing.
+	onCanonical = null,
 } = {}) => {
 	const stats = newStats();
 	onStart(stats);
@@ -1473,6 +1487,23 @@ export const runProbePass = async ({
 		}
 		distressStreak = 0;
 
+		// The observation's slot values, parsed at most once and only when something needs them.
+		let values;
+		const valuesOf = () => {
+			if (values === undefined) values = signatureSlots(observed); // null for a status-signal literal
+			return values;
+		};
+
+		// THE ENTITY'S CANONICAL, as the origin's endpoint names it now (util/entity.js). Before the baseline
+		// logic, because it is a statement about the origin, not about this row's history: a re-baselined or a
+		// changed row reports its product's canonical all the same. Only from an ARMED mapped field — one the
+		// mapping guard disarmed is suspected of being mapped wrong, and must not file targets.
+		if (onCanonical) {
+			const field = canonicalFieldOf(rule);
+			const slots = field && (!guard || guard.isArmed(rule, field)) ? valuesOf() : null;
+			if (slots) await onCanonical({ url: row.url, value: slots[field.slot] });
+		}
+
 		// RULE CHANGED, NOT CONTENT. A baseline is only comparable to an observation made the same
 		// way (changeProbeSpec.js ruleFingerprint). A stored fingerprint that is not this rule's
 		// means the rule was edited since the baseline was taken: store the new observation, compare
@@ -1528,13 +1559,6 @@ export const runProbePass = async ({
 		const pageCheck = rule.pageCheck;
 		const claimPair = pageCheck ? pageCheck.priceFrom !== null && pageCheck.priceFrom !== undefined : false;
 		const mappedFields = pageCheck?.fields ?? [];
-
-		// The observation's slot values, parsed at most once and only when something needs them.
-		let values;
-		const valuesOf = () => {
-			if (values === undefined) values = signatureSlots(observed); // null for a status-signal literal
-			return values;
-		};
 
 		// The claim pair's verdict: true compared-and-agreed, false disagreed, null nothing comparable.
 		let claimVerdict = null;
@@ -2514,6 +2538,8 @@ export const runProbeSweepOnce = async ({
 			readCheck: config.changeProbe.serveCheck?.enabled ? readPageCheck : null,
 			skipCheckedSince: serveChecksArmed() ? (resume?.originStartedAt ?? startedAt) : null,
 			recordCheck: config.changeProbe.serveCheck?.enabled ? writePageCheck : null,
+			// One observer per pass: it counts this pass's adoptions against `adoptCanonical.maxPerPass`.
+			onCanonical: entitiesOn() ? createCanonicalObserver() : null,
 			guard: theMappingGuard(),
 			...limits,
 			// Rows this pass (or the pass it resumes) already probed — see `processOne`. The same for a

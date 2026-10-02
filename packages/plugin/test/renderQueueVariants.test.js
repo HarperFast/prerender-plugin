@@ -1430,3 +1430,38 @@ test('a mark filed a moment before its grant, in the same second, is BEFORE the 
 	await postVariants(B, [rendered('desktop'), rendered('mobile')]);
 	assert.equal(stores.renderSchedule.get(B).urgentAt, undefined, 'an ask filed before the grant is answered by it');
 });
+
+// ───────────────────────────── the entity registry (util/entity.js) ─────────────────────────────
+
+test('a stored render tells the entity registry the canonical its page declared, as of when it READ the origin', async (t) => {
+	const OLD = 'https://site.example.com/product/prd-1/old-slug.jsp';
+	const CANON = 'https://site.example.com/product/prd-1/right-slug.jsp';
+	const entities = new Map();
+	databases.render_service.Entity = {
+		get: async ({ id }) => entities.get(id) ?? null,
+		put: async (id, data) => entities.set(id, { ...data }),
+		patch: async (id, data) => entities.set(id, { ...(entities.get(id) ?? {}), ...data }),
+	};
+	config.ingress.mode = 'forwarded';
+	config.ingress.routes = [
+		{ match: 'prefix', path: '/product/prd-', queryParams: [], entityPrefix: '^/product/prd-[^/]+/' },
+	];
+	config.entities.enabled = true;
+	t.after(() => {
+		config.entities.enabled = false;
+		delete databases.render_service.Entity;
+	});
+	seedUrlRow({ url: OLD });
+	await claim();
+	// Renders shorter than the time since the claim: a render that "began" before its lease is a late result.
+	await new Promise((resolve) => setTimeout(resolve, 40));
+	await postVariants(OLD, [
+		rendered('desktop', '<html>d</html>', { pageFacts: { canonical: CANON }, renderTime: 10 }),
+		rendered('mobile', '<html>m</html>', { pageFacts: { canonical: CANON }, renderTime: 20 }),
+	]);
+	const entity = entities.get('https://site.example.com/product/prd-1/');
+	assert.equal(entity?.canonical, CANON);
+	assert.equal(entity.canonicalFrom, 'render');
+	const storedAt = stores.prerenderedPage.get(key(OLD, 'desktop')).lastCached;
+	assert.equal(entity.canonicalAt.getTime(), storedAt - 20, 'the store time less the longest render');
+});

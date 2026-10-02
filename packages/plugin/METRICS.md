@@ -181,6 +181,15 @@ Notes that bite:
   gate name `entity` (never in a dry run), so every view of what the gates hold out includes them;
   unlike the `route`/`bot` gates, `entity` is evaluated only for URLs with no target row, so it counts
   refused mints rather than gated misses on known targets.
+- **The entity registry is `prerender_ops` / `entity_canonical` and `canonical_adopt`** (v0.101.0,
+  `entities.enabled`). `entity_canonical`: one emit per observation of an entity's canonical, detail =
+  what it did to the registry (`new`, `moved`, `same`, `older`, `foreign`, `unreadable`, `error`),
+  context = the observer (`probe` or `render`). `moved`/`probe` per day is the re-slug rate; `moved`
+  alternating between `probe` and `render` for the same entities means the endpoint and the page
+  disagree about the canonical. `canonical_adopt`: one emit per adoption decision, made only when the
+  canonical the endpoint names is another URL than the one probed: `adopted`, `reactivated`,
+  `would-adopt` (**the dry-run number**), `exists` (every duplicate spelling, nightly), `suppressed`,
+  `recent`, `capped`, `refused`, `error`.
 - **The change probe's `probe_*` series changed shape in v0.97.0, and the table row above predates
   it.** (1) The pass counters are emitted **per probed batch as increments**, not once when a pass
   ends: a nine-hour pass is no longer one row that a dropped analytics window loses whole, and a pass

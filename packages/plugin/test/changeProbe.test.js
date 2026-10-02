@@ -2775,6 +2775,51 @@ test('the same page AGREEING on every mapped field -> unchanged, nothing trigger
 	assert.deepEqual(stats.fieldMismatch, {});
 });
 
+test('the entity registry is told the canonical slot of every probe that answered — and of nothing else', async () => {
+	const signature = await apiSig({ seoUrl: '/product/prd-a/new-spelling.jsp' });
+	const told = [];
+	const onCanonical = async (observation) => told.push(observation);
+	// Every answered probe, whatever its baseline did: seeded, unchanged, changed, re-baselined.
+	await runMappedPass({
+		rows: [row(URL_A), row(URL_B)],
+		answers: { [URL_A]: signature, [URL_B]: signature },
+		stored: { [URL_B]: { signature, pageFacts: await RECORD(), fingerprint: 'an-older-rule' } },
+		onCanonical,
+	});
+	assert.deepEqual(
+		told.map(({ url, value }) => [url, value]),
+		[
+			[URL_A, '/product/prd-a/new-spelling.jsp'],
+			[URL_B, '/product/prd-a/new-spelling.jsp'],
+		]
+	);
+	// A probe that did not answer reports nothing.
+	told.length = 0;
+	await runMappedPass({ rows: [row(URL_A)], answers: {}, onCanonical });
+	assert.deepEqual(told, []);
+	// A canonical field the mapping guard disarmed is suspected of being mapped wrong: it files nothing.
+	const { guard } = guardFor();
+	await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		guard: { ...guard, isArmed: (_rule, field) => field.fact !== 'canonical' },
+		onCanonical,
+	});
+	assert.deepEqual(told, []);
+	// A rule that maps no canonical has nothing to say.
+	const noCanonical = {
+		...MAPPED_RULE,
+		pageCheck: { ...MAPPED_RULE.pageCheck, fields: MAPPED_RULE.pageCheck.fields.filter((f) => f.fact !== 'canonical') },
+	};
+	await runMappedPass({
+		rulesRaw: [noCanonical],
+		rows: [row(URL_A)],
+		answers: { [URL_A]: await apiSig({}, noCanonical) },
+		onCanonical,
+	});
+	assert.deepEqual(told, []);
+});
+
 test('CAUGHT UP: the origin changed and the page ALREADY shows the new value -> baseline moves, nothing triggered', async () => {
 	// A cadence render landed after the rename: re-rendering again would buy nothing.
 	const before = await apiSig();

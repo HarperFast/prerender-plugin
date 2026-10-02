@@ -607,7 +607,7 @@ export const METRICS = Object.freeze({
 		emittedBy:
 			'util/unrouted.js, resources/Sitemap.js, http_handlers/response.js, util/backlogSnapshot.js, ' +
 			'util/demandLadder.js, util/visitFilter.js, util/invalidation.js, util/invalidationReenqueue.js, http_handlers/bot_request.js, ' +
-			'util/changeProbe.js, util/entityGate.js, util/negativeCache.js, util/goneReopen.js, resources/RenderQueue.js, ' +
+			'util/changeProbe.js, util/entityGate.js, util/entity.js, util/negativeCache.js, util/goneReopen.js, resources/RenderQueue.js, ' +
 			'util/renderSchedule.js (due_now_forward), util/serveCheck.js and util/pageCheck.js (serve_check)',
 		cadence:
 			'per report flush (unrouted), per finished sitemap run (sitemap_*), per delivery failure ' +
@@ -616,7 +616,8 @@ export const METRICS = Object.freeze({
 			'per failed epoch read (invalidation_error), per heal attempt (invalidation_reenqueue), ' +
 			'per probed batch of a probe pass (the probe_* pass counters, cycle_behind included — increments since ' +
 			'the previous batch; before v0.97.0, once per finished pass), per gated cacheable miss (discovery_gated), ' +
-			'per raw-document store attempt (raw_cache), per entity-gate evaluation (entity_gate), per ' +
+			'per raw-document store attempt (raw_cache), per entity-gate evaluation (entity_gate), per observation ' +
+			'of an entity\u2019s canonical (entity_canonical), per adoption decision (canonical_adopt), per ' +
 			'negative-cache store, guard, re-check or dry-run verdict (negative_cache), per request that found a ' +
 			'stored 404 (negative_gap), per reopen decision (gone_reopen), per suppressed target rendered (suppression_lifted ' +
 			'or suppression_held), per "render this now" filing on a node that does not own the row (due_now_forward), ' +
@@ -703,6 +704,20 @@ export const METRICS = Object.freeze({
 			'THE DRY-RUN NUMBER is would-gate: the renders (and origin document fetches) arming the gate would ' +
 			'save, to read against render/outcome suppressed/canonical-mismatch. A route whose evaluations are ' +
 			'nearly all no-prefix has a pattern that does not match its URLs. ' +
+			'entity_canonical = one emit per observation of an entity\u2019s canonical (entities.enabled, ' +
+			'util/entity.js), by what it did to the registry: new (the entity\u2019s first row), moved (the canonical ' +
+			'changed — a re-slug, or one observation correcting another), same (nothing written), older (a ' +
+			'disagreeing observation made before the stored one, ignored), foreign (a canonical under another ' +
+			'entity\u2019s prefix, ignored), unreadable, error; context = the observer, probe or render. moved/probe ' +
+			'per day is the re-slug rate. A steady stream of moved alternating between probe and render means the ' +
+			'endpoint and the page disagree about the canonical. ' +
+			'canonical_adopt = one emit per adoption decision of the change probe (changeProbe.adoptCanonical), ' +
+			'made only when the canonical the endpoint names is ANOTHER URL than the one probed: adopted (a target ' +
+			'filed due now), reactivated (a canonical-verdict suppression lifted, due now), would-adopt (either, in ' +
+			'a dry run — THE DRY-RUN NUMBER), exists (the canonical has a target in rotation — every duplicate ' +
+			'spelling, nightly), suppressed (its target is suppressed for a reason the probe does not overturn), ' +
+			'recent (adopted within retryAfter), capped (past maxPerPass), refused (unkeyable, off the domain ' +
+			'allowlist, or not on a prerender route), error. ' +
 			'raw_cache = one emit per raw-document store attempt, split by outcome: `stored`, `stored-unshared`, ' +
 			'or the reason it was refused (not-200, staging, has-cookie, content-type, no-store, no-body, ' +
 			'oversize, capture-failed, write-failed, vary-device). READ THE REFUSALS, not the successes — a route that is ' +
@@ -832,6 +847,8 @@ export const METRICS = Object.freeze({
 					'probe_render_mismatch',
 					'discovery_gated',
 					'entity_gate',
+					'entity_canonical',
+					'canonical_adopt',
 					'raw_cache',
 					'negative_cache',
 					'negative_gap',
@@ -852,7 +869,9 @@ export const METRICS = Object.freeze({
 					'tracker\u2019s fill and false_positive sizing gauges. ' +
 					'invalidation_error = failed epoch resolutions. invalidation_reenqueue = heal-attempt outcomes. ' +
 					'probe_* = change-probe pass counters (see usefulFor). discovery_gated = gated cacheable misses. ' +
-					'entity_gate = entity discovery gate evaluations, by outcome. raw_cache = raw-document store ' +
+					'entity_gate = entity discovery gate evaluations, by outcome. entity_canonical = observations of an ' +
+					'entity\u2019s canonical (entities.enabled). canonical_adopt = the change probe\u2019s adoption ' +
+					'decisions (changeProbe.adoptCanonical). raw_cache = raw-document store ' +
 					'attempts. negative_cache = the negative cache (render.negative): stores, refusals, re-checks and ' +
 					'dry-run verdicts. negative_gap = age of a stored 404 when a request for it arrived. gone_reopen = ' +
 					'gone-suppressed targets reopened on an origin 200. suppression_lifted = suppressions a render ' +
@@ -881,7 +900,9 @@ export const METRICS = Object.freeze({
 					"not-sooner, throttled, error. discovery_gated: which gate refused ('route' = the matched " +
 					"route's discoverTargets, 'bot' = ingress.discoveryBots, 'entity' = the route's entityPrefix " +
 					'found a sibling URL of the same entity in rotation, armed gate only). entity_gate: the outcome ' +
-					'(gated, would-gate, suppressed-only, no-siblings, no-prefix, error). raw_cache: THE OUTCOME — stored, ' +
+					'(gated, would-gate, suppressed-only, no-siblings, no-prefix, error). entity_canonical: the outcome ' +
+					'(new, moved, same, older, foreign, unreadable, error). canonical_adopt: the outcome (adopted, ' +
+					'reactivated, would-adopt, exists, suppressed, recent, capped, refused, error). raw_cache: THE OUTCOME — stored, ' +
 					'stored-unshared, or the refusal name; this is the slot the console reads that panel from. ' +
 					'negative_cache: the outcome — stored/stored-unshared; a refusal (has-cookie, private, no-store, ' +
 					'staging, no-body, empty, oversize, capture-failed, capture-busy, write-failed, skipped-listed, ' +
@@ -901,7 +922,8 @@ export const METRICS = Object.freeze({
 				description:
 					'unrouted: first path segment (`/blog/*`), `/` for root (null for the overflow row). ' +
 					'page_age_negative: the device type. invalidation_reenqueue: the invalidation scope literal ' +
-					'that triggered the heal. discovery_gated and entity_gate: the bot name. gone_reopen: what saw the ' +
+					'that triggered the heal. discovery_gated and entity_gate: the bot name. entity_canonical: the observer, ' +
+					"'probe' or 'render'. gone_reopen: what saw the " +
 					"200 — 'traffic' (a proxied bot request) or 'recheck' (a negative-cache re-check). " +
 					'suppression_lifted and suppression_held: how long the target had been suppressed (since its last ' +
 					'verdict) — <1h, <6h, <1d, <3d, <14d, 14d+, or unknown. probe_detection_lag: the rule label. ' +
@@ -1104,6 +1126,17 @@ export const metrics = Object.freeze({
 	 */
 	entityGate: (outcome, botName) =>
 		server.recordAnalytics(true, 'prerender_ops', 'entity_gate', outcome, botName ?? null),
+
+	/**
+	 * One observation of an entity's canonical (util/entity.js) — a prerender_ops series. `outcome` is what it
+	 * did to the registry (new, moved, same, older, foreign, unreadable, error); `from` is the observer, 'probe'
+	 * or 'render'.
+	 */
+	entityCanonical: (outcome, from) =>
+		server.recordAnalytics(true, 'prerender_ops', 'entity_canonical', outcome, from ?? null),
+
+	/** One adoption decision of the change probe (util/entity.js `createCanonicalObserver`) — a prerender_ops series. */
+	canonicalAdopt: (outcome) => server.recordAnalytics(true, 'prerender_ops', 'canonical_adopt', outcome, null),
 
 	/**
 	 * One raw-document store attempt and what became of it — a prerender_ops series.

@@ -1529,6 +1529,47 @@ export const configSchema = group('Prerender plugin configuration.', {
 					),
 				}
 			),
+			adoptCanonical: group(
+				'ADOPT THE CANONICAL THE PROBE REPORTS (util/entity.js, issue #166). Requires `entities.enabled` and a ' +
+					'rule that maps `canonical` in `pageCheck.fields` (an endpoint field holding the canonical path or URL, ' +
+					'e.g. `{ slot: 6, fact: canonical, compare: path }`). Every probe of a URL on a route with an ' +
+					'`entityPrefix` records the canonical the endpoint names for its entity. When that is ANOTHER URL of ' +
+					'the same entity and no target holds it in rotation, its target is filed due now and urgent, as ' +
+					'redirect adoption does — a target suppressed as a canonical verdict (`canonical-mismatch`, ' +
+					'`canonical-variant`) is reactivated the same way; one suppressed for any other reason is left alone.\n\n' +
+					'WHY: a product whose slug changes while it is out of stock is not in the sitemap, so its new ' +
+					'canonical arrives only by traffic discovery, whose first render is jittered across the route\u2019s ' +
+					'interval; measured, every spelling of such a product then missed for one to four days. The ' +
+					'endpoint is the origin\u2019s own answer for the product id, so a crawler-invented spelling cannot ' +
+					'make it invent a canonical. Outcomes on `prerender_ops` / `canonical_adopt`; the observations on ' +
+					'`entity_canonical`.',
+				{
+					enabled: option(
+						true,
+						'Switch. Inert until `entities.enabled` and a rule maps `canonical`, so leaving it on costs ' +
+							'nothing until then.'
+					),
+					dryRun: option(
+						true,
+						'Count `would-adopt` and file nothing. The default, because the number to know first is how many ' +
+							'canonicals a pass would file. The probe\u2019s own `dryRun` files nothing either.'
+					),
+					maxPerPass: option(
+						500,
+						'Most targets one pass files on this node. Measured on one deployment, products re-slug ~100 ' +
+							'times a day cluster-wide; a site-wide re-spelling would file every product at once, so past ' +
+							'this the pass counts `capped` and leaves the rest to the sitemap and the next pass.',
+						{ min: 0 }
+					),
+					retryAfter: option(
+						7 * DAY,
+						'An entity whose adopted canonical did not take (it 404s, or its page names another canonical ' +
+							'after all) is not filed again for this long, so a bad canonical costs one render per window, ' +
+							'not one a night.',
+						{ unit: 'ms', min: HOUR }
+					),
+				}
+			),
 			requestTimeout: option(10 * SECOND, 'Per-probe timeout, headers and body both.', {
 				unit: 'ms',
 				min: SECOND,
@@ -3090,6 +3131,22 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'the User-Agent; longer matches win over shorter ones (e.g. `googlebot-image` before ' +
 					'`googlebot`).',
 				{ itemType: 'object' }
+			),
+		}
+	),
+
+	entities: group(
+		'THE ENTITY REGISTRY (util/entity.js, issue #166): one `Entity` row per entity a route declares with ' +
+			'`ingress.routes[].entityPrefix` (a product), keyed by the entity prefix, holding the entity\u2019s ' +
+			'current canonical URL. Written by observations of the origin only: the change probe\u2019s mapped ' +
+			'`canonical` slot and a stored render\u2019s declared canonical, the newer of two disagreeing ' +
+			'observations winning, and only when the canonical moves. Replicated, not residency-pinned. Read by ' +
+			'`changeProbe.adoptCanonical`. Observations on `prerender_ops` / `entity_canonical`.',
+		{
+			enabled: option(
+				false,
+				'Keep the registry. Off by default: on, the first probe pass writes one row per probed entity (paced ' +
+					'by the probe) and renders fill in the rest; after that it writes only when a canonical moves.'
 			),
 		}
 	),

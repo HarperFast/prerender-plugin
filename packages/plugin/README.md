@@ -313,6 +313,50 @@ Existing suppressed rows are untouched: they age out through `maxStrikes` as bef
 is armed they are not re-minted. Armed refusals are also counted on `discovery_gated` with the gate
 name `entity`.
 
+### The entity registry, and adopting the canonical the probe reports (`entities`)
+
+`Target` is keyed by URL, so two spellings of one product are two unrelated rows, and nothing records
+which of them the origin calls canonical. The registry keeps one `Entity` row per entity a route
+declares with `entityPrefix`, keyed by the entity prefix (`https://www.example.com/product/prd-123/`),
+holding the entity's current canonical URL ([#166](https://github.com/HarperFast/prerender-plugin/issues/166)).
+
+```yaml
+entities:
+  enabled: true
+changeProbe:
+  adoptCanonical:
+    dryRun: true # the default: count would-adopt, file nothing
+```
+
+- **Written by observations of the origin only.** The change probe's mapped `canonical` slot is one
+  observer; it is the endpoint's own answer for the product id. A stored render's declared
+  `pageFacts.canonical` is the other.
+  - When two observations disagree, the newer wins. A render's instant is when it read the origin
+    (store time less its longest render), so a render claimed before a re-slug can't undo the probe
+    that saw it.
+  - An unchanged observation writes nothing.
+  - A canonical under another entity's prefix is ignored.
+- **Adoption.** When the probe reports a canonical that is another URL of the same entity, and no target
+  holds it in rotation, its target is filed due now and urgent, as redirect adoption does.
+  - A target suppressed as a canonical verdict (`canonical-mismatch`, `canonical-variant`) is reactivated
+    the same way. One suppressed for any other reason (a 404, a noindex) is left alone.
+  - Bounded by `maxPerPass` per pass and node, by `retryAfter` per entity (a canonical that did not take is
+    filed once per window, not nightly), and by both dry runs.
+- **Why.** Measured on one deployment, products re-slug ~100 times a day and the product sitemap
+  changes once a day. An out-of-stock product is not in the sitemap at all, so its new canonical
+  arrived only by traffic discovery, with its first render jittered across the route's 96h interval.
+  Every spelling missed for one to four days.
+- **Needs a rule that maps `canonical`**, e.g. `{ slot: 6, fact: canonical, compare: path }`, with the
+  slot kept out of `ignoreChanges` so a re-slug is also a change the sweep acts on.
+- **Cost.** Replicated and not residency-pinned. The first probe pass with the registry on writes one row
+  per probed entity, paced by the probe, and renders fill in the rest. After that it writes only when a
+  canonical moves.
+- **Inspect it:** `GET /prerender_admin/explain?url=…` reports `rows.entity` (the canonical, who named it,
+  when, and the last adoption). Outcomes: `prerender_ops` / `entity_canonical` and `canonical_adopt`.
+
+Phase 2 of #166 moves the readers onto it: the probe walks entities rather than every target, and the
+entity gate and entity serve do a point read.
+
 ### Sitemaps are filtered to prerender routes
 
 A sitemap is written for search engines: it lists every indexable URL on the site, which is routinely

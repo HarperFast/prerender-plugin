@@ -150,6 +150,32 @@ type Target @table(database: "render_service") @export {
 	unlistedAt: Date
 }
 
+# ONE ROW PER ENTITY a route declares (a product), keyed by its ENTITY PREFIX — the URL origin plus the
+# route's `entityPrefix` match, `https://www.example.com/product/prd-123/` — holding the entity's CURRENT
+# CANONICAL URL (util/entity.js, issue #166). `Target` is keyed by URL, so two spellings of one product are
+# two unrelated rows; this is where "which of them does the origin call canonical, now" lives.
+#
+# DERIVED, NEVER AUTHORITATIVE: `Target` stays the render registry. Written only by observations of the
+# origin — the change probe's mapped `canonical` slot and a stored render's declared canonical — and only
+# when the canonical MOVES (an unchanged observation writes nothing). Replicated and NOT residency-pinned,
+# like `Target`: writes are rare, and every node answers a point read locally. Not @export: internal state,
+# read through the admin API. Inert unless `entities.enabled`.
+type Entity @table(database: "render_service") {
+	id: String @primaryKey
+	# The canonical URL (a Target key) the newest observation named.
+	canonical: String
+	# Which observer named it: 'probe' or 'render'.
+	canonicalFrom: String
+	# When that observer READ the origin. A later observation that disagrees moves the canonical; an earlier
+	# one (a render claimed before a re-slug, landing after the probe saw it) does not.
+	canonicalAt: Date
+	firstSeenAt: Date
+	# The last canonical the change probe ADOPTED a target for, and when: a canonical that did not take is
+	# not re-filed until `changeProbe.adoptCanonical.retryAfter` has passed.
+	adoptedCanonical: String
+	adoptedAt: Date
+}
+
 # The render queue: ONE ROW PER URL, due at `nextRenderTime`. A claim of a row is one job that
 # renders every device in `config.deviceTypes.default`, and its one result schedules the URL once —
 # which is what keeps a URL's device variants aligned (same render pass, one decision) instead of
