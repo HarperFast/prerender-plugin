@@ -43,6 +43,7 @@ import {
 import { isGoneSuppressed, maybeReopenGone, REOPEN_SELECT } from '../util/goneReopen.js';
 import { rescueFromOwner } from '../util/peerRescue.js';
 import { evaluateEntityGate } from '../util/entityGate.js';
+import { entityServeApplies, resolveEntityServe } from '../util/entityServe.js';
 import { deliverResource } from './response.js';
 
 export async function handleBotRequest(request) {
@@ -93,7 +94,15 @@ export async function handleBotRequest(request) {
 			renderTimedOut: info.renderNowStatus === 'timeout',
 			cacheStatus: info.cacheStatus,
 		});
-		recordDemand({ resource, routeClass, route, cacheUrl, botName: request.botName, cacheStatus: info.cacheStatus });
+		// An entity serve is demand for the page that answered it — the canonical's, which owns the target.
+		recordDemand({
+			resource,
+			routeClass,
+			route,
+			cacheUrl: info.entity?.url ?? cacheUrl,
+			botName: request.botName,
+			cacheStatus: info.cacheStatus,
+		});
 		// DEMAND-DRIVEN HEAL, default off and a no-op unless an invalidation is what cost this request
 		// its cache serve (`info.invalidatedBy` is set only when the epoch was consulted, which happens
 		// only when the page would otherwise have been served). Detached inside, like maybeSchedule —
@@ -122,12 +131,13 @@ export async function handleBotRequest(request) {
 }
 
 // The cache statuses that served a rendered snapshot from this node's cache, and the raw-document one.
-const SNAPSHOT_SERVES = new Set(['hit', 'swr', 'verified']);
+const SNAPSHOT_SERVES = new Set(['hit', 'swr', 'verified', 'entity']);
 
 /**
  * Hand a cache serve to the serve-time check (util/serveCheck.js): the served bytes for a snapshot (none
  * on a HEAD, which sends nothing and has nothing to read) with its headers as stored — parsed later, only
- * when a check is due, never before this response — and the stored facts for a raw document.
+ * when a check is due, never before this response — and the stored facts for a raw document. An entity
+ * serve is checked as the page it served — the canonical's URL and key, never the spelling's.
  */
 function maybeServeCheck(resource, request, info, cacheUrl) {
 	if (!config.changeProbe.serveCheck?.enabled || info.source === 'origin') return;
@@ -135,11 +145,11 @@ function maybeServeCheck(resource, request, info, cacheUrl) {
 	if (!kind || (kind === 'page' && request.method === 'HEAD')) return;
 	considerServeCheck({
 		kind,
-		url: cacheUrl,
+		url: info.entity?.url ?? cacheUrl,
 		lastCachedMs: resource?.lastCached ? new Date(resource.lastCached).getTime() : NaN,
 		body: kind === 'page' ? info.cachedBody : undefined,
 		headers: kind === 'page' ? (resource?.headers ?? null) : null,
-		cacheKey: kind === 'page' ? (info.cacheKey ?? resource?.cacheKey ?? null) : null,
+		cacheKey: kind === 'page' ? (info.entity?.cacheKey ?? info.cacheKey ?? resource?.cacheKey ?? null) : null,
 		facts: kind === 'raw' ? (resource?.facts ?? null) : null,
 		rawKey: kind === 'raw' ? (info.rawKey ?? null) : null,
 		deviceType: info.deviceType ?? null,
@@ -169,7 +179,8 @@ export function recordServeOutcome(resource, request, info, deviceType) {
 	const route = info.route?.path ?? info.routeClass ?? 'unrouted';
 	metrics.botServe(info.source, info.cacheStatus, request.botName);
 	metrics.routeServe(route, info.cacheStatus, deviceType);
-	if (info.source === 'cache' && resource.lastCached) {
+	// An entity serve is a served snapshot too: its age is the age of the render the crawler received.
+	if ((info.source === 'cache' || info.source === 'entity') && resource.lastCached) {
 		// lastCached is a schema Date — guard truthiness FIRST, then coerce, exactly like the
 		// expiresAt read above: `new Date(null)` is epoch 0 (not NaN), so an unguarded null
 		// would record age ≈ Date.now() and poison the metric. Past the guard, a Date, number,
@@ -458,6 +469,24 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		return rendered.resource;
 	}
 
+	// A TRUE MISS: nothing was found under this key, and the request is not an operator asking for the origin
+	// as it stands now. The entity serve, the raw cache and the negative cache all answer only this.
+	const trueMiss = info.cacheStatus === 'miss' && !(missModeExplicit && effectiveMissMode === 'origin');
+
+	// THE ENTITY SERVE (util/entityServe.js): this spelling has no page, but its entity's canonical may — a
+	// rendered page, which is a better answer than a stored origin document, so it is asked first. Every
+	// refusal falls through to the raw and negative caches and the origin exactly as before.
+	if (trueMiss && entityServeApplies(info.route)) {
+		const { serve } = await resolveEntityServe({ cacheUrl, deviceType, route: info.route, botName: request.botName });
+		if (serve) {
+			info.cachedBody = serve.body;
+			info.cacheStatus = 'entity';
+			info.source = 'entity';
+			info.entity = { url: serve.url, cacheKey: serve.cacheKey };
+			return serve.page;
+		}
+	}
+
 	// THE RAW-DOCUMENT CACHE (util/rawCache.js), and note the status it is gated on: `miss` ONLY.
 	//
 	// A miss is the one verdict that proves nothing is cached and — on a discovery-gated route, which
@@ -474,10 +503,7 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	// `cacheStatus` at 'miss' (only `Cache-Control: no-cache` sets `skip`), but it is an authorized
 	// operator asking for what the origin has RIGHT NOW — usually to verify a fix. Answering it from
 	// storage would make the one gesture available for checking the origin return a cached document.
-	const rawPolicy =
-		info.cacheStatus === 'miss' && !(missModeExplicit && effectiveMissMode === 'origin')
-			? rawCachePolicy(info.route)
-			: null;
+	const rawPolicy = trueMiss ? rawCachePolicy(info.route) : null;
 	// Per-device by default, one row per URL under `render.raw.deviceIndependent` (see `rawKeyOf`).
 	// Only the STORAGE key changes: the response still reports this request's own `cacheKey`.
 	const rawKey = rawPolicy ? rawKeyOf({ cacheKey, cacheUrl }, rawPolicy) : null;
@@ -532,10 +558,7 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	// — and consulted after it, since a stored document for this URL would be the better answer. What the
 	// lookup found is carried to `afterNegativeProxy`, which stores, refreshes or drops the entry once the
 	// origin has answered.
-	const negativePolicy =
-		info.cacheStatus === 'miss' && !(missModeExplicit && effectiveMissMode === 'origin')
-			? negativeCachePolicy(info.route)
-			: null;
+	const negativePolicy = trueMiss ? negativeCachePolicy(info.route) : null;
 	const negativeKey = negativePolicy ? negativeKeyOf({ cacheKey, cacheUrl }, negativePolicy) : null;
 	let negativeLookup = null;
 	if (negativePolicy) {

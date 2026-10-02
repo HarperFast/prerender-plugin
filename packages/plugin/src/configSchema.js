@@ -115,7 +115,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'queryParams?: string[], renderInterval?: number, discoverTargets?: boolean, demandFloor?: number, ' +
 					"departureAction?: 'none' | 'expire' | 'render', arrivalAction?: 'none' | 'render', " +
 					'rawCache?: boolean, rawFacts?: boolean | string[], documentCheck?: boolean | string[], ' +
-					'negativeCache?: boolean, entityPrefix?: string }.\n\n' +
+					'negativeCache?: boolean, entityPrefix?: string, entityServe?: boolean }.\n\n' +
 					'FIRST MATCH WINS, so order most-specific first. That ordering is what lets a passthrough ' +
 					'carve-out sit inside a prerendered prefix (`/products/clearance/` above `/products/`) ' +
 					'without a second list and a precedence rule.\n\n' +
@@ -233,7 +233,19 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'the route keeps included, so do not set this on a route where several URLs per entity are ' +
 					'distinct pages. The pattern runs against crawler-supplied paths, so keep it linear — a literal ' +
 					'prefix plus `[^/]+` segments, no nested quantifiers. Governed by `ingress.entityGate` (dry run ' +
-					'by default).',
+					'by default).\n\n' +
+					'`entityServe` (default false; prerender routes with an `entityPrefix` only) — answer a TRUE miss ' +
+					'for a URL with no target of its own from the cached render of its entity\u2019s canonical URL, ' +
+					'instead of the origin: the crawler asking for `/product/prd-1/old-slug.jsp` gets the page cached ' +
+					'for `/product/prd-1/right-slug.jsp`, which declares the canonical exactly as the origin would. ' +
+					'Served only when one target of the entity in rotation has a fresh, indexable 200 page for the ' +
+					'device, that page\u2019s own canonical names it, and its canonical was confirmed against the ' +
+					'origin since the last anchor (see `ingress.entityServe`); anything else falls through to the ' +
+					'ordinary miss path. ONLY FOR A SITE THAT ANSWERS EVERY SPELLING OF AN ENTITY WITH THE SAME ' +
+					'DOCUMENT. The experiment that settles it: fetch two spellings of one product from the origin and ' +
+					'compare everything but per-response noise — the canonical, title, description, offers and ' +
+					'breadcrumbs must be identical, and the canonical must name the same URL from both. Governed by ' +
+					'`ingress.entityServe` (dry run by default).',
 				{ itemType: 'object' }
 			),
 			discoveryBots: option(
@@ -278,6 +290,50 @@ export const configSchema = group('Prerender plugin configuration.', {
 							'many mints the gate WOULD refuse — `entity_gate` outcome `would-gate` — which is read ' +
 							'against `render` outcome `suppressed`/`canonical-mismatch` before arming it. Turn it off ' +
 							'to arm the gate.'
+					),
+				}
+			),
+			entityServe: group(
+				'The entity serve. Nothing here does anything until a route sets `ingress.routes[].entityServe` ' +
+					'beside its `entityPrefix` — see that field for what it does and when a site qualifies.\n\n' +
+					'WHEN IT SERVES. On a true miss (no page for this key) for a URL with no target of its own, the ' +
+					'targets sharing its entity prefix are read (one bounded primary-key range read of at most 8 ' +
+					'rows, node-local). Exactly one of them in rotation must have a page for this device that is a ' +
+					'200, indexable, inside its own expiry (not SWR) and not covered by an invalidation it predates; ' +
+					'none, or more than one, falls through. That page must have been rendered since the threshold ' +
+					'below, or checked against the origin since then by a check that compared its canonical and ' +
+					'found it the same (`PageCheck.canonicalAgreed` — the serve-time check and the probe sweep write ' +
+					'it, so the probe rule must map `canonical`); and its own `<link rel=canonical>` must name it. ' +
+					'An unconfirmed page is offered to the serve-time check, under that check\u2019s own switches and ' +
+					'budget. Then it is served as `bot_serve` source and status `entity`.\n\n' +
+					'WHY THE CONFIRMATION. An origin re-spells slugs. Between a re-spell and the old page\u2019s ' +
+					're-render, the old page names its old slug while the origin declares the new one; served at ' +
+					'every spelling, the contradiction would spread. Confirmation since the anchor bounds it to what ' +
+					'the page already serves at its own URL.\n\n' +
+					'ARM THE ENTITY GATE WITH IT. A spelling a minting crawler asks for gets a target on its first ' +
+					'miss, and a spelling with a target is never entity-served. With `ingress.entityGate.dryRun: ' +
+					'true` this answers only the first request for each such spelling.\n\n' +
+					'Observed on `prerender_ops` / `entity_serve`, one emit per evaluation by outcome.',
+				{
+					enabled: option(
+						true,
+						'Master switch. Routes still have to opt in with `entityServe`, so leaving this on costs ' +
+							'nothing until one does; it exists so an operator can stop entity serves during an incident ' +
+							'without editing the route list. Off = no read, nothing counted, every miss as before.'
+					),
+					dryRun: option(
+						true,
+						'Evaluate and count, but answer every miss as before. The default, because the number to know ' +
+							'first is how many misses it WOULD answer — `entity_serve` outcome `would-serve` — and why the ' +
+							'rest fall through. Turn it off to serve.'
+					),
+					maxConfirmAge: option(
+						0,
+						'How recent a confirmation must be, at most, beside the anchor: the threshold is the later of ' +
+							'the last anchor (`changeProbe.mode: anchored`) and now minus this. 0 = the anchor alone. ' +
+							'Outside anchored mode the anchor does not exist, so with 0 nothing is ever confirmed and ' +
+							'nothing is served — set this to the longest a page may go unconfirmed there.',
+						{ unit: 'ms', min: 0 }
 					),
 				}
 			),

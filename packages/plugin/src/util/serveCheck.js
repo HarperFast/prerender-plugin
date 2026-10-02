@@ -197,6 +197,24 @@ const planFor = (kind, url, route) => {
 	return null;
 };
 
+/** Are serve-time checks on (they may still be in dry run)? `serveChecksArmed` (util/changeProbe.js) is "and acting". */
+export const serveChecksOn = isOn;
+
+/**
+ * Does a check of the page at `url` on `route` compare `fact` (a page-facts name: 'canonical', 'title', …)?
+ * The serve-time check's plan for it maps that fact (its rule's endpoint fields, else the route's
+ * `documentCheck`), and the sweep, which records its agreements as checks too, compares the same rule's
+ * fields. False when no check covers the URL at all. A caller that treats an agreeing check as evidence
+ * about ONE fact needs this: an agreement is "nothing compared disagreed", and says nothing about a fact
+ * the check never compares.
+ */
+export const checkComparesFact = (url, route, fact) => {
+	const plan = planFor('page', url, route);
+	if (!plan) return false;
+	if (plan.source === 'document') return plan.want.includes(fact);
+	return (plan.rule.pageCheck?.fields ?? []).some((field) => field.fact === fact);
+};
+
 // ---- the gate, on the serve path (after the response) ---------------------------------------------
 
 const DEDUPE_MS = 5 * 60_000;
@@ -389,7 +407,11 @@ const runCheck = async (item, gen = generation) => {
 	}
 	if (verdict.answered) deps.healthy();
 	if (verdict.result === 'agree') {
-		await deps.writeCheck(item.url, item.lastCachedMs, { outcome: 'agree', signature: verdict.signature ?? null });
+		await deps.writeCheck(item.url, item.lastCachedMs, {
+			outcome: 'agree',
+			signature: verdict.signature ?? null,
+			canonicalAgreed: verdict.canonicalAgreed === true,
+		});
 		metrics.serveCheck('agree', item.source);
 	} else if (verdict.result === 'mismatch') {
 		await settleMismatch(item, verdict, prior);
@@ -425,6 +447,7 @@ const settleMismatch = async (item, verdict, prior) => {
 			outcome: 'held',
 			field: verdict.field,
 			evidence: verdict.evidence,
+			canonicalAgreed: verdict.canonicalAgreed === true,
 		});
 		metrics.serveCheck('held', item.source);
 		return;
@@ -440,6 +463,7 @@ const settleMismatch = async (item, verdict, prior) => {
 		outcome: 'mismatch',
 		field: verdict.field,
 		evidence: verdict.evidence,
+		canonicalAgreed: verdict.canonicalAgreed === true,
 	});
 	metrics.serveCheck(acted, item.source);
 	logger.debug?.(
@@ -470,25 +494,30 @@ const evidenceOf = (value) => fnv1a32(JSON.stringify(value ?? null)).toString(16
  * The served page's facts against the rule's endpoint: 'mismatch' when any ARMED mapped field disagrees
  * (naming the first, with a digest of the endpoint's value for it), 'agree' when at least one compared and
  * agreed and none disagreed, else 'inconclusive'. The same comparators, and the same armed set, as the sweep.
+ * `canonicalAgreed`: an armed field on the page's `canonical` compared and agreed, and none disagreed.
  */
 export const compareWithEndpoint = (rule, values, facts, { pageUrl = null, isArmed = () => true } = {}) => {
 	const ctx = { pageUrl, vocabulary: rule.pageCheck?.vocabulary ?? null };
 	let disagreed = null;
 	let agreed = 0;
+	let canonical = null;
 	for (const field of rule.pageCheck?.fields ?? []) {
 		if (!isArmed(rule, field)) continue;
 		const verdict = compareField(field, values[field.slot], facts, ctx);
 		if (verdict === false) disagreed ??= field;
 		else if (verdict === true) agreed++;
+		if (field.fact === 'canonical' && verdict !== null) canonical = canonical !== false && verdict;
 	}
+	const canonicalAgreed = canonical === true;
 	if (disagreed) {
 		return {
 			result: 'mismatch',
 			field: disagreed.label ?? `${disagreed.slot}:${disagreed.fact}`,
 			evidence: evidenceOf(values[disagreed.slot]),
+			canonicalAgreed,
 		};
 	}
-	return agreed > 0 ? { result: 'agree' } : { result: 'inconclusive' };
+	return { result: agreed > 0 ? 'agree' : 'inconclusive', canonicalAgreed };
 };
 
 const checkDocument = async (item) => {
@@ -530,17 +559,21 @@ const listedByUrl = (list) => {
  * availability: membership and order are not a change (a listing re-ranks through the day, and a product
  * that left it is still correct on its own page). A listing that names one product twice on either side
  * compares nothing: pairing its entries would be a guess, and a wrong guess disagrees on every check.
+ * `canonicalAgreed`: `canonical` was in `want`, both stated it, and it was the same.
  */
 export const compareDocuments = (page, origin, want) => {
 	let disagreed = null;
 	let agreed = 0;
+	let canonicalAgreed = false;
 	for (const name of want) {
 		const a = page?.[name] ?? null;
 		const b = origin?.[name] ?? null;
 		if (a === null || b === null) continue;
 		if (name !== 'itemList') {
-			if (sameValue(a, b)) agreed++;
+			const same = sameValue(a, b);
+			if (same) agreed++;
 			else disagreed ??= { field: name, evidence: evidenceOf(b) };
+			if (name === 'canonical') canonicalAgreed = same;
 			continue;
 		}
 		const ours = listedByUrl(a);
@@ -565,8 +598,8 @@ export const compareDocuments = (page, origin, want) => {
 			disagreed = { field: 'itemList', evidence: evidenceOf(differing) };
 		}
 	}
-	if (disagreed) return { result: 'mismatch', ...disagreed };
-	return agreed > 0 ? { result: 'agree' } : { result: 'inconclusive' };
+	if (disagreed) return { result: 'mismatch', ...disagreed, canonicalAgreed };
+	return { result: agreed > 0 ? 'agree' : 'inconclusive', canonicalAgreed };
 };
 
 /**
