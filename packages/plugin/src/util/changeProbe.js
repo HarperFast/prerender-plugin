@@ -52,7 +52,7 @@ import { metrics } from '../metrics.js';
 import { fnv1a32 } from './hash.js';
 import { epochMsOf, dateColumnMs, getNextTimeOfDay, DAY, MINUTE, SECOND } from './time.js';
 import { getResidencyByUrl } from './residency.js';
-import { resolveEffectiveInterval, routeScopeForUrl } from './routeClass.js';
+import { matchRoute, resolveEffectiveInterval, routeScopeForUrl } from './routeClass.js';
 import { fileDueNow } from './renderSchedule.js';
 import { demandOf, warmDemand } from './demand.js';
 import { createChangeActions } from './changeActions.js';
@@ -395,6 +395,22 @@ export const disarmedFieldsOnNode = async (rule) => {
 		// Unknown: this worker's own guard is what there is.
 	}
 	return out;
+};
+
+/**
+ * How a pass records its agreeing comparisons as checks (`PageCheck`, util/pageCheck.js), or null for not
+ * at all. Every one while serve-time checks are on: they read the rows to spare a request. Otherwise only on
+ * routes that serve entities (`ingress.routes[].entityServe`): the entity serve reads them as confirmation of
+ * the canonical (util/entityServe.js), and nothing else reads them, so a row anywhere else would be a
+ * replicated write per probe that buys nothing.
+ */
+export const pageCheckRecorder = () => {
+	if (config.changeProbe.serveCheck?.enabled) return writePageCheck;
+	if (!config.ingress.entityServe?.enabled) return null;
+	return (url, basisAtMs, details) =>
+		matchRoute(URL.parse(url)?.pathname ?? '')?.entityServe === true
+			? writePageCheck(url, basisAtMs, details)
+			: undefined;
 };
 
 /**
@@ -899,11 +915,15 @@ const RECHECK_MAX_WAIT_MS = MINUTE;
  * when no pass runs.
  *
  * WHAT A PASS LEAVES, while serve-time checks are armed: what they are USING, not what they might
- * (`outOfPassHeadroom`). Twice the out-of-pass rate of the last few seconds, at least a floor and at most
- * `serveCheck.share` of the ceiling — so the total never exceeds `ratePerSecond`, the checks can double
- * their allowance every few seconds when a burst of due pages arrives (the anchor), and a quiet afternoon
- * costs the pass a tenth of its rate, not `share` of it. Unarmed, a pass runs at the ceiling and leaves
- * nothing, as before.
+ * (`outOfPassHeadroom`). The out-of-pass rate of the last few seconds, at least a floor and at most
+ * `serveCheck.share` of the ceiling — so the total never exceeds `ratePerSecond` and a quiet afternoon
+ * costs the pass a tenth of its rate, not `share` of it. TWICE that rate only while requests are WAITING
+ * for budget (the next free slot more than `BACKLOG_MS` out): that is a burst of due pages (the anchor)
+ * asking for more than it has, and doubling lets it grow into `share` within seconds. Doubling
+ * unconditionally idled the budget whenever the checks were held back by something else: on one node
+ * they ran at ~5/s (their own concurrency), the pass left them 2 x 5 = all of a 10/s ceiling and crawled
+ * near its 1/s floor, and ~4/s of the agreed rate went unused for the five hours after the anchor. Unarmed,
+ * a pass runs at the ceiling and leaves nothing, as before.
  *
  * PUSHBACK STOPS THEM. A serve-time check the origin answers 429/5xx, or that times out, pauses every
  * out-of-pass request on the node (`noteOriginPushback`): twice as long per consecutive pushback, at
@@ -957,12 +977,25 @@ export const outOfPassRate = (nowMs = Date.now()) => {
 	return ((Number(Atomics.load(cell, 5)) + current) / (USAGE_WINDOW_MS + elapsed)) * 1000;
 };
 
+/**
+ * How far ahead (ms) the next free out-of-pass slot is: 0 when a request asking now would go at once, more
+ * when earlier requests have booked the slots ahead of it — the time out-of-pass demand is queued for budget.
+ */
+export const outOfPassBacklogMs = (nowMs = Date.now()) =>
+	Math.max(0, Number(Atomics.load(originPaceCell(), 0)) - nowMs);
+
+// Queued for budget longer than this, and the checks are asking for more than they are given (see above).
+// Above a slot or two so one request landing on an already-booked slot does not read as a burst.
+const BACKLOG_MS = 500;
+
 /** What a pass leaves out-of-pass while serve-time checks are armed (see above), in requests per second. */
 export const outOfPassHeadroom = (nowMs = Date.now()) => {
 	const ceiling = Math.max(0, config.changeProbe.ratePerSecond);
 	const most = ceiling * (config.changeProbe.serveCheck?.share ?? 0);
 	const floor = Math.min(most, Math.max(0.1, ceiling * 0.1));
-	return Math.min(most, Math.max(floor, 2 * outOfPassRate(nowMs)));
+	const used = outOfPassRate(nowMs);
+	const wanted = outOfPassBacklogMs(nowMs) > BACKLOG_MS ? 2 * used : used;
+	return Math.min(most, Math.max(floor, wanted));
 };
 
 /**
@@ -1348,8 +1381,9 @@ export const runProbePass = async ({
 	skipProbedSince = null,
 	// Serve-time checks (util/serveCheck.js): `readCheck(url)` resolves the URL's last check
 	// (util/pageCheck.js `readPageCheck`), a row a check observed exactly as its baseline stands at or after
-	// `skipCheckedSince` is skipped (`checkSparesProbe`), and `recordCheck(url, basisAtMs, { signature })`
-	// records this pass's own agreeing comparisons. All null = the pre-feature pass.
+	// `skipCheckedSince` is skipped (`checkSparesProbe`), and `recordCheck(url, basisAtMs, { signature,
+	// canonicalAgreed })` records this pass's own agreeing comparisons (`pageCheckRecorder`). All null = the
+	// pre-feature pass.
 	readCheck = null,
 	skipCheckedSince = null,
 	recordCheck = null,
@@ -1755,9 +1789,15 @@ export const runProbePass = async ({
 			// path then spares a request for a page the pass just compared, and a restarted pass skips what it
 			// already checked since the anchor. Not a verification: it exempts nothing from an invalidation.
 			// The observation goes with it: it is the baseline now (written above when it moved), which is what
-			// lets a restarted pass skip the row (`checkSparesProbe`).
-			if (recordCheck && proof && !caughtUp && !mappedDisagrees)
-				await recordCheck(row.url, epochOf(stored.pageClaimAt), { signature: observed });
+			// lets a restarted pass skip the row (`checkSparesProbe`). So does whether the page's CANONICAL
+			// compared and agreed — the one fact the entity serve takes as confirmation (util/entityServe.js),
+			// which `proof` cannot stand in for: it is satisfied by any armed field, or by the claim pair alone.
+			if (recordCheck && proof && !caughtUp && !mappedDisagrees) {
+				const canonicalAgreed = (verdicts ?? []).some(
+					({ field, verdict }) => field.fact === 'canonical' && verdict === true && armed(field)
+				);
+				await recordCheck(row.url, epochOf(stored.pageClaimAt), { signature: observed, canonicalAgreed });
+			}
 			return;
 		}
 		if (dryRun) {
@@ -2544,7 +2584,7 @@ export const runProbeSweepOnce = async ({
 			// observations), and, once the checks are armed, skips what was checked since this pass began.
 			readCheck: config.changeProbe.serveCheck?.enabled ? readPageCheck : null,
 			skipCheckedSince: serveChecksArmed() ? (resume?.originStartedAt ?? startedAt) : null,
-			recordCheck: config.changeProbe.serveCheck?.enabled ? writePageCheck : null,
+			recordCheck: pageCheckRecorder(),
 			// The entity registry: every answered probe's canonical, filing nothing when THIS pass is a dry run —
 			// an operator's measure-only sweep included.
 			onCanonical: entitiesOn()

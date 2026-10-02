@@ -57,6 +57,9 @@ export const CACHE_STATUS_COLORS = {
 	// origin-side colours — offload counts it against.
 	'negative': '#b9a57e',
 	'negative-revalidate': '#d9a066',
+	// Another URL's render answered it: the entity's canonical, served at a spelling with no page of its own
+	// (plugin `entityServe`, v0.100.0). A snapshot, so a green, but its own: coverage by inference.
+	'entity': '#a7d68f',
 	'miss': WARN,
 	'stale': PINK,
 	'invalidated': PURPLE,
@@ -86,12 +89,15 @@ export const CACHE_STATUS_COLORS = {
  * re-check went to the origin, so the plugin reports its source as `origin` and it must not count as
  * spared here either.
  *
+ * `entity` IS TOO (plugin v0.100.0): the cached render of the entity's canonical answered a spelling with no
+ * page of its own, and the origin was not asked.
+ *
  * BUT IT IS NOT AN AGE POPULATION. `page_age` / `route_page_age` are emitted only when the serve
  * SOURCE is `cache` (`recordServeOutcome`), and a raw serve's source is `raw` — nothing rendered
  * it, so it has no cadence to be measured against. Anything dividing by "cache serves" to talk
  * about freshness must therefore count the source, not this set; see the staleness panel.
  */
-export const CACHE_SERVED = new Set(['hit', 'swr', 'verified', 'peer-rescue', 'raw', 'negative']);
+export const CACHE_SERVED = new Set(['hit', 'swr', 'verified', 'peer-rescue', 'raw', 'negative', 'entity']);
 export const isCacheServed = (status) => CACHE_SERVED.has(status);
 
 /**
@@ -101,7 +107,14 @@ export const isCacheServed = (status) => CACHE_SERVED.has(status);
  * "answered from storage" and "a render covers this URL" are different questions, and a raw
  * document answers only the first.
  */
-export const SOURCE_COLORS = { cache: OK, rendered: INFO, raw: '#7fd4e8', negative: '#b9a57e', origin: WARN };
+export const SOURCE_COLORS = {
+	cache: OK,
+	rendered: INFO,
+	entity: '#a7d68f',
+	raw: '#7fd4e8',
+	negative: '#b9a57e',
+	origin: WARN,
+};
 
 /** What became of a posted render result (render outcome.method). */
 export const OUTCOME_COLORS = {

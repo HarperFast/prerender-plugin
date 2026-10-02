@@ -1895,6 +1895,32 @@ test('a pass leaves out-of-pass requests what they USE, not `share` — and only
 	await applyProbeConfig({ enabled: false });
 });
 
+test('a pass doubles what it leaves only while out-of-pass requests are WAITING for budget', async () => {
+	await applyProbeConfig({
+		enabled: true,
+		dryRun: false,
+		ratePerSecond: 10,
+		serveCheck: { enabled: true, dryRun: false, share: 1 },
+	});
+	changeProbe.__resetOriginPaceForTest();
+	// Twelve at once: at 10/s the last is booked ~1.2s out — demand queued for budget, a burst growing into `share`.
+	for (let i = 0; i < 12; i++) assert.notEqual(changeProbe.reserveOriginSlot(60_000), null);
+	const now = Date.now();
+	assert.ok(changeProbe.outOfPassBacklogMs(now) > 1000, `backlog ${changeProbe.outOfPassBacklogMs(now)}`);
+	const used = changeProbe.outOfPassRate(now);
+	assert.ok(used > 1, `used ${used}`);
+	assert.equal(changeProbe.outOfPassHeadroom(now), 2 * used, 'waiting: twice what they use');
+	// Two seconds on, every booked slot is past and nothing waits: whatever holds the checks back, it is not the
+	// budget, so the pass leaves them what they use and keeps the rest — not twice it, idling half.
+	const later = now + 2000;
+	assert.equal(changeProbe.outOfPassBacklogMs(later), 0);
+	const usedLater = changeProbe.outOfPassRate(later);
+	assert.ok(usedLater > 1, `used ${usedLater}`);
+	assert.equal(changeProbe.outOfPassHeadroom(later), usedLater, 'not waiting: what they use');
+	changeProbe.__resetOriginPaceForTest();
+	await applyProbeConfig({ enabled: false });
+});
+
 test('the pass ceiling is lowered by the headroom it leaves, batch by batch', async () => {
 	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
 	const waits = [];
@@ -2845,6 +2871,44 @@ test('an entity registry that throws, synchronously or not, costs the pass nothi
 		);
 		assert.equal(stats.failed, 0);
 	}
+});
+
+test('a recorded check says whether the CANONICAL compared and agreed — the entity serve\u2019s confirmation', async () => {
+	const signature = await apiSig();
+	const record = async (guard) => {
+		const recorded = [];
+		await runMappedPass({
+			rows: [row(URL_A)],
+			answers: { [URL_A]: signature },
+			stored: { [URL_A]: { signature, pageFacts: await RECORD() } },
+			recordCheck: async (url, basisAtMs, details) => recorded.push({ url, basisAtMs, ...details }),
+			...(guard ? { guard } : {}),
+		});
+		return recorded;
+	};
+	const agreed = await record(null);
+	assert.equal(agreed.length, 1);
+	assert.equal(agreed[0].canonicalAgreed, true);
+	assert.equal(agreed[0].basisAtMs, RENDERED_AT.getTime());
+	// The canonical's field disarmed by the mapping guard: the rest still prove the check, the canonical
+	// proves nothing.
+	const { guard } = guardFor();
+	const disarmed = await record({ ...guard, isArmed: (_rule, field) => field.fact !== 'canonical' });
+	assert.equal(disarmed.length, 1);
+	assert.equal(disarmed[0].canonicalAgreed, false);
+});
+
+test('a RE-SPELL records no check at all: the page is re-rendered, and nothing confirms the old canonical', async () => {
+	const signature = await apiSig({ seoUrl: '/product/prd-a/red-running-shoe.jsp' });
+	const recorded = [];
+	const { triggered } = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		stored: { [URL_A]: { signature, pageFacts: await RECORD() } },
+		recordCheck: async (url) => recorded.push(url),
+	});
+	assert.deepEqual(triggered, [URL_A]);
+	assert.deepEqual(recorded, []);
 });
 
 test('CAUGHT UP: the origin changed and the page ALREADY shows the new value -> baseline moves, nothing triggered', async () => {
@@ -3947,7 +4011,10 @@ test('an agreeing comparison is RECORDED as a check, whether or not an invalidat
 		recordCheck: async (url, basisAtMs, options) => recorded.push({ url, basisAtMs, ...options }),
 	});
 	assert.deepEqual(verified, [], 'no invalidation armed: no verification, which would exempt from one');
-	assert.deepEqual(recorded, [{ url: URL_A, basisAtMs: CLAIM_AT.getTime(), signature: AGREE_SIG }]);
+	// The proof here is the claim pair (price, availability) alone: it says nothing about the canonical.
+	assert.deepEqual(recorded, [
+		{ url: URL_A, basisAtMs: CLAIM_AT.getTime(), signature: AGREE_SIG, canonicalAgreed: false },
+	]);
 });
 
 test('a comparison that never happened is not recorded as a check', async () => {

@@ -560,6 +560,48 @@ test('a stored 404 is its own family, and only the answer that asked nobody coun
 	assert.ok(!isCacheServed('negative-revalidate'));
 });
 
+// ---- an entity serve (plugin entityServe) -------------------------------------------
+
+test('an entity serve is its own family, cache-served, and part of the page-age population', () => {
+	const rows = notHitRows([combo('bot_serve', 'entity', 'entity', 'bingbot', 25)]);
+	const [row] = rows;
+	assert.equal(row.family, 'entity', 'never "other", never a coverage gap');
+	assert.deepEqual([...row.sources], [['entity', 25]]);
+	assert.ok(isCacheServed('entity'), 'the origin was not asked: it counts as spared');
+});
+
+test('the entity-serve panel reads the dry-run census, and says when the gate in dry run hides repeats', async () => {
+	const analytics = {
+		...ANALYTICS,
+		series: [
+			...ANALYTICS.series,
+			combo('prerender_ops', 'entity_serve', 'would-serve', 'bingbot', 600),
+			combo('prerender_ops', 'entity_serve', 'unconfirmed', 'bingbot', 250),
+			combo('prerender_ops', 'entity_serve', 'has-target', 'googlebot', 100),
+			combo('prerender_ops', 'entity_serve', 'stale', 'bingbot', 40),
+			combo('prerender_ops', 'entity_serve', 'no-page', 'bingbot', 10),
+		],
+	};
+	const config = {
+		...CONFIG,
+		layers: [
+			...CONFIG.layers.filter((layer) => layer.path !== 'ingress.routes'),
+			{ path: 'ingress.routes', effective: [{ match: 'prefix', path: '/product/', entityServe: true }] },
+		],
+	};
+	const ctx = makeCtx({ analytics, config });
+	await load(ctx);
+	const text = everything(ctx);
+	assert.match(text, /Entity serve/);
+	assert.match(text, /dry run/);
+	assert.match(text, /1 route opted in/);
+	assert.match(text, /Would serve/);
+	assert.match(text, /60% of evaluated misses/);
+	assert.match(text, /25% · canonical not confirmed since the anchor/);
+	assert.match(text, /entity gate is in dry run/);
+	assert.match(text, /40 past its expiry · 10 no page for this device/);
+});
+
 test('the negative-cache panel reads the dry run: would-serve, and the stale-404 risk as a warning', async () => {
 	const analytics = {
 		...ANALYTICS,

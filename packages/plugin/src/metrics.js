@@ -124,6 +124,12 @@ const CACHE_STATUSES = Object.freeze([
 	// Source `origin`, deliberately: the crawler did not wait, but the origin did the work, and offload
 	// is about the origin. One per `origin_fetch` reason `revalidate`.
 	'negative-revalidate',
+	// A true miss answered from ANOTHER URL's render: the cached page of the entity's canonical, served at a
+	// spelling with no page or target of its own (`ingress.routes[].entityServe`, util/entityServe.js).
+	// Source `entity`. A cache serve of a rendered snapshot, so it counts toward offload and `page_age` —
+	// but its own value, never 'hit': it is coverage by inference (one render answering many URLs), and how
+	// much of a route's traffic is answered that way must stay readable on its own.
+	'entity',
 ]);
 
 const SERVE_SOURCES = Object.freeze([
@@ -132,6 +138,7 @@ const SERVE_SOURCES = Object.freeze([
 	'origin', // proxied live to the origin — the request the offload number counts against
 	'raw', // a stored origin document (render.raw) — saved the round trip, but nothing rendered it
 	'negative', // the origin's stored 404/410 (render.negative), inside its fresh window — the origin was not asked
+	'entity', // the cached render of the entity's canonical, served at another spelling (ingress.routes[].entityServe)
 ]);
 
 const DEVICE_TYPES = Object.freeze(['desktop', 'mobile', 'tablet']);
@@ -607,7 +614,7 @@ export const METRICS = Object.freeze({
 		emittedBy:
 			'util/unrouted.js, resources/Sitemap.js, http_handlers/response.js, util/backlogSnapshot.js, ' +
 			'util/demandLadder.js, util/visitFilter.js, util/invalidation.js, util/invalidationReenqueue.js, http_handlers/bot_request.js, ' +
-			'util/changeProbe.js, util/entityGate.js, util/entity.js, util/negativeCache.js, util/goneReopen.js, resources/RenderQueue.js, ' +
+			'util/changeProbe.js, util/entityGate.js, util/entity.js, util/entityServe.js, util/negativeCache.js, util/goneReopen.js, resources/RenderQueue.js, ' +
 			'util/renderSchedule.js (due_now_forward), util/serveCheck.js and util/pageCheck.js (serve_check)',
 		cadence:
 			'per report flush (unrouted), per finished sitemap run (sitemap_*), per delivery failure ' +
@@ -616,8 +623,9 @@ export const METRICS = Object.freeze({
 			'per failed epoch read (invalidation_error), per heal attempt (invalidation_reenqueue), ' +
 			'per probed batch of a probe pass (the probe_* pass counters, cycle_behind included — increments since ' +
 			'the previous batch; before v0.97.0, once per finished pass), per gated cacheable miss (discovery_gated), ' +
-			'per raw-document store attempt (raw_cache), per entity-gate evaluation (entity_gate), per observation ' +
-			'of an entity\u2019s canonical (entity_canonical), per adoption decision (canonical_adopt), per ' +
+			'per raw-document store attempt (raw_cache), per entity-gate evaluation (entity_gate), per entity-serve ' +
+			'evaluation of a true miss (entity_serve), per observation of an entity\u2019s canonical (entity_canonical), ' +
+			'per adoption decision (canonical_adopt), per ' +
 			'negative-cache store, guard, re-check or dry-run verdict (negative_cache), per request that found a ' +
 			'stored 404 (negative_gap), per reopen decision (gone_reopen), per suppressed target rendered (suppression_lifted ' +
 			'or suppression_held), per "render this now" filing on a node that does not own the row (due_now_forward), ' +
@@ -704,6 +712,15 @@ export const METRICS = Object.freeze({
 			'THE DRY-RUN NUMBER is would-gate: the renders (and origin document fetches) arming the gate would ' +
 			'save, to read against render/outcome suppressed/canonical-mismatch. A route whose evaluations are ' +
 			'nearly all no-prefix has a pattern that does not match its URLs. ' +
+			'entity_serve = one emit per true miss on a route with ingress.routes[].entityServe, split by what ' +
+			'the entity serve decided (util/entityServe.js): served (answered from the canonical’s render — ' +
+			'also bot_serve source entity), would-serve (every guard passed under ingress.entityServe.dryRun; the ' +
+			'miss path answered it — THE DRY-RUN NUMBER), or the guard that fell through: has-target (the spelling ' +
+			'has a row of its own — with the entity gate in dry run, every spelling a minting crawler asks for ' +
+			'again lands here), no-sibling, no-page, not-indexable, stale, invalidated, ambiguous, unconfirmed ' +
+			'(the canonical was neither rendered nor checked-and-agreed since the anchor — the probe and the ' +
+			'serve-time check fill this in; a route stuck here has no rule that maps `canonical`), ' +
+			'not-self-canonical, unreadable, no-prefix, error. ' +
 			'entity_canonical = one emit per observation of an entity\u2019s canonical (entities.enabled, ' +
 			'util/entity.js), by what it did to the registry: new (the entity\u2019s first row), moved (the canonical ' +
 			'changed — a re-slug, or one observation correcting another), same (nothing written), older (a ' +
@@ -848,6 +865,7 @@ export const METRICS = Object.freeze({
 					'probe_render_mismatch',
 					'discovery_gated',
 					'entity_gate',
+					'entity_serve',
 					'entity_canonical',
 					'canonical_adopt',
 					'raw_cache',
@@ -870,8 +888,9 @@ export const METRICS = Object.freeze({
 					'tracker\u2019s fill and false_positive sizing gauges. ' +
 					'invalidation_error = failed epoch resolutions. invalidation_reenqueue = heal-attempt outcomes. ' +
 					'probe_* = change-probe pass counters (see usefulFor). discovery_gated = gated cacheable misses. ' +
-					'entity_gate = entity discovery gate evaluations, by outcome. entity_canonical = observations of an ' +
-					'entity\u2019s canonical (entities.enabled). canonical_adopt = the change probe\u2019s adoption ' +
+					'entity_gate = entity discovery gate evaluations, by outcome. entity_serve = entity-serve ' +
+					'evaluations of true misses, by outcome. entity_canonical = observations of an ' +
+					'entity\u2019s canonical (entities.enabled). canonical_adopt = adoption ' +
 					'decisions (entities.adopt). raw_cache = raw-document store ' +
 					'attempts. negative_cache = the negative cache (render.negative): stores, refusals, re-checks and ' +
 					'dry-run verdicts. negative_gap = age of a stored 404 when a request for it arrived. gone_reopen = ' +
@@ -901,7 +920,9 @@ export const METRICS = Object.freeze({
 					"not-sooner, throttled, error. discovery_gated: which gate refused ('route' = the matched " +
 					"route's discoverTargets, 'bot' = ingress.discoveryBots, 'entity' = the route's entityPrefix " +
 					'found a sibling URL of the same entity in rotation, armed gate only). entity_gate: the outcome ' +
-					'(gated, would-gate, suppressed-only, no-siblings, no-prefix, error). entity_canonical: the outcome ' +
+					'(gated, would-gate, suppressed-only, no-siblings, no-prefix, error). entity_serve: the outcome ' +
+					'(served, would-serve, no-prefix, has-target, no-sibling, no-page, not-indexable, stale, ' +
+					'invalidated, ambiguous, unconfirmed, not-self-canonical, unreadable, error). entity_canonical: the outcome ' +
 					'(new, moved, same, older, foreign, unreadable, error). canonical_adopt: the outcome (adopted, ' +
 					'reactivated, would-adopt, exists, suppressed, recent, capped, refused, error). raw_cache: THE OUTCOME — stored, ' +
 					'stored-unshared, or the refusal name; this is the slot the console reads that panel from. ' +
@@ -923,7 +944,7 @@ export const METRICS = Object.freeze({
 				description:
 					'unrouted: first path segment (`/blog/*`), `/` for root (null for the overflow row). ' +
 					'page_age_negative: the device type. invalidation_reenqueue: the invalidation scope literal ' +
-					'that triggered the heal. discovery_gated and entity_gate: the bot name. entity_canonical: the observer, ' +
+					'that triggered the heal. discovery_gated, entity_gate and entity_serve: the bot name. entity_canonical: the observer, ' +
 					"'probe' or 'render'. gone_reopen: what saw the " +
 					"200 — 'traffic' (a proxied bot request) or 'recheck' (a negative-cache re-check). " +
 					'suppression_lifted and suppression_held: how long the target had been suppressed (since its last ' +
@@ -1127,6 +1148,14 @@ export const metrics = Object.freeze({
 	 */
 	entityGate: (outcome, botName) =>
 		server.recordAnalytics(true, 'prerender_ops', 'entity_gate', outcome, botName ?? null),
+
+	/**
+	 * One entity-serve evaluation of a true miss (util/entityServe.js) and what it decided — a prerender_ops
+	 * series. `outcome` is `served`, `would-serve` (dry run), or the guard that fell through; one per
+	 * evaluation, so the series sums to the true misses on entity-serve routes.
+	 */
+	entityServe: (outcome, botName) =>
+		server.recordAnalytics(true, 'prerender_ops', 'entity_serve', outcome, botName ?? null),
 
 	/**
 	 * One observation of an entity's canonical (util/entity.js) — a prerender_ops series. `outcome` is what it
