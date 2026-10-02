@@ -1895,6 +1895,32 @@ test('a pass leaves out-of-pass requests what they USE, not `share` — and only
 	await applyProbeConfig({ enabled: false });
 });
 
+test('a pass doubles what it leaves only while out-of-pass requests are WAITING for budget', async () => {
+	await applyProbeConfig({
+		enabled: true,
+		dryRun: false,
+		ratePerSecond: 10,
+		serveCheck: { enabled: true, dryRun: false, share: 1 },
+	});
+	changeProbe.__resetOriginPaceForTest();
+	// Twelve at once: at 10/s the last is booked ~1.2s out — demand queued for budget, a burst growing into `share`.
+	for (let i = 0; i < 12; i++) assert.notEqual(changeProbe.reserveOriginSlot(60_000), null);
+	const now = Date.now();
+	assert.ok(changeProbe.outOfPassBacklogMs(now) > 1000, `backlog ${changeProbe.outOfPassBacklogMs(now)}`);
+	const used = changeProbe.outOfPassRate(now);
+	assert.ok(used > 1, `used ${used}`);
+	assert.equal(changeProbe.outOfPassHeadroom(now), 2 * used, 'waiting: twice what they use');
+	// Two seconds on, every booked slot is past and nothing waits: whatever holds the checks back, it is not the
+	// budget, so the pass leaves them what they use and keeps the rest — not twice it, idling half.
+	const later = now + 2000;
+	assert.equal(changeProbe.outOfPassBacklogMs(later), 0);
+	const usedLater = changeProbe.outOfPassRate(later);
+	assert.ok(usedLater > 1, `used ${usedLater}`);
+	assert.equal(changeProbe.outOfPassHeadroom(later), usedLater, 'not waiting: what they use');
+	changeProbe.__resetOriginPaceForTest();
+	await applyProbeConfig({ enabled: false });
+});
+
 test('the pass ceiling is lowered by the headroom it leaves, batch by batch', async () => {
 	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
 	const waits = [];
