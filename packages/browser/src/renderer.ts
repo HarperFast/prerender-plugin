@@ -19,6 +19,7 @@ import {
 } from './readiness.js';
 import { responseLogSource } from './responseLog.js';
 import { extractPageClaims, PAGE_FACT_BOUNDS, STRUCTURED_OFFER_CAP } from './pageFacts.js';
+import { fragmentOnlySelfReferences } from './selfReferences.js';
 import {
 	DOCUMENT_REUSE_HEADER,
 	cookieHeaderOf,
@@ -1159,7 +1160,12 @@ const renderer: Renderer = async (page, job) => {
 				job.structuredOffers = claims?.structuredOffers ?? null;
 				job.pageFacts = claims?.pageFacts ?? null;
 				const ppStart = Date.now();
-				const content = await page.evaluate(postProcess, config.postProcess, config.block.urlPatterns);
+				// Self-references made fragment-only (selfReferences.ts), so the snapshot is correct at every
+				// URL it is served at, not only the one it was rendered at.
+				const content = fragmentOnlySelfReferences(
+					await page.evaluate(postProcess, config.postProcess, config.block.urlPatterns),
+					rawPageUrl
+				);
 				timings.postProcess = Date.now() - ppStart;
 				return content;
 			}

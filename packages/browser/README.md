@@ -824,6 +824,23 @@ Two things worth checking before adding a rule: an attribute may be **load-beari
 `<astro-island>` on hydration, so stripping `ssr` would destroy the only marker distinguishing a
 healthy snapshot from an un-hydrated one. Strip what is inert, not what is merely non-visual.
 
+### Self-references are made fragment-only (always on)
+
+A snapshot is served at more URLs than the one it was rendered at: every query-string variant of a
+route whose cache key drops the query, and (plugin ≥ 0.100.0, `entityServe`) every other spelling of
+the same entity. Anything a script built from `location` names the render URL. Links to it are
+harmless, but a CSS reference is not: a reviews widget that fills its rating stars with
+`fill="url(<page URL>#rating_star_filled)"` names a gradient in the same document only while the
+snapshot is served at that exact URL. Anywhere else the reference is external, and the stars lose
+their fill.
+
+So the serialized snapshot rewrites every CSS `url(<this page's URL>#id)` (absolute, scheme-relative
+or path-absolute; any quoting) to `url(#id)`. A fragment-only `url()` always refers to the current
+document, whatever its URL and whatever `<base>` says, so the rewrite changes nothing at the render
+URL and fixes the reference at every other one. That makes it a fix, not an option. `href`s are
+left alone, because an `href` resolves against `<base>`. A page with no such reference costs two
+substring scans.
+
 ### `reuseParityCheck` — proving reuse is safe BEFORE enabling it
 
 ```ts
