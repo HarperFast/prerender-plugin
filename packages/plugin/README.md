@@ -381,6 +381,62 @@ the gate first, or read `would-serve` as a floor.
 **Rollout.** Deploy with `dryRun: true`. Read `prerender_ops` / `entity_serve`: `would-serve` is what
 arming would answer, and the other outcomes say why the rest fall through. Then set `dryRun: false`.
 
+### The entity registry, and adopting the canonical the probe reports (`entities`)
+
+`Target` is keyed by URL, so two spellings of one product are two unrelated rows, and nothing records
+which of them the origin calls canonical. The registry keeps one `Entity` row per entity a route
+declares with `entityPrefix`, keyed by the entity prefix (`https://www.example.com/product/prd-123/`),
+holding the entity's current canonical URL ([#166](https://github.com/HarperFast/prerender-plugin/issues/166)).
+
+```yaml
+entities:
+  enabled: true # the default: a route opts in by declaring entityPrefix
+  adopt:
+    dryRun: true # the default: count would-adopt, file nothing
+```
+
+On by default, because the route's `entityPrefix` is already the opt-in. A deployment with no such route
+has no entities and the registry does nothing. Alone it changes nothing a crawler sees: adoption files
+nothing until `adopt.dryRun: false`, and the entity serve needs its own `entityServe`.
+
+- **Written by observations of the origin only.** The change probe's mapped `canonical` slot is one
+  observer; it is the endpoint's own answer for the product id. A stored render's declared
+  `pageFacts.canonical` is the other.
+  - When two observations disagree, the newer wins. A render's instant is when it read the origin
+    (store time less the sum of its renders), so a render claimed before a re-slug can't undo the probe
+    that saw it.
+  - An unchanged observation writes nothing, and neither does the same canonical spelled otherwise
+    (`%27` for an apostrophe). That is one document, as the probe's own `path` comparator already
+    treats it.
+  - A canonical under another entity's prefix is ignored, and so is a relative path (only an absolute
+    URL or a `/`-rooted path counts).
+- **Adoption.** When the probe reports a canonical that is another URL of the same entity, and no target
+  holds it in rotation, its target is filed due now and urgent, as redirect adoption does.
+  - A target suppressed as a canonical verdict (`canonical-mismatch`, `canonical-variant`) is reactivated
+    the same way. One suppressed for any other reason (a 404, a noindex) is left alone.
+  - Bounded by `maxPerHour` per node, shared by every worker thread and every observer; by `retryAfter`
+    per entity, whichever canonical (a canonical that did not take is filed once per window, not nightly,
+    so it costs one render a week for as long as the origin names it, and two spellings naming each other
+    cannot reactivate each other in turn); and by both dry runs. A probe pass run as a dry run, including
+    an operator's measure-only sweep, files nothing.
+  - In a dry run, what arming would file is `would-adopt` plus `capped`. A dry run remembers each entity
+    it would have adopted (`wouldAdoptAt`), so a repeat inside `retryAfter` reads `recent` as it would
+    armed, and it spends its own lane of the hourly budget, never an armed node's real slots.
+- **Why.** Measured on one deployment, products re-slug ~100 times a day and the product sitemap
+  changes once a day. An out-of-stock product is not in the sitemap at all, so its new canonical
+  arrived only by traffic discovery, with its first render jittered across the route's 96h interval.
+  Every spelling missed for one to four days.
+- **Needs a rule that maps `canonical`**, e.g. `{ slot: 6, fact: canonical, compare: path }`, with the
+  slot kept out of `ignoreChanges` so a re-slug is also a change the sweep acts on.
+- **Cost.** Replicated and not residency-pinned. The first probe pass with the registry on writes one row
+  per probed entity, paced by the probe, and renders fill in the rest. After that it writes only when a
+  canonical moves.
+- **Inspect it:** `GET /prerender_admin/explain?url=…` reports `rows.entity` (the canonical, who named it,
+  when, and the last adoption). Outcomes: `prerender_ops` / `entity_canonical` and `canonical_adopt`.
+
+Phase 2 of #166 moves the readers onto it: the probe walks entities rather than every target, and the
+entity gate and entity serve do a point read.
+
 ### Sitemaps are filtered to prerender routes
 
 A sitemap is written for search engines: it lists every indexable URL on the site, which is routinely

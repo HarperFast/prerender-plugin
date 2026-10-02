@@ -88,3 +88,24 @@ test('revalidate for a URL too long to key is a plain 400, not the 504 a swallow
 	assert.match((await res.json()).error, /too long to be a cache key/);
 	assert.deepEqual(touched, []);
 });
+
+test('explain names the URL’s entity and reads its row — and reads nothing for it while the registry is off', async () => {
+	const { applyOptions } = await import('../src/config.js');
+	const routes = [{ match: 'prefix', path: '/product/prd-', queryParams: [], entityPrefix: '^/product/prd-[^/]+/' }];
+	const url = 'https://www.example.com/product/prd-1/email.jsp';
+	try {
+		applyOptions({ ingress: { mode: 'forwarded', routes }, entities: { enabled: true } });
+		const body = await (await PrerenderAdmin.explain({ url, deviceType: 'desktop' })).json();
+		assert.equal(body.rows.entity.key, 'https://www.example.com/product/prd-1/');
+		assert.equal(body.rows.entity.canonical, null, 'no row yet');
+		assert.ok(touched.includes('render_service.Entity:https://www.example.com/product/prd-1/'), touched.join(', '));
+
+		touched.length = 0;
+		applyOptions({ ingress: { mode: 'forwarded', routes }, entities: { enabled: false } });
+		const off = await (await PrerenderAdmin.explain({ url, deviceType: 'desktop' })).json();
+		assert.equal(off.rows.entity, null);
+		assert.ok(!touched.some((t) => t.includes('.Entity:')));
+	} finally {
+		applyOptions({});
+	}
+});

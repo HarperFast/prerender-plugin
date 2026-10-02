@@ -7,7 +7,8 @@
 #
 #   render_schedule  RenderSchedule                  — the hot render queue (isolated)
 #   render_service   Target, QueueStatus,            — URL registry (incl. indexability
-#                    QueueControl                      verdicts) + queue status + pause intent
+#                    QueueControl, Entity              verdicts) + queue status + pause intent
+#                                                      + each entity's current canonical
 #   config           ConfigOverride                  — operator-set config overrides (isolated
 #                                                      because it is SUBSCRIBED; see the type)
 #   page_cache       PrerenderedPage                 — rendered-HTML cache (blob writes)
@@ -148,6 +149,38 @@ type Target @table(database: "render_service") @export {
 	# the sitemap arrival check. Both ride writes the walk already makes. NOT @indexed: only ever read
 	# off a row already in hand.
 	unlistedAt: Date
+}
+
+# ONE ROW PER ENTITY a route declares (a product), keyed by its ENTITY PREFIX — the URL origin plus the
+# route's `entityPrefix` match, `https://www.example.com/product/prd-123/` — holding the entity's CURRENT
+# CANONICAL URL (util/entity.js, issue #166). `Target` is keyed by URL, so two spellings of one product are
+# two unrelated rows; this is where "which of them does the origin call canonical, now" lives.
+#
+# DERIVED, NEVER AUTHORITATIVE: `Target` stays the render registry. Written only by observations of the
+# origin — the change probe's mapped `canonical` slot and a stored render's declared canonical — and only
+# when the canonical MOVES (an unchanged observation writes nothing). Replicated and NOT residency-pinned,
+# like `Target`: writes are rare, and every node answers a point read locally. Not @export: internal state,
+# read through the admin API. On by default (`entities.enabled`), and empty for a deployment whose routes declare
+# no `entityPrefix`.
+type Entity @table(database: "render_service") {
+	id: String @primaryKey
+	# The canonical URL (a Target key) the newest observation named.
+	canonical: String
+	# Which observer named it: 'probe' or 'render'.
+	canonicalFrom: String
+	# When that observer READ the origin — when the CURRENT canonical was first observed; an unchanged
+	# observation writes nothing. A later observation that disagrees moves the canonical; an earlier one (a
+	# render claimed before a re-slug, landing after the probe saw it) does not.
+	canonicalAt: Date
+	firstSeenAt: Date
+	# The last canonical a target was ADOPTED for, and when: the entity is not adopted again until
+	# `entities.adopt.retryAfter` has passed, whichever canonical is named then.
+	adoptedCanonical: String
+	adoptedAt: Date
+	# The same, for an adoption a DRY RUN would have made: so the dry-run number counts entities, not
+	# observations, and arming starts from no memory at all (a dry run never blocks a real adoption).
+	wouldAdoptCanonical: String
+	wouldAdoptAt: Date
 }
 
 # The render queue: ONE ROW PER URL, due at `nextRenderTime`. A claim of a row is one job that

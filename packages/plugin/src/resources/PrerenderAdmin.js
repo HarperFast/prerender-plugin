@@ -89,6 +89,7 @@ import { describeConfigSchema, secretPaths } from '../configSchema.js';
 import { describeMetrics } from '../metrics.js';
 import { redactConfig, describeSecret } from '../util/redact.js';
 import { explainCacheKey } from '../util/explain.js';
+import { entitiesOn, entityOf, readEntity } from '../util/entity.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { resolveServeStatus } from '../util/pageFreshness.js';
 import {
@@ -1672,7 +1673,10 @@ export class PrerenderAdmin extends Resource {
 		// selected — this is a status view, and a cached page can be megabytes. The target row
 		// is keyed by URL and carries the suppression verdict, so one read answers both "is it
 		// in rotation" and "did a render suppress it".
-		const [target, schedule, page, invalidations] = await Promise.all([
+		// The URL's entity (util/entity.js): which URL the registry holds as its canonical. Null when the
+		// registry is off or the URL's route declares no entity prefix.
+		const entity = entitiesOn() ? entityOf(canonicalUrl) : null;
+		const [target, schedule, page, invalidations, entityRow] = await Promise.all([
 			readWithTimeout('renderTarget', timedOutReads, () =>
 				Target.get({
 					id: canonicalUrl,
@@ -1703,6 +1707,7 @@ export class PrerenderAdmin extends Resource {
 			// The active invalidation set, ONCE per request. Wrapped in readWithTimeout like every
 			// other read here, so a slow one degrades this view instead of hanging it.
 			readWithTimeout('invalidations', timedOutReads, async () => (await listInvalidations()).rows),
+			entity ? readWithTimeout('entity', timedOutReads, () => readEntity(entity.key)) : null,
 		]);
 
 		const activeInvalidations = invalidations ?? [];
@@ -1763,6 +1768,20 @@ export class PrerenderAdmin extends Resource {
 			cadence: target ? explainCadence(canonicalUrl, target) : null,
 			rows: {
 				renderTarget: target ?? null,
+				// The registry's view: is this URL the canonical of its entity, and if not, which one is.
+				entity: entity
+					? {
+							key: entity.key,
+							canonical: entityRow?.canonical ?? null,
+							isCanonical: entityRow ? entityRow.canonical === canonicalUrl : null,
+							canonicalFrom: entityRow?.canonicalFrom ?? null,
+							canonicalAt: entityRow?.canonicalAt ? new Date(entityRow.canonicalAt).getTime() : null,
+							adoptedCanonical: entityRow?.adoptedCanonical ?? null,
+							adoptedAt: entityRow?.adoptedAt ? new Date(entityRow.adoptedAt).getTime() : null,
+							wouldAdoptCanonical: entityRow?.wouldAdoptCanonical ?? null,
+							wouldAdoptAt: entityRow?.wouldAdoptAt ? new Date(entityRow.wouldAdoptAt).getTime() : null,
+						}
+					: null,
 				// Already described (locally or by the owner) — see above.
 				renderSchedule: scheduleRow,
 				prerenderedPage: page

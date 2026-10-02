@@ -3165,6 +3165,72 @@ export const configSchema = group('Prerender plugin configuration.', {
 		}
 	),
 
+	entities: group(
+		'THE ENTITY REGISTRY (util/entity.js, issue #166): one `Entity` row per entity a route declares with ' +
+			'`ingress.routes[].entityPrefix` (a product), keyed by the entity prefix, holding the entity\u2019s ' +
+			'current canonical URL. Written by observations of the origin only: the change probe\u2019s mapped ' +
+			'`canonical` slot and a stored render\u2019s declared canonical, the newer of two disagreeing ' +
+			'observations winning, and only when the canonical moves. Replicated, not residency-pinned. Read by ' +
+			'`entities.adopt`. Observations on `prerender_ops` / `entity_canonical`.',
+		{
+			enabled: option(
+				true,
+				'Keep the registry. ON by default, and inert for any route without an `ingress.routes[].entityPrefix`: ' +
+					'that prefix is the opt-in. On a route with one, the first probe pass writes one row per probed ' +
+					'entity (paced by the probe) and renders fill in the rest; after that it writes only when a canonical ' +
+					'moves. Nothing a crawler sees changes with it alone: adoption is dry run by default ' +
+					'(`entities.adopt.dryRun`), and the entity serve needs its own opt-in. Off removes every registry ' +
+					'read and write, and the entity serve then has no `moved` veto and no tie-break.'
+			),
+			adopt: group(
+				'ADOPT A CANONICAL NO TARGET HOLDS (util/entity.js `resolveCanonical`, issue #166). When an observation ' +
+					'names a canonical that is ANOTHER URL of the same entity than the one observed, and no target holds ' +
+					'it in rotation (in any spelling: `%27` and an apostrophe are one document), its target is filed due ' +
+					'now and urgent, as redirect adoption does. A target suppressed as a canonical verdict ' +
+					'(`canonical-mismatch`, `canonical-variant`) is reactivated the same way; one suppressed for any other ' +
+					'reason is left alone. The change probe observes through a rule that maps `canonical` in ' +
+					'`pageCheck.fields` (an endpoint field holding the canonical path or URL, e.g. ' +
+					'`{ slot: 6, fact: canonical, compare: path }`).\n\n' +
+					'WHY: a product whose slug changes while it is out of stock is not in the sitemap, so its new ' +
+					'canonical arrives only by traffic discovery, whose first render is jittered across the route\u2019s ' +
+					'interval; measured, every spelling of such a product then missed for one to four days. The ' +
+					'observations are the origin\u2019s own answers for the entity, so a crawler-invented spelling ' +
+					'cannot make one invent a canonical. Outcomes on `prerender_ops` / `canonical_adopt`.',
+				{
+					enabled: option(
+						true,
+						'Switch. Files nothing while `dryRun` is on, and nothing at all with the registry off.'
+					),
+					dryRun: option(
+						true,
+						'Count `would-adopt` and file nothing. The default, because the number to know first is how many ' +
+							'canonicals arming would file: `would-adopt` plus `capped`. A dry run remembers each entity it ' +
+							'would have adopted, so a repeat inside `retryAfter` reads `recent` as it would armed, and counts ' +
+							'against its own lane of the hourly budget, never an armed node\u2019s real slots. A change-probe ' +
+							'pass run as a dry run \u2014 the probe\u2019s own `dryRun`, or an operator\u2019s measure-only ' +
+							'sweep \u2014 files nothing either.'
+					),
+					maxPerHour: option(
+						60,
+						'Most targets adopted per hour on this node, across every worker thread and every observer. ' +
+							'Measured on one deployment, products re-slug ~100 times a day cluster-wide; a site-wide ' +
+							're-spelling would name every product\u2019s new canonical at once, so past this the rest count ' +
+							'`capped` and wait for the next observation of them.',
+						{ min: 0 }
+					),
+					retryAfter: option(
+						7 * DAY,
+						'An entity adopted once is not adopted again for this long, whichever canonical is named then: a ' +
+							'canonical that did not take (it 404s, or its page names another canonical after all) costs one ' +
+							'render per window, not one per observation, and two spellings that name each other cannot ' +
+							'reactivate each other in turn.',
+						{ unit: 'ms', min: HOUR }
+					),
+				}
+			),
+		}
+	),
+
 	demand: group(
 		'The DEMAND TRACKER: which URLs bots actually ask for, and how often — measured, never acted on ' +
 			'here. Every visit from a `bots` crawler to a URL in the render rotation sets bits in a ring of ' +
