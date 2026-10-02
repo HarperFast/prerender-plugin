@@ -313,6 +313,74 @@ Existing suppressed rows are untouched: they age out through `maxStrikes` as bef
 is armed they are not re-minted. Armed refusals are also counted on `discovery_gated` with the gate
 name `entity`.
 
+### Serving one render at every spelling of an entity (`entityServe`)
+
+The gate stops crawler-invented spellings from becoming targets, but the crawlers still ask for them,
+and each ask is a miss that goes to the origin. Measured on one production origin, 93% of the product
+documents the raw cache stored were spellings other than their own canonical. In every case it was
+the same product. The origin served one document for every spelling (68 of 70 identical on every
+fact; the other 2 had changed between fetches), and the canonical's render was cached, fresh and
+indexable for 199 of 200 sampled spellings. `entityServe` answers those misses from that render:
+
+```yaml
+ingress:
+  routes:
+    - { match: prefix, path: '/product/prd-', queryParams: [], entityPrefix: '^/product/prd-[^/]+/', entityServe: true }
+  entityGate:
+    dryRun: false # arm the gate too: see below
+  entityServe:
+    dryRun: true # the default: evaluate and count, answer every miss as before
+```
+
+On a **true miss** (no page for this key) the targets under the URL's entity prefix are read: one
+bounded primary-key range, at most 8 rows, node-local. The miss is answered from another target's page
+only when all of these hold. Otherwise it falls through to the raw cache, the negative cache and the
+origin, exactly as before:
+
+- **The spelling has no target of its own.** A spelling with a row belongs to the render path. That
+  covers a new canonical arriving from the sitemap and a duplicate the render verdict suppressed.
+- **Exactly one candidate.** Exactly one target of the entity in rotation has a page for this device
+  that is a 200, indexable, inside its own expiry (not SWR), and not covered by an invalidation it
+  predates. More than one, or more rows than the read covers, is `ambiguous`: the choice is never
+  guessed.
+- **Its canonical was confirmed since the anchor.** The page was either rendered at or after the last
+  anchor, or checked against the origin since then by a check that compared its canonical and found it
+  the same (`PageCheck.canonicalAgreed`). Both the serve-time check and the probe sweep write that
+  flag. An `agree` alone does not count, because it only means nothing compared disagreed. The
+  reason is slug re-spells. Until the old page re-renders, it names its old slug while the origin
+  already declares the new one, and serving it at every spelling would spread that contradiction. So
+  **map `canonical` in the probe rule's `pageCheck.fields`**, and keep its slot out of
+  `ignoreChanges` so a re-spell is a change the sweep acts on. An unconfirmed page is offered to the
+  serve-time check, under that check's own switches and budget, in a dry run too. A `held` check (a
+  systematic disagreement on another field, served at its own URL anyway) confirms; a `mismatch` does
+  not. Outside anchored mode there is no anchor: set `ingress.entityServe.maxConfirmAge`, or nothing is
+  ever confirmed.
+- **It names itself.** The served bytes' own `<link rel=canonical>`, read off the head, must
+  canonicalize to that target's URL. `isIndexable` alone cannot say this, because a page with no
+  canonical is indexable too.
+
+It is served with the canonical's own stored headers and validators, as `bot_serve` source and status
+`entity`, and debug requests get `x-harper-entity: <the key that answered>`. It stores nothing, so it
+replicates nothing. It answers the first request for a spelling, where a raw cache only answers
+repeats, and it serves the rendered page instead of the unrendered document. A serve-time check of it
+checks the canonical's key. Snapshots rendered with `@harperfast/prerender-browser` ≥ 1.40.0 also make
+script-built `url(<page URL>#id)` references fragment-only, so a reviews widget's star fills still
+resolve at the spelling's URL.
+
+**Only for a site that answers every spelling of an entity with the same document.** To settle it,
+fetch two spellings of one product from the origin and compare everything except per-response noise.
+The canonical, title, description, offers and breadcrumbs must be identical, and both must name the
+same canonical URL.
+
+**Arm the entity gate with it.** A spelling this does not answer (every one, in a dry run) goes to the
+origin, and a minting crawler's miss mints it. From then on it is never entity-served (`has-target`).
+Armed, the gate never mints such a spelling. A served spelling is never minted either, because it was
+not a miss. So with the gate in dry run, `would-serve` counts only each spelling's first request: arm
+the gate first, or read `would-serve` as a floor.
+
+**Rollout.** Deploy with `dryRun: true`. Read `prerender_ops` / `entity_serve`: `would-serve` is what
+arming would answer, and the other outcomes say why the rest fall through. Then set `dryRun: false`.
+
 ### Sitemaps are filtered to prerender routes
 
 A sitemap is written for search engines: it lists every indexable URL on the site, which is routinely

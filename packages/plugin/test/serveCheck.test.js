@@ -215,7 +215,7 @@ test('compareWithEndpoint: the mapped fields, by the sweep’s comparators — a
 	const [rule] = compileProbeRules([RULE]);
 	const facts = documentFactsOf(Buffer.from(SNAPSHOT())).facts;
 	const agree = serveCheck.compareWithEndpoint(rule, extractValues(API(), rule.extract), facts, { pageUrl: URL_A });
-	assert.deepEqual(agree, { result: 'agree' });
+	assert.deepEqual(agree, { result: 'agree', canonicalAgreed: true });
 	// A SKU sold out at the origin while the page still offers it.
 	const soldOut = API({ skus: [{ sku: '111', availability: 'Out of Stock', price: null }] });
 	const mismatch = serveCheck.compareWithEndpoint(rule, extractValues(soldOut, rule.extract), facts, {
@@ -228,10 +228,37 @@ test('compareWithEndpoint: the mapped fields, by the sweep’s comparators — a
 		pageUrl: URL_A,
 		isArmed: (_rule, field) => field.fact !== 'product.offers',
 	});
-	assert.deepEqual(disarmed, { result: 'agree' });
+	assert.deepEqual(disarmed, { result: 'agree', canonicalAgreed: true });
 	// A page that states nothing the rule maps: nothing decided.
 	const none = serveCheck.compareWithEndpoint(rule, extractValues(API(), rule.extract), {}, { pageUrl: URL_A });
-	assert.deepEqual(none, { result: 'inconclusive' });
+	assert.deepEqual(none, { result: 'inconclusive', canonicalAgreed: false });
+});
+
+test('compareWithEndpoint: canonicalAgreed says the CANONICAL compared and agreed — not that the check did', async () => {
+	const { compileProbeRules, extractValues } = await import('../src/util/changeProbeSpec.js');
+	const { documentFactsOf } = await import('../src/util/documentFacts.js');
+	const [rule] = compileProbeRules([RULE]);
+	const facts = documentFactsOf(Buffer.from(SNAPSHOT())).facts;
+	const values = extractValues(API(), rule.extract);
+	// The canonical field disarmed by the mapping guard: the check still agrees, on everything else, and
+	// says nothing about the canonical.
+	const disarmed = serveCheck.compareWithEndpoint(rule, values, facts, {
+		pageUrl: URL_A,
+		isArmed: (_rule, field) => field.fact !== 'canonical',
+	});
+	assert.deepEqual(disarmed, { result: 'agree', canonicalAgreed: false });
+	// The page states no canonical: nothing about it compared.
+	const noCanonical = serveCheck.compareWithEndpoint(rule, values, { ...facts, canonical: null }, { pageUrl: URL_A });
+	assert.deepEqual(noCanonical, { result: 'agree', canonicalAgreed: false });
+	// The origin re-spelled the slug: a disagreement, and certainly no agreement on the canonical.
+	const respelled = serveCheck.compareWithEndpoint(
+		rule,
+		extractValues(API({ seoUrl: '/product/prd-a/new-spelling.jsp' }), rule.extract),
+		facts,
+		{ pageUrl: URL_A }
+	);
+	assert.equal(respelled.result, 'mismatch');
+	assert.equal(respelled.canonicalAgreed, false);
 });
 
 test('compareDocuments: fact by fact, and a listing by the products in BOTH — re-ranking is not a change', () => {
@@ -252,7 +279,12 @@ test('compareDocuments: fact by fact, and a listing by the products in BOTH — 
 		],
 	};
 	const want = ['title', 'metaDescription', 'canonical', 'itemList'];
-	assert.deepEqual(serveCheck.compareDocuments(page, reranked, want), { result: 'agree' });
+	assert.deepEqual(serveCheck.compareDocuments(page, reranked, want), { result: 'agree', canonicalAgreed: true });
+	// A canonical the check is not asked to compare says nothing about it.
+	assert.deepEqual(serveCheck.compareDocuments(page, reranked, ['title', 'itemList']), {
+		result: 'agree',
+		canonicalAgreed: false,
+	});
 	const repriced = { ...reranked, itemList: [['https://shop.example.com/p/b', '18.00', 'USD', 'InStock']] };
 	const repricedVerdict = serveCheck.compareDocuments(page, repriced, want);
 	assert.equal(repricedVerdict.result, 'mismatch');
@@ -274,8 +306,12 @@ test('compareDocuments: fact by fact, and a listing by the products in BOTH — 
 	];
 	assert.deepEqual(serveCheck.compareDocuments({ itemList: twice }, { itemList: twice }, ['itemList']), {
 		result: 'inconclusive',
+		canonicalAgreed: false,
 	});
-	assert.deepEqual(serveCheck.compareDocuments({ title: null }, { title: 'x' }, want), { result: 'inconclusive' });
+	assert.deepEqual(serveCheck.compareDocuments({ title: null }, { title: 'x' }, want), {
+		result: 'inconclusive',
+		canonicalAgreed: false,
+	});
 });
 
 test('checkThreshold: the last anchor, and maxAge for the sampled cohort only', async () => {
@@ -307,6 +343,8 @@ test('a due page that agrees is recorded with the SERVED page’s basis, and is 
 	assert.equal(written.signature, signatureOf(extractValues(API(), compileProbeRules([RULE])[0].extract)));
 	assert.deepEqual(calls.expire, []);
 	assert.deepEqual(outcomes(), ['queued', 'agree']);
+	// The canonical was among what agreed — the one fact the entity serve takes as confirmation.
+	assert.equal(written.canonicalAgreed, true);
 	// The same page again on this worker: not asked again.
 	await consider(served());
 	assert.deepEqual(calls.probe, [URL_A]);
@@ -329,6 +367,8 @@ test('a due page that disagrees is expired and re-filed, carrying the target’s
 	assert.match(calls.writeCheck[0].field, /product\.offers/);
 	assert.equal(typeof calls.writeCheck[0].evidence, 'string');
 	assert.ok(!calls.writeCheck[0].signature, 'only an agreement can spare the sweep');
+	// The disagreement was on the offers; the canonical still compared and agreed, and says so.
+	assert.equal(calls.writeCheck[0].canonicalAgreed, true);
 	assert.deepEqual(outcomes(), ['queued', 'mismatch']);
 });
 
@@ -819,7 +859,7 @@ test('a field scoped away from a URL (pathPattern) cannot decide its check there
 		collectionFacts,
 		{ pageUrl: collectionUrl }
 	);
-	assert.deepEqual(onCollection, { result: 'agree' });
+	assert.deepEqual(onCollection, { result: 'agree', canonicalAgreed: true });
 	// On a regular URL the same disagreement decides.
 	assert.equal(serveCheck.compareWithEndpoint(rule, placeholder, facts, { pageUrl: URL_A }).result, 'mismatch');
 });

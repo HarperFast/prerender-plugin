@@ -356,6 +356,30 @@ const compileEntry = (raw, source, warn) => {
 		}
 	}
 
+	// Optional per-route ENTITY SERVE (util/entityServe.js): answer a true miss from the entity's canonical
+	// render. Same drop-the-FIELD rule. It needs the entity prefix to know what the entity IS, so without a
+	// usable one it is warned about and compiled off — never left on to mean nothing.
+	let entityServe = false;
+	if (raw.entityServe !== undefined && raw.entityServe !== null) {
+		if (mode === PASSTHROUGH) {
+			warn(
+				`ignoring entityServe on passthrough route "${raw.match} ${raw.path}" — a passthrough route is never ` +
+					`served from cache`
+			);
+		} else if (typeof raw.entityServe !== 'boolean') {
+			warn(
+				`ignoring entityServe on route "${raw.match} ${raw.path}" — expected a boolean, got ${String(raw.entityServe)}`
+			);
+		} else if (raw.entityServe && !entityPrefix) {
+			warn(
+				`entityServe on route "${raw.match} ${raw.path}" does nothing: the route has no usable entityPrefix, ` +
+					`so there is no entity to serve from`
+			);
+		} else {
+			entityServe = raw.entityServe;
+		}
+	}
+
 	return {
 		match: raw.match,
 		path: raw.path,
@@ -371,6 +395,7 @@ const compileEntry = (raw, source, warn) => {
 		documentCheck,
 		negativeCache,
 		entityPrefix,
+		entityServe,
 		source,
 	};
 };

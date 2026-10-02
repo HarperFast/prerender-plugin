@@ -52,7 +52,7 @@ import { metrics } from '../metrics.js';
 import { fnv1a32 } from './hash.js';
 import { epochMsOf, dateColumnMs, getNextTimeOfDay, DAY, MINUTE, SECOND } from './time.js';
 import { getResidencyByUrl } from './residency.js';
-import { resolveEffectiveInterval, routeScopeForUrl } from './routeClass.js';
+import { matchRoute, resolveEffectiveInterval, routeScopeForUrl } from './routeClass.js';
 import { fileDueNow } from './renderSchedule.js';
 import { demandOf, warmDemand } from './demand.js';
 import { createChangeActions } from './changeActions.js';
@@ -394,6 +394,22 @@ export const disarmedFieldsOnNode = async (rule) => {
 		// Unknown: this worker's own guard is what there is.
 	}
 	return out;
+};
+
+/**
+ * How a pass records its agreeing comparisons as checks (`PageCheck`, util/pageCheck.js), or null for not
+ * at all. Every one while serve-time checks are on: they read the rows to spare a request. Otherwise only on
+ * routes that serve entities (`ingress.routes[].entityServe`): the entity serve reads them as confirmation of
+ * the canonical (util/entityServe.js), and nothing else reads them, so a row anywhere else would be a
+ * replicated write per probe that buys nothing.
+ */
+export const pageCheckRecorder = () => {
+	if (config.changeProbe.serveCheck?.enabled) return writePageCheck;
+	if (!config.ingress.entityServe?.enabled) return null;
+	return (url, basisAtMs, details) =>
+		matchRoute(URL.parse(url)?.pathname ?? '')?.entityServe === true
+			? writePageCheck(url, basisAtMs, details)
+			: undefined;
 };
 
 /**
@@ -1355,8 +1371,9 @@ export const runProbePass = async ({
 	skipProbedSince = null,
 	// Serve-time checks (util/serveCheck.js): `readCheck(url)` resolves the URL's last check
 	// (util/pageCheck.js `readPageCheck`), a row a check observed exactly as its baseline stands at or after
-	// `skipCheckedSince` is skipped (`checkSparesProbe`), and `recordCheck(url, basisAtMs, { signature })`
-	// records this pass's own agreeing comparisons. All null = the pre-feature pass.
+	// `skipCheckedSince` is skipped (`checkSparesProbe`), and `recordCheck(url, basisAtMs, { signature,
+	// canonicalAgreed })` records this pass's own agreeing comparisons (`pageCheckRecorder`). All null = the
+	// pre-feature pass.
 	readCheck = null,
 	skipCheckedSince = null,
 	recordCheck = null,
@@ -1741,9 +1758,15 @@ export const runProbePass = async ({
 			// path then spares a request for a page the pass just compared, and a restarted pass skips what it
 			// already checked since the anchor. Not a verification: it exempts nothing from an invalidation.
 			// The observation goes with it: it is the baseline now (written above when it moved), which is what
-			// lets a restarted pass skip the row (`checkSparesProbe`).
-			if (recordCheck && proof && !caughtUp && !mappedDisagrees)
-				await recordCheck(row.url, epochOf(stored.pageClaimAt), { signature: observed });
+			// lets a restarted pass skip the row (`checkSparesProbe`). So does whether the page's CANONICAL
+			// compared and agreed — the one fact the entity serve takes as confirmation (util/entityServe.js),
+			// which `proof` cannot stand in for: it is satisfied by any armed field, or by the claim pair alone.
+			if (recordCheck && proof && !caughtUp && !mappedDisagrees) {
+				const canonicalAgreed = (verdicts ?? []).some(
+					({ field, verdict }) => field.fact === 'canonical' && verdict === true && armed(field)
+				);
+				await recordCheck(row.url, epochOf(stored.pageClaimAt), { signature: observed, canonicalAgreed });
+			}
 			return;
 		}
 		if (dryRun) {
@@ -2530,7 +2553,7 @@ export const runProbeSweepOnce = async ({
 			// observations), and, once the checks are armed, skips what was checked since this pass began.
 			readCheck: config.changeProbe.serveCheck?.enabled ? readPageCheck : null,
 			skipCheckedSince: serveChecksArmed() ? (resume?.originStartedAt ?? startedAt) : null,
-			recordCheck: config.changeProbe.serveCheck?.enabled ? writePageCheck : null,
+			recordCheck: pageCheckRecorder(),
 			guard: theMappingGuard(),
 			...limits,
 			// Rows this pass (or the pass it resumes) already probed — see `processOne`. The same for a
