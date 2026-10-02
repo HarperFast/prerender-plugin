@@ -306,14 +306,16 @@ const servedFacts = async (served, want) => {
 
 // ---- the queue and the check -------------------------------------------------------------------
 
-const CONCURRENCY = 4;
 const queue = [];
 let active = 0;
 // Bumped by a reset: a check from an earlier generation stops where it is and frees nothing twice.
 let generation = 0;
 
 const pump = () => {
-	while (active < CONCURRENCY && queue.length) {
+	// Read per pump, so a live edit applies to the next check started. In flight only, never the rate: the
+	// node-wide budget slot each check waits for is what paces the origin.
+	const concurrency = Math.max(1, settings().concurrency ?? 1);
+	while (active < concurrency && queue.length) {
 		const item = queue.shift();
 		const gen = generation;
 		active++;
