@@ -45,10 +45,14 @@ import { isGoneSuppressed, maybeReopenGone, REOPEN_SELECT } from '../util/goneRe
 import { rescueFromOwner } from '../util/peerRescue.js';
 import { evaluateEntityGate } from '../util/entityGate.js';
 import { entityServeApplies, resolveEntityServe } from '../util/entityServe.js';
+import { sampleRequest } from '../util/sampling.js';
 import { deliverResource } from './response.js';
 
 export async function handleBotRequest(request) {
 	request.handlerPath = 'p';
+	// Set once the request is resolved, so a failure past that point is still offered to the samplers.
+	let sampleInfo = null;
+	let sampleUrl = null;
 
 	try {
 		const target = resolveBotTarget(request);
@@ -70,6 +74,8 @@ export async function handleBotRequest(request) {
 		// debug header is present). `route` is the matched route entry, if any; `routeClass`
 		// decides whether this request is cached and scheduled at all.
 		const info = { route, routeClass, deviceType };
+		sampleInfo = info;
+		sampleUrl = cacheUrl;
 
 		// A URL TOO LONG TO BE A KEY IS PROXIED AND NOTHING ELSE. Every table this request would touch —
 		// the page, raw and negative caches, the verification proof, the Target a miss discovers — is keyed
@@ -80,7 +86,9 @@ export async function handleBotRequest(request) {
 		if (!CacheKey.fitsKeyLimit(cacheUrl)) {
 			const resource = await proxyUnkeyable({ request, url, cacheUrl, deviceType, info });
 			if (recordBots) recordServeOutcome(resource, request, info, deviceType);
-			return deliverResource(resource, request, info);
+			const response = deliverResource(resource, request, info);
+			sampleRequest(request, info, resource, response.status, cacheUrl);
+			return response;
 		}
 
 		const resource = await resolveResource({ request, url, cacheUrl, deviceType, routeClass, info });
@@ -121,9 +129,16 @@ export async function handleBotRequest(request) {
 		// inside: nothing about this response waits on it.
 		maybeServeCheck(resource, request, info, cacheUrl);
 
-		return deliverResource(resource, request, info);
+		const response = deliverResource(resource, request, info);
+		// REQUEST SAMPLING (util/sampling.js), after delivery so a sampler sees the status actually sent — a
+		// conditional 304 included. A null check when sampling is off; it never awaits and never throws.
+		sampleRequest(request, info, resource, response.status, cacheUrl);
+		return response;
 	} catch (e) {
 		logger.error(e);
+		// A 500 this handler answered is a visit like any other: a URL-stable sample that skipped it would
+		// read as a longer gap between visits.
+		if (sampleInfo !== null) sampleRequest(request, sampleInfo, null, 500, sampleUrl);
 		return {
 			headers: {},
 			status: 500,

@@ -106,14 +106,18 @@ const ignoredDownstreamRequestHeaders = () => {
 	const tokenHeader = config.origin.securityToken.header;
 	const debugKey = config.debugHeader.key;
 	const peerHeader = config.peerRescue.header;
+	// The render-now header carries `renderNow.token`, a secret, on the very requests that reach the
+	// origin when an on-demand render falls back to it. It is ours, not the crawler's, so it never leaves.
+	const renderNowHeader = config.renderNow.header;
 	const configured = config.origin.ignoredHeaders;
-	const key = `${tokenHeader} ${debugKey} ${peerHeader} ${configured.join(',')}`;
+	const key = `${tokenHeader} ${debugKey} ${peerHeader} ${renderNowHeader} ${configured.join(',')}`;
 	if (ignoredHeadersCache === null || key !== ignoredHeadersKey) {
 		ignoredHeadersCache = new Set([
 			...BASE_IGNORED_HEADERS,
 			String(tokenHeader).toLowerCase(),
 			String(debugKey).toLowerCase(),
 			...(peerHeader ? [String(peerHeader).toLowerCase()] : []),
+			...(renderNowHeader ? [String(renderNowHeader).toLowerCase()] : []),
 			...configured.map((name) => String(name).toLowerCase()),
 		]);
 		ignoredHeadersKey = key;

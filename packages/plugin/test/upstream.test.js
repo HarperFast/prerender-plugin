@@ -123,6 +123,17 @@ test('resolveUpstreamHeaders never forwards the peer token header, default or co
 	assert.equal(upstream['x-cluster-token'], undefined, 'matched case-insensitively, and the memo rebuilt');
 });
 
+test('resolveUpstreamHeaders never forwards the render-now header, default or configured', () => {
+	// It carries `renderNow.token`, a secret, on the requests that fall back to the origin.
+	applyOptions({});
+	let upstream = resolveUpstreamHeaders({ 'x-harper-render-now': 'render-secret', 'x-keep': 'yes' }, 'desktop');
+	assert.equal(upstream['x-harper-render-now'], undefined);
+	assert.equal(upstream['x-keep'], 'yes');
+	applyOptions({ renderNow: { header: 'X-Ops-Render' } });
+	upstream = resolveUpstreamHeaders({ 'x-ops-render': 'render-secret' }, 'desktop');
+	assert.equal(upstream['x-ops-render'], undefined, 'matched case-insensitively, and the memo rebuilt');
+});
+
 test('resolveUpstreamHeaders drops operator-configured ignoredHeaders', () => {
 	applyOptions({ origin: { ignoredHeaders: ['x-internal', 'x-trace-id'] } });
 	const upstream = resolveUpstreamHeaders({ 'x-internal': 'secret', 'x-trace-id': '123', 'x-keep': 'yes' }, 'desktop');

@@ -23,6 +23,7 @@ import { startUnroutedReporter } from './src/util/unrouted.js';
 import { startBacklogSnapshotter } from './src/util/backlogSnapshot.js';
 import { startQueueKeeper } from './src/util/queueKeeperService.js';
 import { startInvalidationWatch } from './src/util/invalidation.js';
+import { startRequestSampling } from './src/util/sampling.js';
 
 export async function handleApplication(scope) {
 	await scope.ready;
@@ -126,4 +127,7 @@ export async function handleApplication(scope) {
 	// changes, because a route RENAMED by a live edit un-invalidates a corpus somebody deliberately
 	// invalidated, with nothing else to notice.
 	startInvalidationWatch();
+	// EVERY worker: each samples the requests it serves into its own ring and writes its own batches
+	// (util/sampling.js). Compiles now and on every config apply, so samplers are live.
+	startRequestSampling();
 }

@@ -831,6 +831,8 @@ this plugin's resources all set `loadAsInstance = false`.
 | `GET /prerender_admin/invalidations`       | active bulk-invalidation rows                                                                                                             | `super_user` |
 | `GET /prerender_admin/crawl-breadth`       | `?days` — distinct URLs crawled per bot per day, and distinct MISSED URLs per miss cause (`misses` per day, `missUnion` across the range) | `super_user` |
 | `GET /prerender_admin/metrics`             | the metric catalog (see METRICS.md)                                                                                                       | `super_user` |
+| `GET /prerender_admin/sampling`            | the samplers as compiled (and any dropped as invalid), this worker's counters, this node's sample files                                   | `super_user` |
+| `GET /prerender_admin/samples`             | `?sampler&from&to&after&limit&format` — this node's sample files for those UTC days, NDJSON or the stored gzip                            | `super_user` |
 | `POST /prerender_admin/explain`            | `{ url, deviceType }` → cache-key trace                                                                                                   | `super_user` |
 | `POST /prerender_admin/schedule`           | `{ url \| cacheKey }` → this node's schedule row                                                                                          | `super_user` |
 | `POST /prerender_admin/queue`              | `{ scope, paused }` → pause control                                                                                                       | `super_user` |
@@ -1542,6 +1544,78 @@ day, `missUnion` across the range). Requests per distinct URL is how many times 
 for, which is what a render of it would serve; the days' distinct counts against the range's union say
 whether the same URLs come back tomorrow. A class of misses made of one-off URLs is not worth covering
 at any capacity.
+
+### Request sampling: who comes back, and how often
+
+Counters say how many requests a route got; the demand tracker says how often a URL is asked for, in
+6-hour slices. Neither says **when** a given crawler asks for a given page, so neither can answer how often
+each bot returns to a page, per page type and device. Request sampling keeps a per-request record for a
+slice of traffic you choose, in files on each node, for days, and costs nothing while it is off.
+
+A sampler matches requests (`routes`, `bots`, `devices`, `methods`, `cacheStatuses`, `sources`, `statuses`,
+exact `urls`, a `urlPattern`), samples them, and records fields from a fixed catalog: time, URL, route,
+bot, device, method, the status sent (304s and the handler's own 500s included), cache status, source, the
+age of the copy served, whether the request carried validators, and (read when a batch is written, never
+on the request) whether the URL has a target and is sitemap-listed. Request headers can be recorded by
+name; credentials never are. The whole option reference is the `sampling.samplers` description in
+`GET /prerender_admin/config`.
+
+**URL-stable sampling** (`sample.by: url`, the default) is the shape for revisit questions. A URL is in or
+out by `fnv1a32(salt + '\n' + url) < rate * 2^32`, so every request for a sampled URL is recorded, from
+every bot and device, for as long as the sampler runs. Raising `rate` keeps every URL already in; a new
+`salt` picks a different set. Set them once for a study.
+
+A starting point for "how often does each crawler revisit each page type", as one override row on
+`sampling.samplers` plus `sampling.enabled: true`. Both take effect within a second, no restart:
+
+```yaml
+sampling:
+  enabled: true
+  samplers:
+    - name: visits-home
+      match: { routes: ['/'] }
+      sample: { rate: 1 }
+      fields: [url, bot, device, status, cacheStatus, source, ageMs, conditional]
+      maxPerMinute: 600
+    - name: visits-listing
+      match: { routes: ['/catalog/'] }
+      sample: { rate: 0.01, salt: visits-1 }
+      fields: [url, bot, device, status, cacheStatus, source, ageMs, conditional, sitemap]
+    - name: visits-product
+      match: { routes: ['/product/'] }
+      sample: { rate: 0.01, salt: visits-1 }
+      fields: [url, bot, device, status, cacheStatus, source, ageMs, conditional, sitemap, target]
+```
+
+**Storage.** Files, the way Harper writes its logs: each worker thread appends to its own
+`<sampling.directory>/<sampler>/<YYYY-MM-DD>.w<worker>.t<thread>.ndjson.gz` (UTC day of the record), one
+gzip member per 1,024 records, and worker 0 deletes files older than `sampling.keepDays` (default 14) every
+hour. An append that fails is rolled back, so a file is always whole members. The
+directory defaults to `prerender-sampling` under Harper's root; it must be persistent and outside the
+component directory, and it is set in the config file only. Read each node's files and merge them (a
+crawler's requests can land on any node):
+
+```sh
+curl -s -b "$SESSION" "https://<node>/prerender_admin/samples?sampler=visits-product&from=2026-10-01&to=2026-10-07&format=gzip" \
+  | gunzip > visits-product.<node>.ndjson
+# more than `limit` files (200) or ~32 MB: repeat with &after=<the x-sampling-next response header>
+```
+
+A file still being written is served as whole records only, in either format. Or copy the files off the
+node: a day's file is a plain gzip stream.
+
+Per (URL, bot, device), the gaps between consecutive visits give the revisit interval and how regular it
+is; visits per URL give popularity strata without any other source; `sitemap` splits listed from unlisted
+URLs; `ageMs` says how old the copy each crawler received was. **Completeness is in the same files:** a
+pick that was not recorded (over `maxPerMinute`, the ring full, or an append that failed) is counted in a
+line `{"ts":…,"counters":{"capped":n,"dropped":n,"lost":n}}`, so a window is complete when its counters
+lines sum to zero. Raise `maxPerMinute` or `sampling.ringSize` if they do not.
+
+**Cost.** Off, or with no sampler for a request's route and bot, a request pays a null check or two map
+lookups. A sampled request is copied into a preallocated per-worker ring; nothing awaits. A flush swaps in
+a second ring and writes the first in slices that yield to the event loop, as one append per sampler per
+day per worker, so writes do not grow with sampling volume. Records still in a ring when a worker stops
+are lost (one flush interval at most).
 
 ## Metrics & observability
 

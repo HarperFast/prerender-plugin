@@ -51,6 +51,10 @@
  *   POST /prerender_admin/sitemap    { url, offset, limit } detail  super_user
  *   POST /prerender_admin/sitemap-refresh { url? }                  super_user
  *   POST /prerender_admin/config-override { set?, clear?, dryRun? } super_user
+ *   GET  /prerender_admin/sampling   samplers, this worker's         super_user
+ *                                    counters, this node's files
+ *   GET  /prerender_admin/samples    ?sampler&from&to&after&limit&   super_user
+ *                                    format=ndjson|gzip — this node's files
  *
  * QUERY-COST RULES for every route here (this console shares the server with bot traffic):
  *   - Nothing walks `RenderSchedule` on page load. The queue counts come from the queue keeper's
@@ -87,6 +91,14 @@ import {
 } from '../config.js';
 import { describeConfigSchema, secretPaths } from '../configSchema.js';
 import { describeMetrics } from '../metrics.js';
+import { listSampleFiles, readSampleFile, sampleFileSummary, samplingWorkerState } from '../util/sampling.js';
+import {
+	CREDENTIAL_HEADER_PATHS,
+	credentialHeadersOf,
+	duplicateSamplerNames,
+	inspectSamplers,
+	isSamplerName,
+} from '../util/samplingSpec.js';
 import { redactConfig, describeSecret } from '../util/redact.js';
 import { explainCacheKey } from '../util/explain.js';
 import { entitiesOn, entityOf, readEntity } from '../util/entity.js';
@@ -262,14 +274,14 @@ const routeOf = (target) => {
  * compiled on its own (neither compiler's verdict on an entry depends on its neighbours), and matched
  * by canonical value, as a multiset so a duplicated bad entry is not excused by one already running.
  */
-const newlyDropped = (inspect, requested, current) => {
-	const droppedIn = (list) => (Array.isArray(list) ? list : []).filter((one) => inspect([one]).dropped > 0);
+const newlyDropped = (inspect, requested, current, inspectCurrent = inspect) => {
+	const droppedIn = (list, by) => (Array.isArray(list) ? list : []).filter((one) => by([one]).dropped > 0);
 	const running = new Map();
-	for (const one of droppedIn(current)) {
+	for (const one of droppedIn(current, inspectCurrent)) {
 		const key = hashConfigValue(one);
 		running.set(key, (running.get(key) ?? 0) + 1);
 	}
-	return droppedIn(requested).filter((one) => {
+	return droppedIn(requested, inspect).filter((one) => {
 		const key = hashConfigValue(one);
 		const left = running.get(key) ?? 0;
 		if (left > 0) running.set(key, left - 1);
@@ -353,6 +365,14 @@ const YIELD_EVERY = 200;
  * on a high-traffic server, refusing an operator beats delaying a crawler.
  */
 const MAX_CONCURRENT_HEAVY = 2;
+
+// A `samples` response stops adding files at this many bytes (gzip or NDJSON, whichever was asked for) and
+// hands back `x-sampling-next` to continue from: the admin worker also serves bot traffic, and a response
+// holds its whole body in memory. The first file is always admitted, decoded up to four times this.
+const MAX_SAMPLE_RESPONSE_BYTES = 32 * 1024 * 1024;
+const MAX_SAMPLE_FILES = 2000;
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const utcDay = (ms) => new Date(ms).toISOString().slice(0, 10);
 let heavyInFlight = 0;
 
 async function withHeavySlot(fn) {
@@ -515,6 +535,10 @@ export class PrerenderAdmin extends Resource {
 			case 'sweep-orphan-pages':
 				// Same shape as discovery-purge: this node's live pass, or its last finished one.
 				return json({ node: server.hostname, ...(await getPageOrphanSweepState()) });
+			case 'sampling':
+				return PrerenderAdmin.samplingView(target);
+			case 'samples':
+				return PrerenderAdmin.samples(target);
 			default:
 				return json({ error: `Unknown route: ${route}` }, 404);
 		}
@@ -830,9 +854,39 @@ export class PrerenderAdmin extends Resource {
 					? (list) => inspectRoutes(list, [])
 					: entry.path === 'changeProbe.rules'
 						? inspectProbeRules
-						: null;
+						: entry.path === 'sampling.samplers'
+							? (list) => inspectSamplers(list, { deniedHeaders: credentialHeadersOf(resolved.config) })
+							: null;
 			if (!inspect) continue;
-			const fresh = newlyDropped(inspect, entry.value, valueAt(config, entry.path));
+			// A sampler's name is its directory and the key its records are read under, so a second entry with a
+			// name already taken is dropped — a drop no per-entry check can see, refused here on its own. Only a
+			// name this set NEWLY repeats, for the reason `newlyDropped` gives.
+			if (entry.path === 'sampling.samplers') {
+				const running = new Set(
+					duplicateSamplerNames(valueAt(config, entry.path), { deniedHeaders: credentialHeadersOf(config) })
+				);
+				const duplicates = duplicateSamplerNames(entry.value, {
+					deniedHeaders: credentialHeadersOf(resolved.config),
+				}).filter((name) => !running.has(name));
+				if (duplicates.length) {
+					rejected.push({
+						path: entry.path,
+						requested: entry.value,
+						reason: `sampler names must be unique: ${duplicates.map((name) => `'${name}'`).join(', ')} repeated`,
+					});
+					continue;
+				}
+			}
+			// The running list is judged by the RUNNING deny list: under the prospective one, a sampler that a
+			// credential rename in this same request breaks would look already dropped, and be excused.
+			const fresh = newlyDropped(
+				inspect,
+				entry.value,
+				valueAt(config, entry.path),
+				entry.path === 'sampling.samplers'
+					? (list) => inspectSamplers(list, { deniedHeaders: credentialHeadersOf(config) })
+					: inspect
+			);
 			if (!fresh.length) continue;
 			rejected.push({
 				path: entry.path,
@@ -842,6 +896,32 @@ export class PrerenderAdmin extends Resource {
 					`the compiler would drop ${fresh.length} of these entries, so they would be stored and never ` +
 					`honored: ${inspect(fresh).warnings.join('; ')}`,
 			});
+		}
+
+		// A CREDENTIAL HEADER RENAMED ONTO A HEADER A SAMPLER RECORDS drops that sampler on the next apply (a
+		// sampler never records a header the plugin authenticates on) — the same outcome as storing a sampler
+		// that names it, reached from the other side, and refused the same way.
+		// Judged entry by entry on the PROSPECTIVE sampler list: an entry that compiles under the running deny
+		// list and not under the prospective one is dropped by the rename alone, whatever else this request sets.
+		const credentialPaths = touched.filter((path) => CREDENTIAL_HEADER_PATHS.includes(path));
+		if (credentialPaths.length) {
+			const before = { deniedHeaders: credentialHeadersOf(config) };
+			const after = { deniedHeaders: credentialHeadersOf(resolved.config) };
+			const list = resolved.config.sampling.samplers;
+			const broken = (Array.isArray(list) ? list : []).filter(
+				(one) => inspectSamplers([one], before).usable === 1 && inspectSamplers([one], after).usable === 0
+			);
+			if (broken.length) {
+				for (const path of credentialPaths) {
+					rejected.push({
+						path,
+						requested: setByPath.get(path)?.value ?? null,
+						reason:
+							'a configured sampler records this header, and would be dropped once it carries a credential: ' +
+							inspectSamplers(broken, after).warnings.join('; '),
+					});
+				}
+			}
 		}
 
 		// Compiled from the PROSPECTIVE config every time, because `collectConfigWarnings` needs the
@@ -2351,5 +2431,129 @@ export class PrerenderAdmin extends Resource {
 				'content-disposition': 'inline',
 			}),
 		});
+	}
+
+	/**
+	 * Request sampling (util/sampling.js) as THIS node and THIS worker see it: the samplers as compiled (an
+	 * invalid entry is listed under `invalid`, not under `samplers`), this worker's counters, and this node's
+	 * files per sampler (count, bytes, first and last day; directory entries only, no file is read). Counters
+	 * are per worker and files per node, so a cluster view asks every node.
+	 */
+	static samplingView(target) {
+		return withHeavySlot(() => this.samplingViewInner(target));
+	}
+
+	static async samplingViewInner(target) {
+		const extra = target?.get?.('sampler');
+		if (extra !== undefined && extra !== null && extra !== '' && !isSamplerName(extra)) {
+			return json({ error: 'sampler must be a sampler name' }, 400);
+		}
+		const configured = Array.isArray(config.sampling.samplers) ? config.sampling.samplers : [];
+		const names = [
+			...new Set([...configured.map((entry) => entry?.name).filter(isSamplerName), ...(extra ? [extra] : [])]),
+		];
+		const inspected = inspectSamplers(configured, { deniedHeaders: credentialHeadersOf(config) });
+		return json({
+			node: server.hostname,
+			enabled: config.sampling.enabled,
+			flushInterval: config.sampling.flushInterval,
+			ringSize: config.sampling.ringSize,
+			keepDays: config.sampling.keepDays,
+			invalid: inspected.warnings,
+			worker: samplingWorkerState(),
+			files: await sampleFileSummary(names),
+		});
+	}
+
+	/**
+	 * THIS node's records for one sampler: its files for the UTC days `from` to `to` (default yesterday to
+	 * today), in name order (day, then worker), as NDJSON (`format=ndjson`, the default) or as the stored
+	 * gzip members concatenated (`format=gzip`; nothing decompressed here, and `gunzip` reads it as one
+	 * stream). Records carry their own `ts`; the `{"counters":…}` lines among them are the picks that were
+	 * not recorded. A file still being appended to is served whole lines only, in either format.
+	 *
+	 * At most `limit` files (default 200, max 2000) and about 32 MB per response; when more remain the
+	 * response carries `x-sampling-next`, a file name to pass back as `after`. A single file too large to
+	 * serve (over four times that) is named in `x-sampling-too-large` and skipped.
+	 */
+	static samples(target) {
+		return withHeavySlot(() => this.samplesInner(target));
+	}
+
+	static async samplesInner(target) {
+		const sampler = target?.get?.('sampler');
+		if (!isSamplerName(sampler)) return json({ error: 'sampler is required: a sampler name' }, 400);
+		const now = Date.now();
+		const from = target?.get?.('from') || utcDay(now - 24 * 60 * 60 * 1000);
+		const to = target?.get?.('to') || utcDay(now);
+		if (!DAY_RE.test(from) || !DAY_RE.test(to)) return json({ error: 'from and to must be YYYY-MM-DD' }, 400);
+		const format = target?.get?.('format') || 'ndjson';
+		if (format !== 'ndjson' && format !== 'gzip') return json({ error: 'format must be ndjson or gzip' }, 400);
+		const after = target?.get?.('after') || null;
+		const limit = Math.min(Math.max(1, Math.floor(Number(target?.get?.('limit')) || 200)), MAX_SAMPLE_FILES);
+		const decode = format === 'ndjson';
+
+		const files = (await listSampleFiles(sampler)).filter(
+			(file) => file.day >= from && file.day <= to && (after === null || file.name > after)
+		);
+		// A file written to within the last two flushes may be mid-append; in a gzip download it is re-encoded
+		// to whole members, so the files after it in the same stream stay readable.
+		const settledBefore = now - 2 * config.sampling.flushInterval - 60_000;
+		const parts = [];
+		let bytes = 0;
+		let read = 0;
+		let unreadable = 0;
+		const tooLarge = [];
+		let next = null;
+		// `next` is the last file this page covered (read, skipped or unreadable), so the next page starts after it.
+		for (let i = 0; i < files.length; i++) {
+			const file = files[i];
+			const remaining = MAX_SAMPLE_RESPONSE_BYTES - bytes;
+			if (read === limit || (read > 0 && (remaining <= 0 || (!decode && file.size > remaining)))) {
+				next = files[i - 1].name;
+				break;
+			}
+			// One file alone may take up to four times the cap; past that it is named, not served.
+			if (!decode && file.size > 4 * MAX_SAMPLE_RESPONSE_BYTES) {
+				tooLarge.push(file.name);
+				continue;
+			}
+			let data;
+			try {
+				data = await readSampleFile(file.path, {
+					format: decode ? 'ndjson' : file.mtimeMs > settledBefore ? 'whole' : 'gzip',
+					maxOutputLength: decode ? (read === 0 ? 4 * MAX_SAMPLE_RESPONSE_BYTES : remaining) : undefined,
+				});
+			} catch (e) {
+				if (e instanceof RangeError) {
+					// Past the budget: stop BEFORE this file, so the next page starts with it. A first file past
+					// four times the cap is too large to decode here at all.
+					if (read > 0) {
+						next = files[i - 1].name;
+						break;
+					}
+					tooLarge.push(file.name);
+					continue;
+				}
+				unreadable++;
+				continue;
+			}
+			parts.push(data);
+			bytes += data.length;
+			read++;
+			if (read % 16 === 0) await yieldNow();
+		}
+
+		const headers = noStore({
+			'content-type': format === 'gzip' ? 'application/gzip' : 'application/x-ndjson; charset=utf-8',
+			'x-content-type-options': 'nosniff',
+			'x-sampling-node': server.hostname,
+			'x-sampling-files': String(read),
+			'x-sampling-unreadable': String(unreadable),
+		});
+		// Too large to serve here: copy the file off the node, or ask for `format=gzip` if it was NDJSON.
+		if (tooLarge.length) headers['x-sampling-too-large'] = tooLarge.join(',');
+		if (next) headers['x-sampling-next'] = next;
+		return new Response(Buffer.concat(parts), { status: 200, headers });
 	}
 }
