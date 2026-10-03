@@ -50,6 +50,9 @@ import { deliverResource } from './response.js';
 
 export async function handleBotRequest(request) {
 	request.handlerPath = 'p';
+	// Set once the request is resolved, so a failure past that point is still offered to the samplers.
+	let sampleInfo = null;
+	let sampleUrl = null;
 
 	try {
 		const target = resolveBotTarget(request);
@@ -71,6 +74,8 @@ export async function handleBotRequest(request) {
 		// debug header is present). `route` is the matched route entry, if any; `routeClass`
 		// decides whether this request is cached and scheduled at all.
 		const info = { route, routeClass, deviceType };
+		sampleInfo = info;
+		sampleUrl = cacheUrl;
 
 		// A URL TOO LONG TO BE A KEY IS PROXIED AND NOTHING ELSE. Every table this request would touch —
 		// the page, raw and negative caches, the verification proof, the Target a miss discovers — is keyed
@@ -131,6 +136,9 @@ export async function handleBotRequest(request) {
 		return response;
 	} catch (e) {
 		logger.error(e);
+		// A 500 this handler answered is a visit like any other: a URL-stable sample that skipped it would
+		// read as a longer gap between visits.
+		if (sampleInfo !== null) sampleRequest(request, sampleInfo, null, 500, sampleUrl);
 		return {
 			headers: {},
 			status: 500,

@@ -1,5 +1,9 @@
 import { test, before, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { gunzipSync, gzipSync } from 'node:zlib';
 
 /**
  * `POST /prerender_admin/config-override` and `GET /prerender_admin/config` against an in-memory
@@ -186,6 +190,7 @@ test('a sampler list with an entry the compiler would drop is refused, and nothi
 		[{ name: 'pdp', match: { bot: ['Googlebot'] } }], // a misspelled key would widen the match
 		[{ name: 'pdp', headers: ['cookie'] }],
 		[{ name: 'pdp', headers: ['x-harper-renderer-bypass'] }],
+		[{ name: 'pdp', headers: ['x-harper-render-now'] }],
 		[{ name: 'pdp', sample: { rate: 2 } }],
 		[{ name: 'pdp', fields: ['ip'] }],
 	]) {
@@ -226,37 +231,93 @@ test('a valid sampler list previews as a live change and applies', async () => {
 	assert.deepEqual(overrideRows.get('sampling.samplers').value, value);
 });
 
-test('GET sampling shows the compiled samplers and the invalid ones; GET samples needs a sampler name', async () => {
-	applyOptions(
-		{
-			...file(),
-			sampling: {
-				enabled: true,
-				samplers: [
-					{ name: 'ok', match: { routes: ['/catalog/'] } },
-					{ name: 'bad', x: 1 },
-				],
-			},
-		},
-		{}
-	);
-	const params = (query) => ({ get: (key) => query[key] });
-	const view = await (await PrerenderAdmin.samplingView(params({}))).json();
-	assert.equal(view.enabled, true);
-	assert.deepEqual(
-		view.worker.samplers.map((s) => s.name),
-		[]
-	); // this test never starts the worker's sampling: the view reports what the worker runs, not the config
-	assert.equal(view.invalid.length, 1);
-	assert.match(view.invalid[0], /sampler 'bad' dropped/);
-	assert.deepEqual(Object.keys(view.stored.bySampler).sort(), ['bad', 'ok']);
+test('a sampler that repeats a name the running list already repeats does not block an edit', async () => {
+	applyOptions({ ...file(), sampling: { samplers: [{ name: 'dup' }, { name: 'dup' }] } }, {});
+	const res = await samplerSet([{ name: 'dup' }, { name: 'dup' }, { name: 'new' }], true);
+	const body = await res.json();
+	assert.deepEqual(body.rejected, []);
+});
 
-	assert.equal((await PrerenderAdmin.samples(params({}))).status, 400);
-	assert.equal((await PrerenderAdmin.samples(params({ sampler: 'a/b' }))).status, 400);
-	assert.equal((await PrerenderAdmin.samples(params({ sampler: 'ok', format: 'csv' }))).status, 400);
-	const empty = await PrerenderAdmin.samples(params({ sampler: 'ok', format: 'gzip' }));
-	assert.equal(empty.status, 200);
-	assert.equal(empty.headers.get('content-type'), 'application/gzip');
-	assert.equal(empty.headers.get('x-sampling-chunks'), '0');
-	assert.equal(empty.headers.get('x-sampling-next'), null);
+test('renaming a credential header onto a header a sampler records is refused: the sampler would be dropped', async () => {
+	applyOptions({ ...file(), sampling: { enabled: true, samplers: [{ name: 'ua', headers: ['x-ops-key'] }] } }, {});
+	const res = await PrerenderAdmin.configOverride(
+		{ set: [{ path: 'renderNow.header', value: 'x-ops-key' }] },
+		operator
+	);
+	assert.equal(res.status, 409);
+	const body = await res.json();
+	assert.equal(body.rejected[0].path, 'renderNow.header');
+	assert.match(body.rejected[0].reason, /a configured sampler records this header/);
+	assert.equal(overrideRows.size, 0);
+	// A rename that drops nothing goes through.
+	const ok = await PrerenderAdmin.configOverride({ set: [{ path: 'renderNow.header', value: 'x-other' }] }, operator);
+	assert.equal(ok.status, 200);
+});
+
+test('GET sampling shows the compiled samplers, the invalid ones and the files; GET samples reads the files', async () => {
+	const dir = mkdtempSync(join(tmpdir(), 'prerender-admin-sampling-'));
+	try {
+		applyOptions(
+			{
+				...file(),
+				sampling: {
+					enabled: true,
+					directory: dir,
+					samplers: [
+						{ name: 'ok', match: { routes: ['/catalog/'] } },
+						{ name: 'bad', x: 1 },
+					],
+				},
+			},
+			{}
+		);
+		mkdirSync(join(dir, 'ok'));
+		const day = (offset) => new Date(Date.now() + offset * 86_400_000).toISOString().slice(0, 10);
+		writeFileSync(join(dir, 'ok', `${day(-1)}.w000.ndjson.gz`), gzipSync('{"ts":1}\n'));
+		writeFileSync(join(dir, 'ok', `${day(0)}.w000.ndjson.gz`), gzipSync('{"ts":2}\n'));
+		writeFileSync(join(dir, 'ok', `${day(0)}.w001.ndjson.gz`), gzipSync('{"ts":3}\n{"counters":{"capped":1}}\n'));
+		writeFileSync(join(dir, 'ok', `${day(-9)}.w000.ndjson.gz`), gzipSync('{"ts":0}\n'));
+
+		const params = (query) => ({ get: (key) => query[key] });
+		const view = await (await PrerenderAdmin.samplingView(params({}))).json();
+		assert.equal(view.enabled, true);
+		// This test never starts the worker's sampling: the view reports what the worker runs, not the config.
+		assert.deepEqual(view.worker.samplers, []);
+		assert.equal(view.invalid.length, 1);
+		assert.match(view.invalid[0], /sampler 'bad' dropped/);
+		assert.equal(view.files.ok.files, 4);
+		assert.equal(view.files.ok.lastDay, day(0));
+		assert.equal(view.files.bad.files, 0);
+
+		assert.equal((await PrerenderAdmin.samples(params({}))).status, 400);
+		assert.equal((await PrerenderAdmin.samples(params({ sampler: '../ok' }))).status, 400);
+		assert.equal((await PrerenderAdmin.samples(params({ sampler: 'ok', format: 'csv' }))).status, 400);
+		assert.equal((await PrerenderAdmin.samples(params({ sampler: 'ok', from: 'yesterday' }))).status, 400);
+
+		// Default window: yesterday and today, so the 9-day-old file is left out.
+		const all = await PrerenderAdmin.samples(params({ sampler: 'ok' }));
+		assert.equal(all.status, 200);
+		assert.equal(all.headers.get('x-sampling-files'), '3');
+		assert.equal(await all.text(), '{"ts":1}\n{"ts":2}\n{"ts":3}\n{"counters":{"capped":1}}\n');
+
+		// Paging: one file at a time, resumed with `after`.
+		const lines = [];
+		let after;
+		for (let page = 0; page < 5; page++) {
+			const res = await PrerenderAdmin.samples(params({ sampler: 'ok', limit: '1', ...(after ? { after } : {}) }));
+			lines.push(await res.text());
+			after = res.headers.get('x-sampling-next');
+			if (!after) break;
+		}
+		assert.equal(lines.join(''), '{"ts":1}\n{"ts":2}\n{"ts":3}\n{"counters":{"capped":1}}\n');
+
+		const gz = await PrerenderAdmin.samples(params({ sampler: 'ok', format: 'gzip', from: day(0), to: day(0) }));
+		assert.equal(gz.headers.get('content-type'), 'application/gzip');
+		assert.equal(
+			gunzipSync(Buffer.from(await gz.arrayBuffer())).toString(),
+			'{"ts":2}\n{"ts":3}\n{"counters":{"capped":1}}\n'
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });

@@ -2,6 +2,9 @@ import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { gunzipSync } from 'node:zlib';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { checkHarperKey } from './support/harperKeyLimit.js';
 
 /**
@@ -162,13 +165,6 @@ before(async () => {
 			},
 		},
 		crawl_stats: { CrawlSketch: class {}, VisitFilter: class {} },
-		sampling: {
-			SampleChunk: {
-				put: async (id, data) => {
-					sampleRows.push({ id, ...data });
-				},
-			},
-		},
 	};
 	({ applyOptions, config } = await import('../src/config.js'));
 	applyOptions(BASE_OPTIONS);
@@ -180,7 +176,6 @@ before(async () => {
 
 let applyOptions;
 let sampling;
-const sampleRows = [];
 
 const BASE_OPTIONS = {
 	ingress: {
@@ -647,10 +642,12 @@ test('a local 304 on a GET drains the body so the pooled origin connection is RE
 // ── request sampling ─────────────────────────────────────────────────────────────────────────────
 
 test('a sampler records the status the crawler was SENT: an origin 200 answered locally as a 304', async () => {
+	const sampleDir = mkdtempSync(join(tmpdir(), 'prerender-bot-sampling-'));
 	applyOptions({
 		...BASE_OPTIONS,
 		sampling: {
 			enabled: true,
+			directory: sampleDir,
 			samplers: [
 				{
 					name: 'pdp',
@@ -662,15 +659,15 @@ test('a sampler records the status the crawler was SENT: an origin 200 answered 
 		},
 	});
 	try {
-		sampleRows.length = 0;
 		// The origin answers 200 with this ETag, and the crawler's If-None-Match matches it, so the handler
 		// sends a 304 — the status the sampler must record, not the origin's 200.
 		const res = await handleBotRequest(request('/desktop/p/big-sampled', 'GET', { 'if-none-match': '"origin-v1"' }));
 		assert.equal(res.status, 304);
 		await settle();
 		await sampling.flushSamples();
-		assert.equal(sampleRows.length, 1);
-		const [record] = gunzipSync(sampleRows[0].body)
+		const files = readdirSync(join(sampleDir, 'pdp'));
+		assert.equal(files.length, 1);
+		const [record] = gunzipSync(readFileSync(join(sampleDir, 'pdp', files[0])))
 			.toString()
 			.trim()
 			.split('\n')
@@ -690,5 +687,33 @@ test('a sampler records the status the crawler was SENT: an origin 200 answered 
 		});
 	} finally {
 		applyOptions(BASE_OPTIONS);
+		rmSync(sampleDir, { recursive: true, force: true });
+	}
+});
+
+test('a request the handler answers 500 is still offered to the samplers', async () => {
+	const sampleDir = mkdtempSync(join(tmpdir(), 'prerender-bot-sampling-'));
+	applyOptions({
+		...BASE_OPTIONS,
+		sampling: {
+			enabled: true,
+			directory: sampleDir,
+			samplers: [{ name: 'fails', match: { routes: ['/p/'] }, sample: { rate: 1 }, fields: ['url', 'status'] }],
+		},
+	});
+	try {
+		pageGet = async () => {
+			throw new Error('storage fault');
+		};
+		const res = await handleBotRequest(request('/desktop/p/broken'));
+		assert.equal(res.status, 500);
+		await sampling.flushSamples();
+		const [file] = readdirSync(join(sampleDir, 'fails'));
+		const { ts, ...record } = JSON.parse(gunzipSync(readFileSync(join(sampleDir, 'fails', file))).toString());
+		assert.ok(ts > 0);
+		assert.deepEqual(record, { url: `http://127.0.0.1:${origin.port}/p/broken`, status: 500 });
+	} finally {
+		applyOptions(BASE_OPTIONS);
+		rmSync(sampleDir, { recursive: true, force: true });
 	}
 });

@@ -1,5 +1,5 @@
 /**
- * REQUEST SAMPLING: a configurable, live-toggleable log of sampled bot requests, kept node-local.
+ * REQUEST SAMPLING: a configurable, live-toggleable log of sampled bot requests, kept in node-local files.
  *
  * WHY. Nothing else here records WHEN a URL is asked for. The demand tracker keeps one Bloom slice per
  * period (how often, not when, and it cannot list URLs); the crawl-breadth sketches count distinct URLs.
@@ -17,35 +17,62 @@
  *   - sampling off, or no enabled sampler: one module-variable null check.
  *   - on, and no sampler for this route and bot: two Map gets on a memo keyed by the route entry and the
  *     bot name, filled once per (route, bot) and reset on every config apply. No allocation.
- *   - a candidate sampler: its remaining filters (Set lookups), then the pick — an FNV-1a over the URL
- *     continued from the salt's precomputed state, or one Math.random().
+ *   - a candidate sampler: its request filters (Set lookups), then the pick — an FNV-1a over the URL
+ *     continued from the salt's precomputed state, or one Math.random() — and only then its URL filters,
+ *     so a `urlPattern` runs on the picked fraction, not on every matched request.
  *   - picked: a minute counter for `maxPerMinute`, then assignments into a PREALLOCATED ring slot.
  *     Strings are referenced, never copied; only the listed headers are read. A full ring drops the
  *     record and counts it. Nothing awaits, nothing allocates, and a sampler can never fail a response.
  *
- * STORAGE. Every `flushInterval`, or as soon as the ring is half full, the worker drains the ring and
- * writes ONE ROW PER SAMPLER — the batch's records as gzipped NDJSON (gzip on zlib's thread pool, the
- * write detached from every request). Writes therefore scale with workers and samplers, not with sampling
- * volume. Rows are node-local (`replicate: false`) and expire `keep` after their first record. Records
- * still in the ring when a worker stops are lost: at most one flush interval's worth.
+ * STORAGE: APPEND-ONLY FILES, THE WAY HARPER WRITES ITS LOGS — each thread appends to a file it owns, and
+ * old files are deleted on a schedule — rather than through Harper's logger, which a component can point
+ * at a file of its own only through each node's root config, and which prefixes every line. Every
+ * `flushInterval`, or as soon as the ring is half full, the worker swaps in its spare slot array (O(1), so
+ * the requests that follow land in an empty ring) and writes what it took, in slices that yield to the
+ * event loop: one gzip member per slice, appended to `<directory>/<sampler>/<YYYY-MM-DD>.w<worker>.ndjson.gz`.
+ * Concatenated members are one gzip stream, so a day's file reads with `gunzip`. A worker owns its files
+ * and serializes its own appends, so lines never interleave. Worker 0 deletes files older than
+ * `sampling.keepDays` every hour.
+ *
+ * COMPLETENESS IS IN THE STREAM. A pick not recorded — over `maxPerMinute` (capped), with the ring full
+ * (dropped), or in an append that failed (lost) — is counted, and the counts are appended as a line
+ * `{"ts":…,"counters":{"capped":n,"dropped":n,"lost":n}}` beside the records, so a reader sees the loss in
+ * the same window as the data. Records still in a ring when a worker stops are lost uncounted: at most one
+ * flush interval's worth.
  *
  * CONFIG IS LIVE. `sampling.*` is applied on every config apply (an override row included): the samplers
- * are recompiled, the ring resized and the flush timer re-armed. Records already in the ring keep the
- * compiled sampler they were taken under, so a sampler edited or removed mid-batch still writes its
- * records with the fields it was recording.
+ * are recompiled, the ring resized and the flush timer re-armed. Records already taken keep the compiled
+ * sampler they were taken under, so a sampler edited or removed mid-batch still writes its records with
+ * the fields it was recording.
  */
 
-import { gzip as gzipCallback, gunzip as gunzipCallback } from 'node:zlib';
+import { appendFile, mkdir, readdir, readFile, stat, unlink } from 'node:fs/promises';
+import { isAbsolute, join } from 'node:path';
+import { setImmediate as yieldNow } from 'node:timers/promises';
 import { promisify } from 'node:util';
+import { constants as zlibConstants, gunzip as gunzipCallback, gzip as gzipCallback } from 'node:zlib';
 import { config, getLogger, onConfigApplied } from '../config.js';
 import { Target } from '../resources/Target.js';
 import { runDetached } from './detach.js';
-import { compileSamplers, continueFnv, describeSampler, MAX_HEADERS } from './samplingSpec.js';
+import {
+	compileSamplers,
+	continueFnv,
+	credentialHeadersOf,
+	describeSampler,
+	isSamplerName,
+	MAX_HEADERS,
+} from './samplingSpec.js';
 
 const gzip = promisify(gzipCallback);
 const gunzip = promisify(gunzipCallback);
 
-const table = () => databases.sampling.SampleChunk;
+const DAY_MS = 86_400_000;
+// Under Harper's root unless `sampling.directory` says otherwise: persistent, and outside the component
+// directory a deploy replaces.
+const DEFAULT_DIRECTORY = 'prerender-sampling';
+// `<YYYY-MM-DD>.w<worker>.ndjson.gz`. Anything else in a sampler's directory is never read or deleted.
+const FILE_RE = /^(\d{4}-\d{2}-\d{2})\.w(\d{3})\.ndjson\.gz$/;
+export const fileNameOf = (day, worker) => `${day}.w${String(worker).padStart(3, '0')}.ndjson.gz`;
 
 // Bounds the (route, bot) memo. Route entries are a configured handful; bot names are bounded by the
 // registry, plus whatever names `deriveUnknownBots` mints — which is why there is a cap at all. Past it a
@@ -54,20 +81,34 @@ const MEMO_CAP = 512;
 // A header value is recorded to this length. A user-agent is ~200 characters; anything longer is not a
 // header worth keeping whole in a sample.
 const MAX_HEADER_VALUE = 512;
+// A `urlPattern` is tested only against URLs up to this length. The pattern is an operator's, but the URL
+// is the crawler's, and a pattern that backtracks costs time in proportion to it; a longer URL counts as
+// not matching.
+const MAX_PATTERN_INPUT = 8192;
+// Records serialized between event-loop yields, and per gzip member.
+const SLICE = 1024;
 // Distinct-URL target reads per batch run this many at a time, so a large batch cannot crowd the store.
 const TARGET_READ_CONCURRENCY = 16;
 const ERROR_LOG_INTERVAL_MS = 60_000;
+const SWEEP_INTERVAL_MS = 3_600_000;
 
 let plan = null;
 let started = false;
 let timer = null;
 let armedInterval = null;
+let sweepTimer = null;
 let flushQueued = false;
-let flushSeq = 0;
-let lastErrorLogMs = 0;
+let lastErrorLogMs = -Infinity;
+// This worker's appends, one at a time: two flushes in flight (the timer and a half-full ring) never
+// write the same file at once.
+let appendQueue = Promise.resolve();
+const madeDirs = new Set();
 
-const ring = { slots: [], size: 0, half: 0, count: 0 };
-// name -> counters for this worker. Kept across recompiles, so a sampler's numbers survive an edit.
+// `spare` is the second slot array a flush swaps in, kept for the flush after; null while a flush is
+// still working through it.
+const ring = { slots: [], spare: null, size: 0, half: 0, count: 0 };
+// name -> counters and the per-minute cap window for this worker. Kept across recompiles, so an edit
+// neither resets a sampler's numbers nor opens a second cap window inside the same minute.
 const statsByName = new Map();
 
 const newSlot = () => ({
@@ -108,21 +149,36 @@ const statsFor = (name) => {
 			picked: 0,
 			capped: 0,
 			dropped: 0,
+			lost: 0,
 			written: 0,
-			chunks: 0,
+			appends: 0,
 			bytes: 0,
 			errors: 0,
 			lastFlushAt: null,
-			// Since the last row this worker wrote for the sampler: carried on the next row, so a reader
-			// summing rows can tell how complete the sample was.
+			// Since the last counters line this worker wrote for the sampler.
 			pendingCapped: 0,
 			pendingDropped: 0,
-			// The compiled sampler last seen under this name, for a row that carries only counters.
+			pendingLost: 0,
+			// The `maxPerMinute` window.
+			minute: -1,
+			inMinute: 0,
+			// The compiled sampler last seen under this name.
 			sampler: null,
 		};
 		statsByName.set(name, stats);
 	}
 	return stats;
+};
+
+/**
+ * Where this node's sample files go: `sampling.directory` when set (it must be absolute), else
+ * `<Harper root>/prerender-sampling`. Null when neither resolves, and then nothing is recorded.
+ */
+export const sampleDirectory = () => {
+	const configured = config.sampling.directory;
+	if (configured) return isAbsolute(configured) ? configured : null;
+	const root = server.config?.rootPath ?? process.env.ROOTPATH;
+	return typeof root === 'string' && root ? join(root, DEFAULT_DIRECTORY) : null;
 };
 
 /** The route label the metrics use, so a sampler's `match.routes` reads the same as a dashboard. */
@@ -163,13 +219,14 @@ const headerOf = (request, name) => {
 };
 
 /**
- * Offer one delivered request to the samplers. Called by the bot handler after the response is assembled,
- * so `status` is the status sent (a conditional 304 included). Never throws into the request.
+ * Offer one answered request to the samplers. Called by the bot handler once the response is assembled,
+ * so `status` is the status sent (a conditional 304 included, and a 500 the handler itself answered).
+ * Never throws into the request.
  *
  * @param {object} request    the bot request (`botName` already resolved)
  * @param {object} info       the handler's resolution info: route, routeClass, deviceType, cacheKey,
  *                            cacheStatus, source, entity, renderNowStatus
- * @param {object} resource   what answered (for `lastCached`)
+ * @param {object|null} resource  what answered (for `lastCached`)
  * @param {number} status     the status sent
  * @param {string} url        the canonical URL (the cache key's URL half)
  */
@@ -187,8 +244,6 @@ export function sampleRequest(request, info, resource, status, url) {
 			if (sampler.cacheStatuses !== null && !sampler.cacheStatuses.has(info.cacheStatus)) continue;
 			if (sampler.sources !== null && !sampler.sources.has(info.source)) continue;
 			if (sampler.statuses !== null && !sampler.statuses.has(status)) continue;
-			if (sampler.urls !== null && !sampler.urls.has(url)) continue;
-			if (sampler.urlPattern !== null && !sampler.urlPattern.test(url)) continue;
 			const stats = sampler.stats;
 			stats.matched++;
 			if (
@@ -196,14 +251,18 @@ export function sampleRequest(request, info, resource, status, url) {
 			) {
 				continue;
 			}
+			// The URL filters after the pick: both are a pure function of the URL, so the order changes what
+			// is recorded not at all, and a pattern runs on the picked fraction only.
+			if (sampler.urls !== null && !sampler.urls.has(url)) continue;
+			if (sampler.urlPattern !== null && (url.length > MAX_PATTERN_INPUT || !sampler.urlPattern.test(url))) continue;
 			stats.picked++;
 			if (now === 0) now = Date.now();
 			const minute = Math.floor(now / 60_000);
-			if (sampler.minute !== minute) {
-				sampler.minute = minute;
-				sampler.inMinute = 0;
+			if (stats.minute !== minute) {
+				stats.minute = minute;
+				stats.inMinute = 0;
 			}
-			if (++sampler.inMinute > sampler.maxPerMinute) {
+			if (++stats.inMinute > sampler.maxPerMinute) {
 				stats.capped++;
 				stats.pendingCapped++;
 				continue;
@@ -242,15 +301,18 @@ export function sampleRequest(request, info, resource, status, url) {
 	}
 }
 
+// At most one line per interval. A clock stepped backwards logs at once rather than going quiet until it
+// catches up.
 const logError = (message, e) => {
 	const now = Date.now();
-	if (now - lastErrorLogMs < ERROR_LOG_INTERVAL_MS) return;
+	const elapsed = now - lastErrorLogMs;
+	if (elapsed >= 0 && elapsed < ERROR_LOG_INTERVAL_MS) return;
 	lastErrorLogMs = now;
 	getLogger().warn?.(`${message}: ${e?.message ?? String(e)}`);
 };
 
-// A half-full ring asks for a flush from inside a request. The flush itself must not run there: it
-// would add the drain to that one response, and its writes would inherit the request's transaction
+// A half-full ring asks for a flush from inside a request. The flush must not run there: its work would
+// delay that one response, and anything it starts would inherit the request's async context
 // (util/detach.js). So it is queued from the load context, on the next turn of the loop.
 const scheduleFlush = () => {
 	if (flushQueued) return;
@@ -267,75 +329,63 @@ const flushSafely = () => {
 	flushSamples().catch((e) => logError('[prerender] request sampling flush failed', e));
 };
 
-const pad13 = (ms) => String(Math.max(0, Math.floor(ms))).padStart(13, '0');
-
-/** The chunk row key: sampler, first record time, worker, sequence — so a sampler's rows sort by time. */
-export const chunkIdOf = (name, firstMs, worker, seq) =>
-	`${name}/${pad13(firstMs)}/${String(worker).padStart(3, '0')}/${seq.toString(36)}`;
-
-/**
- * Drain the ring into per-sampler batches. Synchronous, so a request arriving during the write that
- * follows lands in an empty ring rather than in the batch being written.
- */
-const takeBatches = () => {
-	const node = server.hostname;
-	const worker = server.workerIndex ?? 0;
-	const batches = new Map();
+/** Take the ring's records in O(1): the spare array becomes the ring, and the taken one is worked through. */
+const swapRing = () => {
 	const n = ring.count;
-	for (let i = 0; i < n; i++) {
-		const slot = ring.slots[i];
-		const sampler = slot.sampler;
-		let batch = batches.get(sampler.name);
-		if (!batch) {
-			batch = { sampler, records: [], first: slot.ts, last: slot.ts };
-			batches.set(sampler.name, batch);
-		}
-		const record = {};
-		for (const field of sampler.fields) {
-			if (field === 'node') record.node = node;
-			else if (field === 'worker') record.worker = worker;
-			else if (field === 'target' || field === 'sitemap') record[field] = null;
-			else record[field] = slot[field];
-		}
-		if (sampler.headers.length) {
-			const headers = {};
-			for (let h = 0; h < sampler.headers.length; h++) headers[sampler.headers[h]] = slot.headers[h];
-			record.headers = headers;
-		}
-		batch.records.push(record);
-		if (slot.ts < batch.first) batch.first = slot.ts;
-		if (slot.ts > batch.last) batch.last = slot.ts;
-		clearSlot(slot);
-	}
+	if (n === 0) return null;
+	const slots = ring.slots;
+	ring.slots = ring.spare ?? Array.from({ length: ring.size }, newSlot);
+	ring.spare = null;
 	ring.count = 0;
-	// Counters with no records behind them still get a row: a ring full of another sampler's records
-	// drops this one's, and that loss has to be readable from the table.
+	return { slots, n };
+};
+
+// A worked-through array becomes the spare again, unless the ring has been resized since it was taken.
+const releaseSlots = (slots) => {
+	if (ring.spare === null && slots !== ring.slots && slots.length === ring.size && ring.size > 0) ring.spare = slots;
+};
+
+const takePending = () => {
+	const out = [];
 	for (const [name, stats] of statsByName) {
-		if (batches.has(name) || (stats.pendingCapped === 0 && stats.pendingDropped === 0) || !stats.sampler) continue;
-		const now = Date.now();
-		batches.set(name, { sampler: stats.sampler, records: [], first: now, last: now });
-	}
-	for (const [name, batch] of batches) {
-		const stats = statsFor(name);
-		batch.capped = stats.pendingCapped;
-		batch.dropped = stats.pendingDropped;
+		if (stats.pendingCapped === 0 && stats.pendingDropped === 0 && stats.pendingLost === 0) continue;
+		out.push({ name, capped: stats.pendingCapped, dropped: stats.pendingDropped, lost: stats.pendingLost });
 		stats.pendingCapped = 0;
 		stats.pendingDropped = 0;
+		stats.pendingLost = 0;
 	}
-	return batches;
+	return out;
+};
+
+const recordOf = (slot, sampler, node, worker) => {
+	const record = {};
+	for (const field of sampler.fields) {
+		if (field === 'node') record.node = node;
+		else if (field === 'worker') record.worker = worker;
+		// Resolved once the batch is grouped (`resolveTargets`); a record whose read failed says 'unknown'.
+		else if (field === 'target' || field === 'sitemap') record[field] = null;
+		else record[field] = slot[field];
+	}
+	if (sampler.headers.length) {
+		const headers = {};
+		for (let h = 0; h < sampler.headers.length; h++) headers[sampler.headers[h]] = slot.headers[h];
+		record.headers = headers;
+	}
+	return record;
 };
 
 /**
- * Resolve the flush-time fields (`target`, `sitemap`) for the records of samplers that record them: one
- * target read per distinct URL in the batch. A failed read records `target: 'unknown'` — never null, which
- * means "no target".
+ * Resolve `target` and `sitemap` for the records that record them, from the URL each was TAKEN for —
+ * `urls[i]`, kept beside the records, so a sampler need not record `url` to have its target read. One read
+ * per distinct URL. A failed read records `target: 'unknown'` and `sitemap: null`, never null and false,
+ * which would say "no target".
  */
-const resolveTargets = async (records) => {
-	const urls = [...new Set(records.map((record) => record.url).filter((url) => typeof url === 'string'))];
+const resolveTargets = async (records, urls) => {
+	const distinct = [...new Set(urls.filter((url) => typeof url === 'string'))];
 	const found = new Map();
-	for (let i = 0; i < urls.length; i += TARGET_READ_CONCURRENCY) {
+	for (let i = 0; i < distinct.length; i += TARGET_READ_CONCURRENCY) {
 		await Promise.all(
-			urls.slice(i, i + TARGET_READ_CONCURRENCY).map(async (url) => {
+			distinct.slice(i, i + TARGET_READ_CONCURRENCY).map(async (url) => {
 				try {
 					const row = await Target.get({ id: url, select: ['url', 'state', 'sitemapUrl'] });
 					found.set(url, row ? { target: row.state ?? 'active', sitemap: !!row.sitemapUrl } : null);
@@ -345,74 +395,149 @@ const resolveTargets = async (records) => {
 			})
 		);
 	}
-	for (const record of records) {
-		const hit = found.get(record.url);
-		const target = hit === undefined ? 'unknown' : (hit?.target ?? null);
-		if ('target' in record) record.target = target;
+	for (let i = 0; i < records.length; i++) {
+		if (typeof urls[i] !== 'string') continue;
+		const record = records[i];
+		const hit = found.get(urls[i]);
+		if ('target' in record) record.target = hit === undefined ? 'unknown' : (hit?.target ?? null);
 		if ('sitemap' in record) record.sitemap = hit === undefined ? null : !!hit?.sitemap;
 	}
 };
 
-const writeBatch = async (name, batch) => {
-	const stats = statsFor(name);
+const appendSerially = (path, bytes) => {
+	const run = appendQueue.then(() => appendFile(path, bytes));
+	appendQueue = run.catch(() => {});
+	return run;
+};
+
+/**
+ * Write one (sampler, day) group: its records in gzip members of `SLICE` records, then its counters line,
+ * appended in one write. A failure loses the records, and says so: they are counted as `lost`, and the
+ * counters this group carried go back to pending, for the next line this worker writes.
+ */
+const writeGroup = async (dir, group, worker, now) => {
+	const stats = statsFor(group.name);
+	const count = group.records.length;
 	try {
-		const { sampler, records } = batch;
-		if (records.length && sampler.wantsTarget) await resolveTargets(records);
-		let body = null;
-		if (records.length) {
-			let text = '';
-			for (const record of records) text += `${JSON.stringify(record)}\n`;
-			body = await gzip(Buffer.from(text), { level: 6 });
+		if (dir === null) {
+			throw new Error('no sampling directory (set sampling.directory to an absolute path)');
 		}
-		const worker = server.workerIndex ?? 0;
-		await table().put(chunkIdOf(name, batch.first, worker, ++flushSeq), {
-			sampler: name,
-			node: server.hostname,
-			worker,
-			firstAt: new Date(batch.first),
-			lastAt: new Date(batch.last),
-			count: records.length,
-			capped: batch.capped,
-			dropped: batch.dropped,
-			body: body ? createBlob(body) : null,
-			expiresAt: new Date(batch.first + sampler.keep),
-		});
-		stats.written += records.length;
-		stats.chunks++;
-		stats.bytes += body ? body.length : 0;
+		if (group.urls.some((url) => url !== null)) await resolveTargets(group.records, group.urls);
+		const members = [];
+		for (let i = 0; i < count; i += SLICE) {
+			let text = '';
+			const end = Math.min(i + SLICE, count);
+			for (let j = i; j < end; j++) text += `${JSON.stringify(group.records[j])}\n`;
+			members.push(await gzip(Buffer.from(text)));
+		}
+		if (group.counters) {
+			members.push(await gzip(Buffer.from(`${JSON.stringify({ ts: now, counters: group.counters })}\n`)));
+		}
+		const bytes = members.length === 1 ? members[0] : Buffer.concat(members);
+		const folder = join(dir, group.name);
+		if (!madeDirs.has(folder)) {
+			await mkdir(folder, { recursive: true });
+			madeDirs.add(folder);
+		}
+		await appendSerially(join(folder, fileNameOf(group.day, worker)), bytes);
+		stats.written += count;
+		stats.appends++;
+		stats.bytes += bytes.length;
 		stats.lastFlushAt = Date.now();
+		return true;
 	} catch (e) {
 		stats.errors++;
-		logError(`[prerender] request sampling could not write a batch for '${name}' (its records are lost)`, e);
+		stats.lost += count;
+		stats.pendingLost += count;
+		if (group.counters) {
+			stats.pendingCapped += group.counters.capped;
+			stats.pendingDropped += group.counters.dropped;
+			stats.pendingLost += group.counters.lost;
+		}
+		logError(`[prerender] request sampling could not append for '${group.name}' (${count} records lost, counted)`, e);
+		return false;
 	}
 };
 
-/** Drain this worker's ring and write one row per sampler. Exported for tests. */
-export async function flushSamples() {
-	const batches = takeBatches();
-	if (batches.size === 0) return { chunks: 0, records: 0 };
+/**
+ * Group taken records by (sampler name, UTC day of the record) — yielding every `SLICE` records — add the
+ * pending counters to today's group per sampler, and write each group. Records keep the compiled sampler
+ * they were taken under: fields, headers and whether targets are read all come from it.
+ */
+const writeOut = async (taken, pending) => {
+	const dir = sampleDirectory();
+	const node = server.hostname;
+	const worker = server.workerIndex ?? 0;
+	const groups = new Map();
+	const groupFor = (name, day) => {
+		const key = `${name}/${day}`;
+		let group = groups.get(key);
+		if (!group) {
+			group = { name, day, records: [], urls: [], counters: null };
+			groups.set(key, group);
+		}
+		return group;
+	};
+	let dayNumber = NaN;
+	let dayText = '';
+	const dayOf = (ms) => {
+		const n = Math.floor(ms / DAY_MS);
+		if (n !== dayNumber) {
+			dayNumber = n;
+			dayText = new Date(n * DAY_MS).toISOString().slice(0, 10);
+		}
+		return dayText;
+	};
+
+	if (taken) {
+		for (let i = 0; i < taken.n; i++) {
+			const slot = taken.slots[i];
+			const sampler = slot.sampler;
+			const group = groupFor(sampler.name, dayOf(slot.ts));
+			group.records.push(recordOf(slot, sampler, node, worker));
+			group.urls.push(sampler.wantsTarget ? slot.url : null);
+			clearSlot(slot);
+			if ((i + 1) % SLICE === 0) await yieldNow();
+		}
+		releaseSlots(taken.slots);
+	}
+	const now = Date.now();
+	for (const { name, capped, dropped, lost } of pending)
+		groupFor(name, dayOf(now)).counters = { capped, dropped, lost };
+
+	let files = 0;
 	let records = 0;
-	await Promise.all(
-		[...batches].map(([name, batch]) => {
-			records += batch.records.length;
-			return writeBatch(name, batch);
-		})
-	);
-	return { chunks: batches.size, records };
+	for (const group of groups.values()) {
+		if (await writeGroup(dir, group, worker, now)) {
+			files++;
+			records += group.records.length;
+		}
+	}
+	return { files, records };
+};
+
+/** Write out this worker's ring and pending counters. Exported for tests. */
+export async function flushSamples() {
+	const taken = swapRing();
+	const pending = takePending();
+	if (taken === null && pending.length === 0) return { files: 0, records: 0 };
+	return writeOut(taken, pending);
 }
 
-// Size 0 releases the ring. Records taken under the old ring are written, not discarded, before the slots
-// are replaced or released: the drain is synchronous, so nothing can land in between.
+// Size 0 releases the ring. What the old ring held is written, never discarded; on release the pending
+// counters go with it, since no flush follows.
 const resizeRing = (size) => {
 	if (ring.size === size) return;
-	if (ring.count) {
-		const batches = takeBatches();
-		for (const [name, batch] of batches) writeBatch(name, batch);
-	}
-	ring.slots = Array.from({ length: size }, newSlot);
+	const taken = ring.count ? { slots: ring.slots, n: ring.count } : null;
+	ring.slots = size ? Array.from({ length: size }, newSlot) : [];
+	ring.spare = null;
 	ring.size = size;
 	ring.half = size ? Math.max(1, Math.floor(size / 2)) : 0;
 	ring.count = 0;
+	const pending = size === 0 ? takePending() : [];
+	if (taken || pending.length) {
+		writeOut(taken, pending).catch((e) => logError('[prerender] request sampling flush failed', e));
+	}
 };
 
 /**
@@ -421,10 +546,16 @@ const resizeRing = (size) => {
  */
 export const syncSampling = () => {
 	const sampling = config.sampling;
-	const compiled = sampling?.enabled
-		? compileSamplers(sampling.samplers, [], { deniedHeaders: [config.origin?.securityToken?.header].filter(Boolean) })
+	const compiled = sampling.enabled
+		? compileSamplers(sampling.samplers, [], { deniedHeaders: credentialHeadersOf(config) })
 		: [];
 	const enabled = compiled.filter((sampler) => sampler.enabled);
+	if (enabled.length && sampleDirectory() === null) {
+		logError('[prerender] request sampling is enabled but has no directory', {
+			message: 'set sampling.directory to an absolute path — nothing is recorded until then',
+		});
+		enabled.length = 0;
+	}
 	for (const sampler of enabled) {
 		sampler.stats = statsFor(sampler.name);
 		sampler.stats.sampler = sampler;
@@ -436,7 +567,6 @@ export const syncSampling = () => {
 		plan = { samplers: enabled, memo: new Map() };
 	} else {
 		plan = null;
-		// Switched off: what the ring holds is written now, and the ring is released.
 		resizeRing(0);
 	}
 
@@ -452,12 +582,60 @@ export const syncSampling = () => {
 	}
 };
 
+/**
+ * Delete this node's sample files older than `sampling.keepDays` (by the day in the file name), for every
+ * sampler directory — including samplers no longer configured. Run hourly on worker 0, whether or not
+ * sampling is on, so turning it off never strands files. Exported for tests.
+ */
+export async function sweepSampleFiles(nowMs = Date.now()) {
+	const dir = sampleDirectory();
+	if (!dir) return { deleted: 0 };
+	const cutoff = new Date(nowMs - config.sampling.keepDays * DAY_MS).toISOString().slice(0, 10);
+	let names;
+	try {
+		names = await readdir(dir);
+	} catch (e) {
+		if (e.code === 'ENOENT') return { deleted: 0 };
+		throw e;
+	}
+	let deleted = 0;
+	for (const name of names) {
+		if (!isSamplerName(name)) continue;
+		let files;
+		try {
+			files = await readdir(join(dir, name));
+		} catch {
+			continue;
+		}
+		for (const file of files) {
+			const match = FILE_RE.exec(file);
+			if (!match || match[1] >= cutoff) continue;
+			try {
+				await unlink(join(dir, name, file));
+				deleted++;
+			} catch (e) {
+				if (e.code !== 'ENOENT') logError('[prerender] request sampling could not delete an old file', e);
+			}
+		}
+	}
+	return { deleted };
+}
+
+const sweepSafely = () => {
+	sweepSampleFiles().catch((e) => logError('[prerender] request sampling retention sweep failed', e));
+};
+
 /** Start sampling on this worker: compile now, and again on every config apply. Idempotent. */
 export const startRequestSampling = () => {
 	if (started) return;
 	started = true;
 	syncSampling();
 	onConfigApplied(syncSampling);
+	if ((server.workerIndex ?? 0) === 0) {
+		sweepTimer = setInterval(sweepSafely, SWEEP_INTERVAL_MS);
+		sweepTimer.unref?.();
+		setTimeout(sweepSafely, 60_000).unref?.();
+	}
 };
 
 /** This worker's live view, for the admin API: what is compiled, the ring, and the counters. */
@@ -465,6 +643,7 @@ export const samplingWorkerState = () => ({
 	node: server.hostname,
 	workerIndex: server.workerIndex ?? 0,
 	active: plan !== null,
+	directory: sampleDirectory(),
 	flushInterval: armedInterval,
 	ring: { size: ring.size, used: ring.count },
 	samplers: plan ? plan.samplers.map(describeSampler) : [],
@@ -476,8 +655,9 @@ export const samplingWorkerState = () => ({
 				picked: stats.picked,
 				capped: stats.capped,
 				dropped: stats.dropped,
+				lost: stats.lost,
 				written: stats.written,
-				chunks: stats.chunks,
+				appends: stats.appends,
 				bytes: stats.bytes,
 				errors: stats.errors,
 				lastFlushAt: stats.lastFlushAt ? new Date(stats.lastFlushAt).toISOString() : null,
@@ -486,85 +666,76 @@ export const samplingWorkerState = () => ({
 	),
 });
 
-/**
- * This node's chunk rows for one sampler, in key order (first-record time, then worker): those whose first
- * record is at or after `sinceMs` and before `untilMs`, or after the row id `after` when resuming. A chunk
- * spans at most one flush interval, so a reader wanting records from `sinceMs` on starts one interval
- * earlier and filters records by `ts`.
- *
- * One lower-bound condition on the key, with the upper bound applied here: the walk ends at the first row
- * past it, so reading a window costs the rows in the window.
- */
-export async function* sampleChunks({ sampler, sinceMs = 0, untilMs = Infinity, after = null, select }) {
-	const prefix = `${sampler}/`;
-	const resume = typeof after === 'string' && after.startsWith(prefix);
-	const start = resume ? after : `${prefix}${pad13(sinceMs)}`;
-	const end = Number.isFinite(untilMs) ? `${prefix}${pad13(untilMs)}` : `${prefix}~`;
-	const results = table().search({
-		conditions: [{ attribute: 'id', comparator: resume ? 'greater_than' : 'greater_than_equal', value: start }],
-		sort: { attribute: 'id' },
-		...(select ? { select: select.includes('id') ? select : ['id', ...select] } : {}),
-	});
-	for await (const row of results) {
-		if (typeof row?.id !== 'string' || row.id >= end) return;
-		yield row;
+/** This node's files for one sampler, in name order (day, then worker). */
+export async function listSampleFiles(sampler) {
+	const dir = sampleDirectory();
+	if (!dir || !isSamplerName(sampler)) return [];
+	let names;
+	try {
+		names = await readdir(join(dir, sampler));
+	} catch (e) {
+		if (e.code === 'ENOENT') return [];
+		throw e;
 	}
+	return names
+		.filter((name) => FILE_RE.test(name))
+		.sort()
+		.map((name) => ({ name, day: name.slice(0, 10), path: join(dir, sampler, name) }));
 }
 
-/** A stored chunk's records as NDJSON bytes, or its gzip as stored. */
-export const chunkBytes = async (row, { decode = true } = {}) => {
-	const blob = row?.body;
-	if (!blob) return null;
-	const stored = typeof blob.bytes === 'function' ? await blob.bytes() : blob;
-	const bytes = Buffer.isBuffer(stored) ? stored : Buffer.from(stored);
-	return decode ? gunzip(bytes) : bytes;
-};
-
-/**
- * Totals of this node's stored rows per sampler over a window: rows, records, and the capped and dropped
- * counts the rows carry. Reads no bodies. `cap` bounds the rows walked per sampler; a walk that hits it
- * says so.
- */
-export async function storedSampleTotals({ names, sinceMs, untilMs = Infinity, cap = 20_000 }) {
+/** Per sampler: this node's files, bytes, and first and last day. Reads directory entries, never files. */
+export async function sampleFileSummary(names) {
 	const out = {};
 	for (const name of names) {
-		const totals = { chunks: 0, records: 0, capped: 0, dropped: 0, firstAt: null, lastAt: null, truncated: false };
-		for await (const row of sampleChunks({
-			sampler: name,
-			sinceMs,
-			untilMs,
-			select: ['count', 'capped', 'dropped', 'firstAt', 'lastAt'],
-		})) {
-			if (totals.chunks === cap) {
-				totals.truncated = true;
-				break;
+		const files = await listSampleFiles(name);
+		let bytes = 0;
+		for (const file of files) {
+			try {
+				bytes += (await stat(file.path)).size;
+			} catch {
+				// Deleted by the sweep between the listing and the stat.
 			}
-			totals.chunks++;
-			totals.records += Number(row.count) || 0;
-			totals.capped += Number(row.capped) || 0;
-			totals.dropped += Number(row.dropped) || 0;
-			const first = row.firstAt ? new Date(row.firstAt).getTime() : NaN;
-			const last = row.lastAt ? new Date(row.lastAt).getTime() : NaN;
-			if (first >= 0 && (totals.firstAt === null || first < totals.firstAt)) totals.firstAt = first;
-			if (last >= 0 && (totals.lastAt === null || last > totals.lastAt)) totals.lastAt = last;
 		}
-		if (totals.firstAt !== null) totals.firstAt = new Date(totals.firstAt).toISOString();
-		if (totals.lastAt !== null) totals.lastAt = new Date(totals.lastAt).toISOString();
-		out[name] = totals;
+		out[name] = {
+			files: files.length,
+			bytes,
+			firstDay: files.length ? files[0].day : null,
+			lastDay: files.length ? files[files.length - 1].day : null,
+		};
 	}
 	return out;
+}
+
+/**
+ * One file's bytes: as stored (gzip members), or decoded to NDJSON. A file another worker is appending to
+ * right now can end mid-member, so decoding flushes what is complete and keeps whole lines only.
+ * `maxOutputLength` bounds the decoded size (a RangeError past it).
+ */
+export async function readSampleFile(path, { decode = true, maxOutputLength } = {}) {
+	const bytes = await readFile(path);
+	if (!decode) return bytes;
+	const text = await gunzip(bytes, {
+		finishFlush: zlibConstants.Z_SYNC_FLUSH,
+		...(maxOutputLength ? { maxOutputLength } : {}),
+	});
+	const end = text.lastIndexOf(10);
+	return end === -1 ? Buffer.alloc(0) : text.subarray(0, end + 1);
 }
 
 /** Test seam: forget everything this worker holds. */
 export const resetSamplingForTests = () => {
 	if (timer) clearInterval(timer);
+	if (sweepTimer) clearInterval(sweepTimer);
 	timer = null;
+	sweepTimer = null;
 	armedInterval = null;
 	plan = null;
 	started = false;
 	flushQueued = false;
-	flushSeq = 0;
+	appendQueue = Promise.resolve();
+	madeDirs.clear();
 	ring.slots = [];
+	ring.spare = null;
 	ring.size = 0;
 	ring.half = 0;
 	ring.count = 0;

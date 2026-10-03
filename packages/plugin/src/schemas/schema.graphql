@@ -24,8 +24,6 @@
 #                                                      the render rotation (expiring, isolated)
 #   negative_cache   NegativePage,                   — the origin's own 404/410 responses, node-local
 #                    NegativePageAnchor                (+ an empty replicated anchor, see the type)
-#   sampling         SampleChunk,                    — sampled bot requests, gzipped NDJSON batches,
-#                    SampleChunkAnchor                 node-local (+ an empty replicated anchor)
 
 type SitemapEntry {
 	loc: String
@@ -846,49 +844,5 @@ type NegativePage @table(database: "negative_cache", replicate: false, expiratio
 # Same anchor, same reason as CoordinationAnchor and ProbeStateAnchor: NegativePage is `replicate: false`,
 # and a database with zero replicable tables spins the replication subscription (harper-pro#685).
 type NegativePageAnchor @table(database: "negative_cache") @sealed {
-	id: Int @primaryKey
-}
-
-# SAMPLED BOT REQUESTS (util/sampling.js): one row per sampler per worker per flush, holding that batch's
-# records as gzipped NDJSON. A row per batch rather than per record is what keeps sampling cheap to store:
-# writes scale with workers and samplers, not with how many requests are sampled, and the records compress
-# together (they share every key and most values).
-#
-# `id` is `<sampler>/<first record ms, 13 digits>/<worker, 3 digits>/<sequence>`, so one sampler's rows sort
-# by time and a window is one key-range walk (`sampleChunks`).
-#
-# NODE-LOCAL, hence `replicate: false`: each node keeps what it served, and a reader asks every node, as it
-# does for the change probe and the unrouted tally. Replicating would ship every batch to three nodes that
-# never read it, and losing a node's rows loses only that node's sample.
-#
-# Its own database, so a flush never queues behind any other table's writes (Harper serializes writes per
-# database) and nothing queues behind a flush.
-#
-# DELIBERATELY NOT `@export`: the records are read through the super_user-gated admin API only.
-#
-# `expiresAt` carries `@expiresAt` and is set to the first record's time plus the sampler's `keep`, so each
-# sampler sets its own retention; the 1-day table expiration is only the fallback for a row whose field is
-# unreadable, and its quarter (6h) is the reclaim cadence.
-type SampleChunk @table(database: "sampling", replicate: false, expiration: 86400) @sealed {
-	id: String @primaryKey
-	sampler: String
-	node: String
-	worker: Int
-	firstAt: Date
-	lastAt: Date
-	# Records in `body`. Zero for a row that carries only counters (see `capped` and `dropped`).
-	count: Int
-	# Requests this sampler picked on this worker since its previous row and did not record: over
-	# `maxPerMinute` (capped) or with the worker's ring full (dropped). A URL-stable sample is complete
-	# only while both stay zero.
-	capped: Int
-	dropped: Int
-	body: Blob
-	expiresAt: Date @expiresAt
-}
-
-# Same anchor, same reason as CoordinationAnchor: SampleChunk is `replicate: false`, and a database with
-# zero replicable tables spins the replication subscription (harper-pro#685).
-type SampleChunkAnchor @table(database: "sampling") @sealed {
 	id: Int @primaryKey
 }

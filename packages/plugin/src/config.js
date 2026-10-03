@@ -20,6 +20,7 @@
 
 import { createHash } from 'node:crypto';
 import { isIP } from 'node:net';
+import { isAbsolute } from 'node:path';
 import {
 	configSchema,
 	defaultConfig,
@@ -49,7 +50,7 @@ import { DepartureAction, prerenderRouteCount } from './util/routeClass.js';
 // runtime, precisely so this module can compile prospective rules inside collectConfigWarnings.
 import { inspectProbeRules } from './util/changeProbeSpec.js';
 // Same reason: samplingSpec.js is the samplers' pure half.
-import { compileSamplers, inspectSamplers } from './util/samplingSpec.js';
+import { compileSamplers, credentialHeadersOf, inspectSamplers } from './util/samplingSpec.js';
 
 // Returns the Harper logger when running inside Harper, otherwise the console.
 // Unit tests run outside Harper where `logger` is undefined.
@@ -1006,7 +1007,15 @@ export const collectConfigWarnings = (target = config, { prerenderRoutes } = {})
 	}
 
 	if (target.sampling.enabled) {
-		const deniedHeaders = [target.origin.securityToken.header];
+		if (target.sampling.directory && !isAbsolute(target.sampling.directory)) {
+			add(
+				'warn',
+				'sampling.directory',
+				`sampling.directory '${target.sampling.directory}' is not an absolute path — nothing is recorded ` +
+					'until it is (or until it is cleared, for the default under Harper\u2019s root)'
+			);
+		}
+		const deniedHeaders = credentialHeadersOf(target);
 		const samplers = inspectSamplers(target.sampling.samplers, { deniedHeaders });
 		if (samplers.dropped > 0) {
 			add(

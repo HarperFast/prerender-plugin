@@ -635,17 +635,16 @@ Database/table names are fixed. Tables are split across databases by write-trans
 Harper serializes writes per database and commits each database independently, so the hot, high-write
 queue table is isolated and bursty/heavy writes don't serialize against it:
 
-| Database          | Tables                                  | Notes                                                                             |
-| ----------------- | --------------------------------------- | --------------------------------------------------------------------------------- |
-| `render_schedule` | `RenderSchedule`                        | the hot render queue — isolated                                                   |
-| `render_service`  | `Target`, `QueueStatus`, `QueueControl` | target registry, observed status, desired status                                  |
-| `page_cache`      | `PrerenderedPage`                       | rendered-HTML cache (heavy blob writes)                                           |
-| `sitemaps`        | `Sitemap`, `SitemapRefresh`             | sitemap data + per-root refresh progress                                          |
-| `invalidation`    | `Invalidation`                          | bulk-invalidation epochs (one row per scope)                                      |
-| `crawl_stats`     | `CrawlSketch`, `VisitFilter`            | crawl-breadth and miss-cause sketches, demand-tracker visit bloom                 |
-| `coordination`    | `SharedBuffer`                          | node-local cross-worker SAB (never replicated)                                    |
-| `config`          | `ConfigOverride`                        | operator-set config overrides — isolated because it is SUBSCRIBED                 |
-| `sampling`        | `SampleChunk`                           | sampled bot requests as gzipped batches (request sampling) — node-local, expiring |
+| Database          | Tables                                  | Notes                                                             |
+| ----------------- | --------------------------------------- | ----------------------------------------------------------------- |
+| `render_schedule` | `RenderSchedule`                        | the hot render queue — isolated                                   |
+| `render_service`  | `Target`, `QueueStatus`, `QueueControl` | target registry, observed status, desired status                  |
+| `page_cache`      | `PrerenderedPage`                       | rendered-HTML cache (heavy blob writes)                           |
+| `sitemaps`        | `Sitemap`, `SitemapRefresh`             | sitemap data + per-root refresh progress                          |
+| `invalidation`    | `Invalidation`                          | bulk-invalidation epochs (one row per scope)                      |
+| `crawl_stats`     | `CrawlSketch`, `VisitFilter`            | crawl-breadth and miss-cause sketches, demand-tracker visit bloom |
+| `coordination`    | `SharedBuffer`                          | node-local cross-worker SAB (never replicated)                    |
+| `config`          | `ConfigOverride`                        | operator-set config overrides — isolated because it is SUBSCRIBED |
 
 `config` is alone in its database for a reason that is not write volume — the table is written a few
 times a week. **A subscription is a per-database cost.** Harper's audit log spans every table in a
@@ -832,8 +831,8 @@ this plugin's resources all set `loadAsInstance = false`.
 | `GET /prerender_admin/invalidations`       | active bulk-invalidation rows                                                                                                             | `super_user` |
 | `GET /prerender_admin/crawl-breadth`       | `?days` — distinct URLs crawled per bot per day, and distinct MISSED URLs per miss cause (`misses` per day, `missUnion` across the range) | `super_user` |
 | `GET /prerender_admin/metrics`             | the metric catalog (see METRICS.md)                                                                                                       | `super_user` |
-| `GET /prerender_admin/sampling`            | `?since` — the samplers as compiled (and any dropped as invalid), this worker's counters, this node's stored totals                       | `super_user` |
-| `GET /prerender_admin/samples`             | `?sampler&since&until&after&limit&format` — this node's sampled records, NDJSON or the stored gzip                                        | `super_user` |
+| `GET /prerender_admin/sampling`            | the samplers as compiled (and any dropped as invalid), this worker's counters, this node's sample files                                   | `super_user` |
+| `GET /prerender_admin/samples`             | `?sampler&from&to&after&limit&format` — this node's sample files for those UTC days, NDJSON or the stored gzip                            | `super_user` |
 | `POST /prerender_admin/explain`            | `{ url, deviceType }` → cache-key trace                                                                                                   | `super_user` |
 | `POST /prerender_admin/schedule`           | `{ url \| cacheKey }` → this node's schedule row                                                                                          | `super_user` |
 | `POST /prerender_admin/queue`              | `{ scope, paused }` → pause control                                                                                                       | `super_user` |
@@ -1551,14 +1550,15 @@ at any capacity.
 Counters say how many requests a route got; the demand tracker says how often a URL is asked for, in
 6-hour slices. Neither says **when** a given crawler asks for a given page, so neither can answer how often
 each bot returns to a page, per page type and device. Request sampling keeps a per-request record for a
-slice of traffic you choose, node-local, for days, and costs nothing while it is off.
+slice of traffic you choose, in files on each node, for days, and costs nothing while it is off.
 
 A sampler matches requests (`routes`, `bots`, `devices`, `methods`, `cacheStatuses`, `sources`, `statuses`,
 exact `urls`, a `urlPattern`), samples them, and records fields from a fixed catalog: time, URL, route,
-bot, device, method, the status sent (304s included), cache status, source, the age of the copy served,
-whether the request carried validators, and (read when a batch is written, never on the request) whether
-the URL has a target and is sitemap-listed. Request headers can be recorded by name; credentials never
-are. The whole option reference is the `sampling.samplers` description in `GET /prerender_admin/config`.
+bot, device, method, the status sent (304s and the handler's own 500s included), cache status, source, the
+age of the copy served, whether the request carried validators, and (read when a batch is written, never
+on the request) whether the URL has a target and is sitemap-listed. Request headers can be recorded by
+name; credentials never are. The whole option reference is the `sampling.samplers` description in
+`GET /prerender_admin/config`.
 
 **URL-stable sampling** (`sample.by: url`, the default) is the shape for revisit questions. A URL is in or
 out by `fnv1a32(salt + '\n' + url) < rate * 2^32`, so every request for a sampled URL is recorded, from
@@ -1587,26 +1587,33 @@ sampling:
       fields: [url, bot, device, status, cacheStatus, source, ageMs, conditional, sitemap, target]
 ```
 
-Read each node's records and merge them (records are node-local; a crawler's requests can land on any
-node):
+**Storage.** Files, the way Harper writes its logs: each worker appends to its own
+`<sampling.directory>/<sampler>/<YYYY-MM-DD>.w<worker>.ndjson.gz` (UTC day of the record), one gzip
+member per batch, and worker 0 deletes files older than `sampling.keepDays` (default 14) every hour. The
+directory defaults to `prerender-sampling` under Harper's root; it must be persistent and outside the
+component directory, and it is set in the config file only. Read each node's files and merge them (a
+crawler's requests can land on any node):
 
 ```sh
-curl -s -b "$SESSION" "https://<node>/prerender_admin/samples?sampler=visits-product&since=2026-10-01&format=gzip" \
+curl -s -b "$SESSION" "https://<node>/prerender_admin/samples?sampler=visits-product&from=2026-10-01&to=2026-10-07&format=gzip" \
   | gunzip > visits-product.<node>.ndjson
-# more than `limit` chunks (500): repeat with &after=<the x-sampling-next response header>
+# more than `limit` files (200) or ~32 MB: repeat with &after=<the x-sampling-next response header>
 ```
+
+Or copy the files off the node: a day's file is a plain gzip stream.
 
 Per (URL, bot, device), the gaps between consecutive visits give the revisit interval and how regular it
 is; visits per URL give popularity strata without any other source; `sitemap` splits listed from unlisted
-URLs; `ageMs` says how old the copy each crawler received was. A sample is complete only while the rows'
-`capped` and `dropped` counts (summed by `GET /prerender_admin/sampling`) stay zero: raise `maxPerMinute`
-or `sampling.ringSize` if they do not.
+URLs; `ageMs` says how old the copy each crawler received was. **Completeness is in the same files:** a
+pick that was not recorded (over `maxPerMinute`, the ring full, or an append that failed) is counted in a
+line `{"ts":…,"counters":{"capped":n,"dropped":n,"lost":n}}`, so a window is complete when its counters
+lines sum to zero. Raise `maxPerMinute` or `sampling.ringSize` if they do not.
 
 **Cost.** Off, or with no sampler for a request's route and bot, a request pays a null check or two map
-lookups. A sampled request is copied into a preallocated per-worker ring; nothing awaits. Each worker
-writes one gzipped row per sampler per `flushInterval` (or when its ring is half full), so writes do not
-grow with sampling volume. Records still in a ring when a worker stops are lost (one flush interval at
-most).
+lookups. A sampled request is copied into a preallocated per-worker ring; nothing awaits. A flush swaps in
+a second ring and writes the first in slices that yield to the event loop, as one append per sampler per
+day per worker, so writes do not grow with sampling volume. Records still in a ring when a worker stops
+are lost (one flush interval at most).
 
 ## Metrics & observability
 

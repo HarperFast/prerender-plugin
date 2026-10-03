@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import {
 	compileSamplers,
 	continueFnv,
+	credentialHeadersOf,
 	DEFAULT_FIELDS,
+	describeSampler,
 	duplicateSamplerNames,
 	inspectSamplers,
 	isDeniedHeader,
@@ -39,7 +41,6 @@ test('a sampler with only a name compiles with the documented defaults', () => {
 	assert.deepEqual(s.fields, DEFAULT_FIELDS);
 	assert.deepEqual(s.headers, []);
 	assert.equal(s.maxPerMinute, 120);
-	assert.equal(s.keep, 14 * 86_400_000);
 	for (const key of ['routes', 'bots', 'devices', 'methods', 'cacheStatuses', 'sources', 'statuses', 'urls']) {
 		assert.equal(s[key], null, `${key} defaults to any`);
 	}
@@ -51,6 +52,8 @@ test('an unknown key at any level drops the entry instead of widening it', () =>
 		{ name: 'a', bot: ['Googlebot'] },
 		{ name: 'a', match: { bot: ['Googlebot'] } },
 		{ name: 'a', sample: { ratio: 0.5 } },
+		// Retention is `sampling.keepDays`, for every sampler; a per-sampler `keep` is not an option.
+		{ name: 'a', keep: 86_400_000 },
 	]) {
 		const { samplers, warnings } = compile([entry]);
 		assert.equal(samplers.length, 0, JSON.stringify(entry));
@@ -90,8 +93,6 @@ test('rates outside (0, 1], unknown `by`, bad statuses, keeps and caps are refus
 		{ sample: { salt: '' } },
 		{ match: { statuses: [200, 'x'] } },
 		{ match: { statuses: [99] } },
-		{ keep: 60_000 },
-		{ keep: 91 * 86_400_000 },
 		{ maxPerMinute: 0 },
 		{ maxPerMinute: 6001 },
 		{ maxPerMinute: 1.5 },
@@ -122,6 +123,8 @@ test('names: required, restricted characters, and the first of a repeated name w
 	assert.match(warnings[0], /already used/);
 	assert.deepEqual(duplicateSamplerNames([{ name: 'dup' }, { name: 'x' }, { name: 'dup' }]), ['dup']);
 	assert.deepEqual(duplicateSamplerNames([{ name: 'a' }, null, 'junk']), []);
+	// An entry the compiler drops for another reason never takes the name.
+	assert.deepEqual(duplicateSamplerNames([{ name: 'x', headers: ['cookie'] }, { name: 'x' }]), []);
 });
 
 test('fields: ts always first and once; an unknown field drops the entry', () => {
@@ -153,6 +156,48 @@ test('credential headers are refused whatever they are called; ordinary ones are
 	assert.deepEqual(s.headers, ['user-agent', 'accept-language']);
 	assert.equal(compile([{ name: 'a', headers: ['bad header'] }]).samplers.length, 0);
 	assert.equal(compile([{ name: 'a', headers: Array.from({ length: 9 }, (_, i) => `x-h${i}`) }]).samplers.length, 0);
+});
+
+test('every header the plugin authenticates on is refused by its configured name', () => {
+	const cfg = {
+		origin: { securityToken: { header: 'x-harper-renderer-bypass' } },
+		renderNow: { header: 'x-harper-render-now' },
+		peerRescue: { header: 'X-Cluster-Key' },
+	};
+	const denied = credentialHeadersOf(cfg);
+	assert.deepEqual(denied, ['x-harper-renderer-bypass', 'x-harper-render-now', 'X-Cluster-Key']);
+	for (const header of ['x-harper-render-now', 'x-cluster-key']) {
+		assert.equal(compile([{ name: 'a', headers: [header] }], { deniedHeaders: denied }).samplers.length, 0, header);
+	}
+});
+
+test('the admin view of a compiled sampler is valid input that compiles to the same sampler', () => {
+	const entries = [
+		{ name: 'all' },
+		{
+			name: 'narrow',
+			match: {
+				routes: ['/product/'],
+				bots: ['Googlebot'],
+				statuses: [200, 304],
+				urlPattern: 'prd-',
+				urls: ['https://www.example.com/a'],
+			},
+			sample: { by: 'request', rate: 0.5, salt: 's' },
+			fields: ['url', 'sitemap'],
+			headers: ['user-agent'],
+			maxPerMinute: 30,
+		},
+	];
+	const once = compile(entries).samplers.map(describeSampler);
+	const twice = compile(once).samplers.map(describeSampler);
+	assert.deepEqual(twice, once);
+	assert.deepEqual(once[0].match, {}, 'a key it does not filter on is left out');
+	const many = compile([
+		{ name: 'm', match: { urls: Array.from({ length: 101 }, (_, i) => `https://www.example.com/${i}`) } },
+	]).samplers.map(describeSampler);
+	assert.equal(many[0].urlCount, 101);
+	assert.equal(many[0].match.urls, undefined);
 });
 
 test('urls: an exact set, never a wildcard; urlPattern must compile', () => {

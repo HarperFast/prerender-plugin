@@ -80,20 +80,30 @@ export const MAX_HEADERS = 8;
 export const MAX_URLS = 10_000;
 const MAX_PATTERN_LENGTH = 512;
 const MAX_SALT_LENGTH = 128;
-export const MIN_KEEP_MS = 3_600_000;
-export const MAX_KEEP_MS = 90 * 86_400_000;
-export const DEFAULT_KEEP_MS = 14 * 86_400_000;
 export const DEFAULT_RATE = 0.01;
 export const DEFAULT_MAX_PER_MINUTE = 120;
 export const MAX_PER_MINUTE = 6000;
 
 /**
  * REFUSED IN `headers`, ALWAYS. A sampler is configured by an operator but its records are read back by
- * anyone with admin access, and kept for days: credentials must never be in them. The configured origin
- * bypass-token header is refused by name (passed in, since this module reads no config), and every name
- * carrying one of these fragments is refused whatever it is called.
+ * anyone with admin access, and kept for days: credentials must never be in them. Every header the plugin
+ * itself authenticates on is refused by its configured name (`credentialHeadersOf`, passed in, since this
+ * module reads no config), and every name carrying one of these fragments is refused whatever it is called.
  */
 const DENIED_HEADER_FRAGMENTS = ['cookie', 'auth', 'token', 'secret', 'password', 'api-key', 'apikey', 'session'];
+
+/** The option paths naming a request header whose value is a secret this plugin checks or sends. */
+export const CREDENTIAL_HEADER_PATHS = Object.freeze([
+	'origin.securityToken.header',
+	'renderNow.header',
+	'peerRescue.header',
+]);
+
+/** Those headers' configured names, from a config object (the live one, or a prospective one in a dry run). */
+export const credentialHeadersOf = (cfg) =>
+	[cfg.origin.securityToken.header, cfg.renderNow.header, cfg.peerRescue.header].filter(
+		(name) => typeof name === 'string' && name !== ''
+	);
 
 export const isDeniedHeader = (name, deniedHeaders = []) => {
 	const lower = String(name).toLowerCase();
@@ -101,7 +111,7 @@ export const isDeniedHeader = (name, deniedHeaders = []) => {
 	return DENIED_HEADER_FRAGMENTS.some((fragment) => lower.includes(fragment));
 };
 
-const ENTRY_KEYS = new Set(['name', 'enabled', 'match', 'sample', 'fields', 'headers', 'maxPerMinute', 'keep']);
+const ENTRY_KEYS = new Set(['name', 'enabled', 'match', 'sample', 'fields', 'headers', 'maxPerMinute']);
 const MATCH_STRING_LISTS = ['routes', 'bots', 'devices', 'methods', 'cacheStatuses', 'sources'];
 const MATCH_KEYS = new Set([...MATCH_STRING_LISTS, 'statuses', 'urls', 'urlPattern']);
 const SAMPLE_KEYS = new Set(['by', 'rate', 'salt']);
@@ -256,10 +266,6 @@ const compileOne = (raw, index, deniedHeaders) => {
 	if (!Number.isInteger(maxPerMinute) || maxPerMinute < 1 || maxPerMinute > MAX_PER_MINUTE) {
 		problems.push(`maxPerMinute must be a whole number from 1 to ${MAX_PER_MINUTE}`);
 	}
-	const keep = raw.keep ?? DEFAULT_KEEP_MS;
-	if (!Number.isInteger(keep) || keep < MIN_KEEP_MS || keep > MAX_KEEP_MS) {
-		problems.push(`keep must be whole milliseconds from ${MIN_KEEP_MS} (1h) to ${MAX_KEEP_MS} (90 days)`);
-	}
 
 	if (problems.length) return { problems };
 
@@ -288,12 +294,9 @@ const compileOne = (raw, index, deniedHeaders) => {
 			wantsConditional: fields.includes('conditional'),
 			wantsTarget: fields.some((field) => FLUSH_FIELDS.includes(field)),
 			maxPerMinute,
-			keep,
-			// Runtime state, declared here so every compiled sampler has one shape from the start: the
-			// request path reads these on every candidate, and a property added later would change it.
+			// The worker's counters and the per-minute cap window for this NAME, attached at compile time
+			// (they outlive a recompile); declared here so every compiled sampler has one shape.
 			stats: null,
-			minute: -1,
-			inMinute: 0,
 		},
 	};
 };
@@ -344,37 +347,41 @@ export const inspectSamplers = (list, options) => {
 	};
 };
 
-/** Names that appear on more than one entry of `list` — the one drop a per-entry check cannot see. */
-export const duplicateSamplerNames = (list) => {
+/**
+ * Names carried by more than one entry of `list` that each compile on their own — the one drop a
+ * per-entry check cannot see. An entry the compiler drops for another reason is not counted: it never
+ * takes the name, so the entry after it is not a duplicate.
+ */
+export const duplicateSamplerNames = (list, options) => {
 	const seen = new Set();
 	const dup = new Set();
 	for (const raw of Array.isArray(list) ? list : []) {
 		const name = isPlainObject(raw) ? raw.name : undefined;
-		if (typeof name !== 'string') continue;
+		if (typeof name !== 'string' || compileOne(raw, 0, options?.deniedHeaders ?? []).problems) continue;
 		if (seen.has(name)) dup.add(name);
 		seen.add(name);
 	}
 	return [...dup];
 };
 
-/** A compiled sampler as the admin API shows it: plain data, the Sets and the pattern written back out. */
-export const describeSampler = (sampler) => ({
-	name: sampler.name,
-	enabled: sampler.enabled,
-	match: {
-		routes: sampler.routes ? [...sampler.routes] : ['*'],
-		bots: sampler.bots ? [...sampler.bots] : ['*'],
-		devices: sampler.devices ? [...sampler.devices] : ['*'],
-		methods: sampler.methods ? [...sampler.methods] : ['*'],
-		cacheStatuses: sampler.cacheStatuses ? [...sampler.cacheStatuses] : ['*'],
-		sources: sampler.sources ? [...sampler.sources] : ['*'],
-		statuses: sampler.statuses ? [...sampler.statuses] : ['*'],
-		urls: sampler.urls ? sampler.urls.size : null,
-		urlPattern: sampler.urlPattern ? sampler.urlPattern.source : null,
-	},
-	sample: { by: sampler.by, rate: sampler.rate, salt: sampler.salt },
-	fields: sampler.fields,
-	headers: sampler.headers,
-	maxPerMinute: sampler.maxPerMinute,
-	keep: sampler.keep,
-});
+/**
+ * A compiled sampler as the admin API shows it, in the shape a sampler entry is written: a key it does not
+ * filter on is left out, so what is shown is valid input. The exception is a long `urls` list, which is
+ * shown as `urlCount` rather than echoed.
+ */
+export const describeSampler = (sampler) => {
+	const match = {};
+	for (const key of [...MATCH_STRING_LISTS, 'statuses']) if (sampler[key]) match[key] = [...sampler[key]];
+	if (sampler.urls && sampler.urls.size <= 100) match.urls = [...sampler.urls];
+	if (sampler.urlPattern) match.urlPattern = sampler.urlPattern.source;
+	return {
+		name: sampler.name,
+		enabled: sampler.enabled,
+		match,
+		sample: { by: sampler.by, rate: sampler.rate, salt: sampler.salt },
+		fields: sampler.fields,
+		headers: sampler.headers,
+		maxPerMinute: sampler.maxPerMinute,
+		...(sampler.urls && sampler.urls.size > 100 ? { urlCount: sampler.urls.size } : {}),
+	};
+};

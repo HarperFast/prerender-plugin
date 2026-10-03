@@ -3406,45 +3406,64 @@ export const configSchema = group('Prerender plugin configuration.', {
 	sampling: group(
 		'REQUEST SAMPLING: a log of sampled bot requests for questions no counter answers — above all, how ' +
 			'often each crawler comes back to a page, per page type and device. Each sampler in `samplers` ' +
-			'matches requests, samples them, and records a fixed set of fields; every flush writes one gzipped ' +
-			'batch per sampler per worker to a node-local table, read back through ' +
-			'`GET /prerender_admin/samples` on each node. Everything here is live: add, change or switch off a ' +
-			'sampler with an override row and it takes effect within a second, no restart.\n\n' +
+			'matches requests, samples them, and records a fixed set of fields. Each worker appends its records ' +
+			'to its own gzipped NDJSON file per sampler per UTC day, in `directory` on this node, read back ' +
+			'through `GET /prerender_admin/samples` on each node. Everything but `directory` is live: add, ' +
+			'change or switch off a sampler with an override row and it takes effect within a second, no ' +
+			'restart.\n\n' +
 			'COST. Off, or with no sampler for a request\u2019s route and bot, a request pays a null check or ' +
 			'two map lookups. A sampled request writes into a preallocated per-worker ring and never waits on ' +
 			'storage. Records still in a worker\u2019s ring when it stops are lost (at most one `flushInterval`).',
 		{
 			enabled: option(
 				false,
-				'Run the samplers. Off: nothing is matched or recorded, the ring is not even allocated, and records ' +
-					'already taken are written out.'
+				'Run the samplers. Off: nothing is matched or recorded, the ring is released, and records already ' +
+					'taken are written out. Old files are still deleted on schedule.'
+			),
+			directory: option(
+				'',
+				'Where this node writes sample files, as an absolute path; one subdirectory per sampler. Empty ' +
+					'(default): `prerender-sampling` under Harper\u2019s root. It must be persistent and outside the ' +
+					'component directory, which a deploy replaces. A relative path is refused and nothing is ' +
+					'recorded.',
+				// FILE-ONLY: a path the plugin writes, reads back through the admin API and deletes from is not
+				// something to repoint from the console.
+				{ uiEditable: false }
+			),
+			keepDays: option(
+				14,
+				'Days of sample files kept. Worker 0 deletes older files (by the day in the file name) every ' +
+					'hour, for every sampler directory, including samplers no longer configured.',
+				{ min: 1, max: 90 }
 			),
 			flushInterval: option(
 				60_000,
-				'How often each worker writes its records (one row per sampler). A ring half full flushes at once ' +
-					'whatever this says. Longer means fewer, larger rows and more records at risk when a worker stops.',
+				'How often each worker appends its records. A ring half full flushes at once whatever this says. ' +
+					'Longer means fewer appends and more records at risk when a worker stops.',
 				{ unit: 'ms', min: 5_000, max: HOUR }
 			),
 			ringSize: option(
 				4096,
-				'Records each worker can hold between flushes. A full ring drops new records and counts them ' +
-					'(`dropped` on the next row): raise this, or shorten `flushInterval`, if that number is not zero.',
-				{ min: 64, max: 262_144 }
+				'Records each worker can hold between flushes, preallocated while sampling is on (~270 bytes a ' +
+					'slot, twice over: a flush swaps in a second array). A full ring drops new records and counts ' +
+					'them (`dropped`): raise this, or shorten `flushInterval`, if that number is not zero.',
+				{ min: 64, max: 32_768 }
 			),
 			samplers: option(
 				[],
 				'The samplers, each an object:\n\n' +
-					'- `name` (required): letters, digits, `.`, `-`, `_`, at most 64. The key its records are stored ' +
-					'and read under; unique.\n' +
+					'- `name` (required): letters, digits, `.`, `-`, `_`, at most 64. Its directory, and the key its ' +
+					'records are read under; unique.\n' +
 					'- `enabled` (default true).\n' +
-					"- `match`: every key narrows, and an absent key or `['*']` means any. `routes` (a route\u2019s " +
-					'`path`, or a route class: `prerender`, `passthrough`, `unclassified`), `bots` (names as the ' +
-					'analytics registry resolves them, case-insensitive), `devices`, `methods`, `cacheStatuses`, ' +
-					'`sources`, `statuses` (numbers; the status sent, 304s included), `urls` (exact URLs as the ' +
-					'cache key spells them, at most 10,000) and `urlPattern` (a regular expression on that URL).\n' +
+					"- `match`: every key narrows, and an absent key means any. Lists of strings, where `['*']` " +
+					'also means any: `routes` (a route\u2019s `path`, or a route class: `prerender`, `passthrough`, ' +
+					'`unclassified`), `bots` (names as the analytics registry resolves them, case-insensitive), ' +
+					'`devices`, `methods`, `cacheStatuses`, `sources`. And `statuses` (numbers; the status sent, ' +
+					'304s and the handler\u2019s own 500s included), `urls` (exact URLs as the cache key spells them, ' +
+					'at most 10,000) and `urlPattern` (a regular expression on that URL).\n' +
 					'- `sample`: `by` (`url`, the default: a URL is in or out by a hash of the URL and `salt`, so ' +
 					'every request for a sampled URL is recorded, from every bot, for as long as the sampler runs ' +
-					'— the shape for revisit questions; `request`: each request independently), `rate` (above 0, ' +
+					'\u2014 the shape for revisit questions; `request`: each request independently), `rate` (above 0, ' +
 					'at most 1; default 0.01) and `salt` (default the name). Under `by: url`, raising `rate` keeps ' +
 					'every URL already in and adds more; changing `salt` picks a different set. A URL is in when ' +
 					"`fnv1a32(salt + '\\n' + url) < rate * 2^32`, so an analysis can recompute the set.\n" +
@@ -3452,15 +3471,18 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'`bot`, `device`, `method`, `status`, `cacheStatus`, `source`, `ageMs` (age of the copy served), ' +
 					'`entityUrl`, `renderNow`, `conditional` (the request carried validators), `node`, `worker`, ' +
 					'and two read once per distinct URL when the batch is written, never on the request: `target` ' +
-					'(active, suppressed or null) and `sitemap` (sitemap-listed). Default: ts, url, route, bot, ' +
-					'device, method, status, cacheStatus, source, ageMs.\n' +
+					'(active, suppressed, null for none, or unknown when the read failed) and `sitemap` ' +
+					'(sitemap-listed). Default: ts, url, route, bot, device, method, status, cacheStatus, source, ' +
+					'ageMs.\n' +
 					'- `headers`: request headers to record, by name, at most 8. Credentials are always refused: ' +
-					'any name containing cookie, auth, token, secret, password, session or api-key, and ' +
-					'`origin.securityToken.header`. No client address is recorded unless a header carrying one is ' +
-					'listed.\n' +
+					'any name containing cookie, auth, token, secret, password, session or api-key, and the headers ' +
+					'this plugin authenticates on (`origin.securityToken.header`, `renderNow.header`, ' +
+					'`peerRescue.header`). No client address is recorded unless a header carrying one is listed.\n' +
 					'- `maxPerMinute` (default 120, at most 6000): per worker. Picks over it are counted (`capped`), ' +
-					'not recorded, so a URL-stable sample is complete only while that count stays zero.\n' +
-					'- `keep` (ms, default 14 days, 1 hour to 90 days): how long its rows are kept.\n\n' +
+					'not recorded.\n\n' +
+					'COMPLETENESS. Picks not recorded \u2014 `capped`, `dropped` (ring full) and `lost` (an append that ' +
+					'failed) \u2014 are written into the same file as a line `{"ts":\u2026,"counters":{\u2026}}`, so a ' +
+					'URL-stable sample is complete for any window whose counters lines sum to zero.\n\n' +
 					'An invalid entry is dropped, not the list, and an override that would drop one is refused. ' +
 					'Unknown keys make an entry invalid: every key narrows the match, so a misspelled one would ' +
 					'otherwise widen it silently.',
