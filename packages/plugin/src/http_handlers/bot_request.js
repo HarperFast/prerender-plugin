@@ -45,6 +45,7 @@ import { isGoneSuppressed, maybeReopenGone, REOPEN_SELECT } from '../util/goneRe
 import { rescueFromOwner } from '../util/peerRescue.js';
 import { evaluateEntityGate } from '../util/entityGate.js';
 import { entityServeApplies, resolveEntityServe } from '../util/entityServe.js';
+import { sampleRequest } from '../util/sampling.js';
 import { deliverResource } from './response.js';
 
 export async function handleBotRequest(request) {
@@ -80,7 +81,9 @@ export async function handleBotRequest(request) {
 		if (!CacheKey.fitsKeyLimit(cacheUrl)) {
 			const resource = await proxyUnkeyable({ request, url, cacheUrl, deviceType, info });
 			if (recordBots) recordServeOutcome(resource, request, info, deviceType);
-			return deliverResource(resource, request, info);
+			const response = deliverResource(resource, request, info);
+			sampleRequest(request, info, resource, response.status, cacheUrl);
+			return response;
 		}
 
 		const resource = await resolveResource({ request, url, cacheUrl, deviceType, routeClass, info });
@@ -121,7 +124,11 @@ export async function handleBotRequest(request) {
 		// inside: nothing about this response waits on it.
 		maybeServeCheck(resource, request, info, cacheUrl);
 
-		return deliverResource(resource, request, info);
+		const response = deliverResource(resource, request, info);
+		// REQUEST SAMPLING (util/sampling.js), after delivery so a sampler sees the status actually sent — a
+		// conditional 304 included. A null check when sampling is off; it never awaits and never throws.
+		sampleRequest(request, info, resource, response.status, cacheUrl);
+		return response;
 	} catch (e) {
 		logger.error(e);
 		return {

@@ -175,3 +175,88 @@ test('GET config reports an override masking a later config.yaml change, in laye
 	);
 	assert.equal(view.overrides.rows[0].fileHash, row.fileHash);
 });
+
+// ── request sampling ──────────────────────────────────────────────────────────────────────────
+
+const samplerSet = (value, dryRun = false) =>
+	PrerenderAdmin.configOverride({ set: [{ path: 'sampling.samplers', value }], dryRun }, operator);
+
+test('a sampler list with an entry the compiler would drop is refused, and nothing is written', async () => {
+	for (const value of [
+		[{ name: 'pdp', match: { bot: ['Googlebot'] } }], // a misspelled key would widen the match
+		[{ name: 'pdp', headers: ['cookie'] }],
+		[{ name: 'pdp', headers: ['x-harper-renderer-bypass'] }],
+		[{ name: 'pdp', sample: { rate: 2 } }],
+		[{ name: 'pdp', fields: ['ip'] }],
+	]) {
+		const res = await samplerSet(value);
+		assert.equal(res.status, 409, JSON.stringify(value));
+		const body = await res.json();
+		assert.equal(body.rejected[0].path, 'sampling.samplers');
+		assert.match(body.rejected[0].reason, /the compiler would drop 1 of these entries/);
+	}
+	assert.equal(overrideRows.size, 0);
+});
+
+test('two samplers sharing a name are refused: the name is the key their records are stored under', async () => {
+	const res = await samplerSet([{ name: 'pdp' }, { name: 'pdp', sample: { rate: 0.5 } }]);
+	assert.equal(res.status, 409);
+	const body = await res.json();
+	assert.match(body.rejected[0].reason, /sampler names must be unique: 'pdp' repeated/);
+	assert.equal(overrideRows.size, 0);
+});
+
+test('a valid sampler list previews as a live change and applies', async () => {
+	const value = [
+		{
+			name: 'revisit-pdp',
+			match: { routes: ['/catalog/'], bots: ['Googlebot', 'Bingbot'] },
+			sample: { by: 'url', rate: 0.01, salt: 'revisit-1' },
+			fields: ['url', 'bot', 'device', 'status', 'cacheStatus', 'conditional', 'sitemap'],
+			headers: ['user-agent'],
+		},
+	];
+	const preview = await (await samplerSet(value, true)).json();
+	assert.deepEqual(preview.rejected, []);
+	assert.equal(preview.changes[0].path, 'sampling.samplers');
+	assert.equal(preview.changes[0].willTakeEffect, true);
+
+	const res = await samplerSet(value);
+	assert.equal(res.status, 200);
+	assert.deepEqual(overrideRows.get('sampling.samplers').value, value);
+});
+
+test('GET sampling shows the compiled samplers and the invalid ones; GET samples needs a sampler name', async () => {
+	applyOptions(
+		{
+			...file(),
+			sampling: {
+				enabled: true,
+				samplers: [
+					{ name: 'ok', match: { routes: ['/catalog/'] } },
+					{ name: 'bad', x: 1 },
+				],
+			},
+		},
+		{}
+	);
+	const params = (query) => ({ get: (key) => query[key] });
+	const view = await (await PrerenderAdmin.samplingView(params({}))).json();
+	assert.equal(view.enabled, true);
+	assert.deepEqual(
+		view.worker.samplers.map((s) => s.name),
+		[]
+	); // this test never starts the worker's sampling: the view reports what the worker runs, not the config
+	assert.equal(view.invalid.length, 1);
+	assert.match(view.invalid[0], /sampler 'bad' dropped/);
+	assert.deepEqual(Object.keys(view.stored.bySampler).sort(), ['bad', 'ok']);
+
+	assert.equal((await PrerenderAdmin.samples(params({}))).status, 400);
+	assert.equal((await PrerenderAdmin.samples(params({ sampler: 'a/b' }))).status, 400);
+	assert.equal((await PrerenderAdmin.samples(params({ sampler: 'ok', format: 'csv' }))).status, 400);
+	const empty = await PrerenderAdmin.samples(params({ sampler: 'ok', format: 'gzip' }));
+	assert.equal(empty.status, 200);
+	assert.equal(empty.headers.get('content-type'), 'application/gzip');
+	assert.equal(empty.headers.get('x-sampling-chunks'), '0');
+	assert.equal(empty.headers.get('x-sampling-next'), null);
+});

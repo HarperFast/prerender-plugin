@@ -51,6 +51,10 @@
  *   POST /prerender_admin/sitemap    { url, offset, limit } detail  super_user
  *   POST /prerender_admin/sitemap-refresh { url? }                  super_user
  *   POST /prerender_admin/config-override { set?, clear?, dryRun? } super_user
+ *   GET  /prerender_admin/sampling   ?since — samplers, this worker's super_user
+ *                                    counters, this node's stored totals
+ *   GET  /prerender_admin/samples    ?sampler&since&until&after&     super_user
+ *                                    limit&format=ndjson|gzip — this node's records
  *
  * QUERY-COST RULES for every route here (this console shares the server with bot traffic):
  *   - Nothing walks `RenderSchedule` on page load. The queue counts come from the queue keeper's
@@ -87,6 +91,8 @@ import {
 } from '../config.js';
 import { describeConfigSchema, secretPaths } from '../configSchema.js';
 import { describeMetrics } from '../metrics.js';
+import { chunkBytes, sampleChunks, samplingWorkerState, storedSampleTotals } from '../util/sampling.js';
+import { duplicateSamplerNames, inspectSamplers, isSamplerName } from '../util/samplingSpec.js';
 import { redactConfig, describeSecret } from '../util/redact.js';
 import { explainCacheKey } from '../util/explain.js';
 import { entitiesOn, entityOf, readEntity } from '../util/entity.js';
@@ -353,6 +359,19 @@ const YIELD_EVERY = 200;
  * on a high-traffic server, refusing an operator beats delaying a crawler.
  */
 const MAX_CONCURRENT_HEAVY = 2;
+
+// A `samples` response stops at this many bytes (gzip or NDJSON, whichever was asked for) and hands back
+// `x-sampling-next` to continue from: the admin worker also serves bot traffic, and one response holds its
+// whole body in memory.
+const MAX_SAMPLE_RESPONSE_BYTES = 32 * 1024 * 1024;
+const MAX_SAMPLE_CHUNKS = 5000;
+
+/** A time query parameter: epoch ms or anything `Date.parse` reads; `fallback` when absent, NaN when unreadable. */
+const timeParam = (value, fallback) => {
+	if (value === undefined || value === null || value === '') return fallback;
+	const text = String(value);
+	return /^\d+$/.test(text) ? Number(text) : Date.parse(text);
+};
 let heavyInFlight = 0;
 
 async function withHeavySlot(fn) {
@@ -515,6 +534,10 @@ export class PrerenderAdmin extends Resource {
 			case 'sweep-orphan-pages':
 				// Same shape as discovery-purge: this node's live pass, or its last finished one.
 				return json({ node: server.hostname, ...(await getPageOrphanSweepState()) });
+			case 'sampling':
+				return PrerenderAdmin.samplingView(target);
+			case 'samples':
+				return PrerenderAdmin.samples(target);
 			default:
 				return json({ error: `Unknown route: ${route}` }, 404);
 		}
@@ -830,8 +853,23 @@ export class PrerenderAdmin extends Resource {
 					? (list) => inspectRoutes(list, [])
 					: entry.path === 'changeProbe.rules'
 						? inspectProbeRules
-						: null;
+						: entry.path === 'sampling.samplers'
+							? (list) => inspectSamplers(list, { deniedHeaders: [resolved.config.origin.securityToken.header] })
+							: null;
 			if (!inspect) continue;
+			// A sampler's name is the key its records are stored under, so a second entry with a name already
+			// taken is dropped — a drop no per-entry check can see, refused here on its own.
+			if (entry.path === 'sampling.samplers') {
+				const duplicates = duplicateSamplerNames(entry.value);
+				if (duplicates.length) {
+					rejected.push({
+						path: entry.path,
+						requested: entry.value,
+						reason: `sampler names must be unique: ${duplicates.map((name) => `'${name}'`).join(', ')} repeated`,
+					});
+					continue;
+				}
+			}
 			const fresh = newlyDropped(inspect, entry.value, valueAt(config, entry.path));
 			if (!fresh.length) continue;
 			rejected.push({
@@ -2351,5 +2389,109 @@ export class PrerenderAdmin extends Resource {
 				'content-disposition': 'inline',
 			}),
 		});
+	}
+
+	/**
+	 * Request sampling (util/sampling.js) as THIS node and THIS worker see it: the samplers as compiled
+	 * (an invalid entry is listed under `invalid`, not under `samplers`), this worker's counters, and this
+	 * node's stored totals per sampler since `since` (default an hour ago). Counters are per worker and rows
+	 * are per node, so a cluster view asks every node; the stored totals cover all of a node's workers.
+	 */
+	static samplingView(target) {
+		return withHeavySlot(() => this.samplingViewInner(target));
+	}
+
+	static async samplingViewInner(target) {
+		const now = Date.now();
+		const sinceMs = timeParam(target?.get?.('since'), now - 60 * 60 * 1000);
+		if (!Number.isFinite(sinceMs)) return json({ error: 'since must be epoch ms or a date' }, 400);
+		const extra = target?.get?.('sampler');
+		if (extra !== undefined && extra !== null && extra !== '' && !isSamplerName(extra)) {
+			return json({ error: 'sampler must be a sampler name' }, 400);
+		}
+		const configured = Array.isArray(config.sampling.samplers) ? config.sampling.samplers : [];
+		const names = [
+			...new Set([...configured.map((entry) => entry?.name).filter(isSamplerName), ...(extra ? [extra] : [])]),
+		];
+		const inspected = inspectSamplers(configured, { deniedHeaders: [config.origin.securityToken.header] });
+		return json({
+			node: server.hostname,
+			enabled: config.sampling.enabled,
+			flushInterval: config.sampling.flushInterval,
+			ringSize: config.sampling.ringSize,
+			invalid: inspected.warnings,
+			worker: samplingWorkerState(),
+			stored: {
+				since: new Date(sinceMs).toISOString(),
+				bySampler: await storedSampleTotals({ names, sinceMs }),
+			},
+		});
+	}
+
+	/**
+	 * THIS node's records for one sampler: the chunks whose first record falls in [since, until) — default
+	 * the last day — in time order, as NDJSON (`format=ndjson`, the default) or as the stored gzip members
+	 * concatenated (`format=gzip`, nothing decompressed here; `gunzip` reads it as one stream). A chunk
+	 * spans at most one flush interval, so ask from one interval earlier than the first record wanted and
+	 * filter on `ts`.
+	 *
+	 * At most `limit` chunks (default 500, max 5000) and 32 MB per response; when more remain the response
+	 * carries `x-sampling-next`, to pass back as `after`.
+	 */
+	static samples(target) {
+		return withHeavySlot(() => this.samplesInner(target));
+	}
+
+	static async samplesInner(target) {
+		const sampler = target?.get?.('sampler');
+		if (!isSamplerName(sampler)) return json({ error: 'sampler is required: a sampler name' }, 400);
+		const now = Date.now();
+		const sinceMs = timeParam(target?.get?.('since'), now - 24 * 60 * 60 * 1000);
+		const untilMs = timeParam(target?.get?.('until'), Infinity);
+		if (Number.isNaN(sinceMs) || Number.isNaN(untilMs)) {
+			return json({ error: 'since and until must be epoch ms or dates' }, 400);
+		}
+		const format = target?.get?.('format') || 'ndjson';
+		if (format !== 'ndjson' && format !== 'gzip') return json({ error: 'format must be ndjson or gzip' }, 400);
+		const after = target?.get?.('after') || null;
+		const limit = Math.min(Math.max(1, Math.floor(Number(target?.get?.('limit')) || 500)), MAX_SAMPLE_CHUNKS);
+
+		const parts = [];
+		let bytes = 0;
+		let chunks = 0;
+		let records = 0;
+		let unreadable = 0;
+		let last = null;
+		let next = null;
+		for await (const row of sampleChunks({ sampler, sinceMs, untilMs, after, select: ['count', 'body'] })) {
+			if (chunks === limit || bytes >= MAX_SAMPLE_RESPONSE_BYTES) {
+				next = last;
+				break;
+			}
+			last = row.id;
+			chunks++;
+			try {
+				const data = await chunkBytes(row, { decode: format === 'ndjson' });
+				if (data) {
+					parts.push(data);
+					bytes += data.length;
+					records += Number(row.count) || 0;
+				}
+			} catch {
+				unreadable++;
+			}
+			if (chunks % 64 === 0) await yieldNow();
+		}
+
+		const headers = noStore({
+			'content-type': format === 'gzip' ? 'application/gzip' : 'application/x-ndjson; charset=utf-8',
+			'x-content-type-options': 'nosniff',
+			'x-sampling-node': server.hostname,
+			'x-sampling-chunks': String(chunks),
+			'x-sampling-records': String(records),
+			'x-sampling-unreadable': String(unreadable),
+		});
+		if (next) headers['x-sampling-next'] = next;
+		return new Response(Buffer.concat(parts), { status: 200, headers });
 	}
 }

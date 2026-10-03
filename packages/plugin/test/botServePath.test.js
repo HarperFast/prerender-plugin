@@ -162,27 +162,41 @@ before(async () => {
 			},
 		},
 		crawl_stats: { CrawlSketch: class {}, VisitFilter: class {} },
-	};
-	let applyOptions;
-	({ applyOptions, config } = await import('../src/config.js'));
-	applyOptions({
-		ingress: {
-			mode: 'forwarded',
-			deviceTypeSource: 'path',
-			routes: [
-				{ match: 'prefix', path: '/p/', mode: 'prerender', queryParams: [] },
-				{ match: 'prefix', path: '/raw/', mode: 'prerender', queryParams: [], rawCache: true },
-				{ match: 'prefix', path: '/neg/', mode: 'prerender', queryParams: [], negativeCache: true },
-			],
+		sampling: {
+			SampleChunk: {
+				put: async (id, data) => {
+					sampleRows.push({ id, ...data });
+				},
+			},
 		},
-		analytics: { enabled: false },
-		invalidation: { enabled: false },
-		render: { raw: { enabled: true }, negative: { enabled: true, dryRun: false } },
-		peerRescue: { enabled: true, token: 'cluster-secret' },
-	});
+	};
+	({ applyOptions, config } = await import('../src/config.js'));
+	applyOptions(BASE_OPTIONS);
 	({ handleBotRequest } = await import('../src/http_handlers/bot_request.js'));
 	({ getResidencyByUrl } = await import('../src/util/residency.js'));
+	sampling = await import('../src/util/sampling.js');
+	sampling.startRequestSampling();
 });
+
+let applyOptions;
+let sampling;
+const sampleRows = [];
+
+const BASE_OPTIONS = {
+	ingress: {
+		mode: 'forwarded',
+		deviceTypeSource: 'path',
+		routes: [
+			{ match: 'prefix', path: '/p/', mode: 'prerender', queryParams: [] },
+			{ match: 'prefix', path: '/raw/', mode: 'prerender', queryParams: [], rawCache: true },
+			{ match: 'prefix', path: '/neg/', mode: 'prerender', queryParams: [], negativeCache: true },
+		],
+	},
+	analytics: { enabled: false },
+	invalidation: { enabled: false },
+	render: { raw: { enabled: true }, negative: { enabled: true, dryRun: false } },
+	peerRescue: { enabled: true, token: 'cluster-secret' },
+};
 
 after(() => {
 	origin.server.closeAllConnections?.();
@@ -628,4 +642,53 @@ test('a local 304 on a GET drains the body so the pooled origin connection is RE
 		origin.connections - before <= 1,
 		`five local 304s must reuse one connection, not open five (opened ${origin.connections - before})`
 	);
+});
+
+// ── request sampling ─────────────────────────────────────────────────────────────────────────────
+
+test('a sampler records the status the crawler was SENT: an origin 200 answered locally as a 304', async () => {
+	applyOptions({
+		...BASE_OPTIONS,
+		sampling: {
+			enabled: true,
+			samplers: [
+				{
+					name: 'pdp',
+					match: { routes: ['/p/'], bots: ['Bingbot'] },
+					sample: { rate: 1 },
+					fields: ['url', 'route', 'bot', 'device', 'status', 'cacheStatus', 'source', 'conditional', 'ageMs'],
+				},
+			],
+		},
+	});
+	try {
+		sampleRows.length = 0;
+		// The origin answers 200 with this ETag, and the crawler's If-None-Match matches it, so the handler
+		// sends a 304 — the status the sampler must record, not the origin's 200.
+		const res = await handleBotRequest(request('/desktop/p/big-sampled', 'GET', { 'if-none-match': '"origin-v1"' }));
+		assert.equal(res.status, 304);
+		await settle();
+		await sampling.flushSamples();
+		assert.equal(sampleRows.length, 1);
+		const [record] = gunzipSync(sampleRows[0].body)
+			.toString()
+			.trim()
+			.split('\n')
+			.map((line) => JSON.parse(line));
+		const { ts, ...rest } = record;
+		assert.ok(ts > 0);
+		assert.deepEqual(rest, {
+			url: `http://127.0.0.1:${origin.port}/p/big-sampled`,
+			route: '/p/',
+			bot: 'Bingbot',
+			device: 'desktop',
+			status: 304,
+			cacheStatus: 'miss',
+			source: 'origin',
+			conditional: true,
+			ageMs: null,
+		});
+	} finally {
+		applyOptions(BASE_OPTIONS);
+	}
 });

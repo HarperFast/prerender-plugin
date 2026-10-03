@@ -48,6 +48,8 @@ import { DepartureAction, prerenderRouteCount } from './util/routeClass.js';
 // NOT cyclic, on purpose: changeProbeSpec.js is the probe's pure half and imports nothing of the
 // runtime, precisely so this module can compile prospective rules inside collectConfigWarnings.
 import { inspectProbeRules } from './util/changeProbeSpec.js';
+// Same reason: samplingSpec.js is the samplers' pure half.
+import { compileSamplers, inspectSamplers } from './util/samplingSpec.js';
 
 // Returns the Harper logger when running inside Harper, otherwise the console.
 // Unit tests run outside Harper where `logger` is undefined.
@@ -1000,6 +1002,48 @@ export const collectConfigWarnings = (target = config, { prerenderRoutes } = {})
 				'a changeProbe rule sets invalidateScope but invalidation.enabled is false — a canary trip ' +
 					'will refuse to record the bulk invalidation and pre-change snapshots will keep serving'
 			);
+		}
+	}
+
+	if (target.sampling.enabled) {
+		const deniedHeaders = [target.origin.securityToken.header];
+		const samplers = inspectSamplers(target.sampling.samplers, { deniedHeaders });
+		if (samplers.dropped > 0) {
+			add(
+				'warn',
+				'sampling.samplers',
+				`${samplers.dropped} of ${samplers.total} sampler(s) dropped as invalid and recording nothing: ` +
+					samplers.warnings.join('; ')
+			);
+		}
+		if (samplers.enabled === 0) {
+			add(
+				'warn',
+				'sampling.enabled',
+				'sampling.enabled with no enabled, valid sampler — nothing is recorded; add sampling.samplers'
+			);
+		}
+		// A route a sampler names that no route has is a sampler that matches nothing, which looks exactly
+		// like a sampler whose route gets no traffic. Judged against the configured route paths and the
+		// route classes, the two things a request's route label can be.
+		const known = new Set([
+			'prerender',
+			'passthrough',
+			'unclassified',
+			'unrouted',
+			...(Array.isArray(target.ingress.routes) ? target.ingress.routes.map((route) => route?.path) : []),
+			...(Array.isArray(target.ingress.excludePathPatterns) ? target.ingress.excludePathPatterns : []),
+		]);
+		for (const sampler of compileSamplers(target.sampling.samplers, [], { deniedHeaders })) {
+			const unknown = sampler.routes ? [...sampler.routes].filter((route) => !known.has(route)) : [];
+			if (unknown.length) {
+				add(
+					'warn',
+					'sampling.samplers',
+					`sampler '${sampler.name}' names route(s) no route has, which it will never match: ` +
+						`${unknown.map((route) => `'${route}'`).join(', ')} — use a route's \`path\` or a route class`
+				);
+			}
 		}
 	}
 
