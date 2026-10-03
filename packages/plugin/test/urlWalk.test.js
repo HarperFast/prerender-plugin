@@ -12,6 +12,15 @@ import { recoverKeylessKeys, walkUrlRange } from '../src/util/urlWalk.js';
 
 const U = (n) => `https://example.com/product/prd-${String(n).padStart(4, '0')}/`;
 
+/** The walk's key conditions as [lower, upper?]: a `gtlt` range is `> value[0]` and `< value[1]`. */
+const bounds = (conditions) =>
+	conditions[0].comparator === 'gtlt'
+		? [
+				{ comparator: 'greater_than', value: conditions[0].value[0] },
+				{ comparator: 'less_than', value: conditions[0].value[1] },
+			]
+		: [conditions[0], conditions[1]];
+
 /** A table whose search answers from a scripted, ordered row list. `aborts` is a set of urls the
  *  PROJECTED read path silently stops in front of (the select-abort personality); rows with
  *  `url: undefined` model the tolerant personality. */
@@ -19,7 +28,7 @@ const fakeTable = (rows, { abortsBefore = new Set() } = {}) => ({
 	calls: [],
 	search({ conditions, sort, select, limit }) {
 		this.calls.push({ conditions, select, limit, descending: !!sort?.descending });
-		const [range, upper] = [conditions[0], conditions[1]];
+		const [range, upper] = bounds(conditions);
 		let view = rows.filter((r) => {
 			const key = r.key;
 			if (range.comparator === 'greater_than' ? key <= range.value : key < range.value) return false;
@@ -103,10 +112,9 @@ test('descending end-check catches the fully-blind store: probe empty, top shows
 	const table = {
 		...fakeTable(rows, { abortsBefore: new Set([U(2)]) }),
 		search({ conditions, sort, limit }) {
-			const upper = conditions[1];
+			const [lower, upper] = bounds(conditions);
 			let view = rows.filter((r) => {
-				if (conditions[0].comparator === 'greater_than' ? r.key <= conditions[0].value : r.key < conditions[0].value)
-					return false;
+				if (lower.comparator === 'greater_than' ? r.key <= lower.value : r.key < lower.value) return false;
 				if (upper && r.key >= upper.value) return false;
 				return true;
 			});
@@ -126,6 +134,26 @@ test('descending end-check catches the fully-blind store: probe empty, top shows
 		collect(walkUrlRange(table, { startAt: '', select: ['url'], chunkSize: 10 })),
 		/NOT fully covered/
 	);
+});
+
+test('the bounded probe is ONE gtlt range, never a pair of conditions the planner may reorder', async () => {
+	// Harper 5.3 orders separate conditions by a storage-level estimate; a `less_than endBound` that
+	// estimates narrower would lead and walk every row below the bound to find one row past the cursor.
+	const inside = row('https://example.com/catalog.jsp?CN=a');
+	const outsidePoison = row('https://example.com/product/prd-0001/', false);
+	const table = fakeTable([inside, outsidePoison], { abortsBefore: new Set([outsidePoison.key]) });
+	const endBound = 'https://example.com/catalog.jsq';
+	const urls = await collect(
+		walkUrlRange(table, { startAt: 'https://example.com/catalog.jsp', select: ['url'], chunkSize: 10, endBound })
+	);
+	assert.deepEqual(urls, [inside.key]);
+	const probes = table.calls.filter((call) => !call.select);
+	assert.ok(probes.length > 0, 'the short chunk was verified by a probe');
+	for (const probe of probes) {
+		assert.equal(probe.conditions.length, 1);
+		assert.equal(probe.conditions[0].comparator, 'gtlt');
+		assert.equal(probe.conditions[0].value[1], endBound);
+	}
 });
 
 test('endBound keeps the probes inside the range: a next-region poison row cannot false-alarm the walk', async () => {
@@ -203,7 +231,7 @@ test('ambiguous url-less probe row with endBound: the descending probe decides, 
 });
 
 test('bounded probe shape unsupported: ascending falls back to an unbounded probe filtered in code', async () => {
-	// The store refuses two-condition searches AND its projected reads stop at the region
+	// The store refuses the bounded `gtlt` probe AND its projected reads stop at the region
 	// boundary, so the short chunk needs verifying. The range is genuinely finished (the only row
 	// past the cursor is beyond endBound and readable) — the fallback must prove that instead of
 	// erroring or lying.
@@ -213,7 +241,7 @@ test('bounded probe shape unsupported: ascending falls back to an unbounded prob
 	const base = fakeTable(rows, { abortsBefore: new Set([outside.key]) });
 	const table = {
 		search(q) {
-			if (q.conditions.length > 1) throw new Error('two-condition search unsupported');
+			if (q.conditions.some((c) => c.comparator === 'gtlt')) throw new Error('bounded range search unsupported');
 			return base.search.call(base, q);
 		},
 	};
