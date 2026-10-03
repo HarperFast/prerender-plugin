@@ -27,11 +27,14 @@
  * tables (the default), `cacheKey` for `PrerenderedPage`. The unreadable-row rules are the same for
  * any string key — a row whose key attribute did not decode is skipped and counted, never a cursor.
  * `endBound` (exclusive) keeps the verification probes inside the caller's range so a row from
- * the next keyspace region can neither resume nor fail a prefix-scoped walk. The bounded probe
- * shape (two conditions on the key) falls back to an unbounded probe filtered in code when the
- * store rejects it. Residual (documented, not fixable from this layer): a range whose LAST key is
- * itself unreadable can still end a walk early when every probe path aborts on it; escalate such
- * rows to the database layer.
+ * the next keyspace region can neither resume nor fail a prefix-scoped walk. The bounded probe is
+ * ONE `gtlt` condition on the key, not a `greater_than` + `less_than` pair: Harper 5.3's planner
+ * orders separate conditions by a storage-level size estimate, and when `< endBound` estimates
+ * narrower it leads, so finding the one row past the cursor can walk every row below the bound. One
+ * exclusive range is a single bounded read on 5.2 and 5.3 alike. It falls back to an unbounded
+ * probe filtered in code when the store rejects it. Residual (documented, not fixable from this
+ * layer): a range whose LAST key is itself unreadable can still end a walk early when every probe
+ * path aborts on it; escalate such rows to the database layer.
  *
  * `searchOptions` is passed as the second argument of every search the walk makes, so a caller on a
  * residency-pinned table can keep every read local (`{ replicateFrom: false }`).
@@ -85,12 +88,14 @@ export async function* walkUrlRange(
 	 * treat that as unknown, never as empty.
 	 */
 	const probeSearch = async (descending) => {
-		const range = [{ attribute: key, comparator: 'greater_than', value: cursor ?? '' }];
-		const bounded = endBound ? [...range, { attribute: key, comparator: 'less_than', value: endBound }] : range;
+		const after = cursor ?? '';
+		const range = [{ attribute: key, comparator: 'greater_than', value: after }];
+		// One exclusive range (`> after` and `< endBound`), never two conditions the planner may reorder.
+		const bounded = endBound ? [{ attribute: key, comparator: 'gtlt', value: [after, endBound] }] : range;
 		try {
 			return await search(bounded, descending, 1);
 		} catch {
-			// The two-condition shape is refused here. Ascending degrades cleanly: probe unbounded
+			// The bounded shape is refused here. Ascending degrades cleanly: probe unbounded
 			// and apply the bound in code — a READABLE first row at or past endBound is proof the
 			// range itself is clear. Descending cannot degrade (the table's top row says nothing
 			// about this range), so it reports unknown.
