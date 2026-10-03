@@ -29,10 +29,13 @@
  * at a file of its own only through each node's root config, and which prefixes every line. Every
  * `flushInterval`, or as soon as the ring is half full, the worker swaps in its spare slot array (O(1), so
  * the requests that follow land in an empty ring) and writes what it took, in slices that yield to the
- * event loop: one gzip member per slice, appended to `<directory>/<sampler>/<YYYY-MM-DD>.w<worker>.ndjson.gz`.
- * Concatenated members are one gzip stream, so a day's file reads with `gunzip`. A worker owns its files
- * and serializes its own appends, so lines never interleave. Worker 0 deletes files older than
- * `sampling.keepDays` every hour.
+ * event loop: one gzip member per slice, appended to
+ * `<directory>/<sampler>/<YYYY-MM-DD>.w<worker>.t<thread>.ndjson.gz`. Concatenated members are one gzip
+ * stream, so a day's file reads with `gunzip`. A worker thread owns its files — the thread id is in the
+ * name because Harper's overlapping restart briefly runs two threads with one worker index — and
+ * serializes its own appends, so lines never interleave; an append that fails is rolled back to the
+ * file's size before it, so a partial member is never followed by another. Worker 0 deletes files older
+ * than `sampling.keepDays` every hour.
  *
  * COMPLETENESS IS IN THE STREAM. A pick not recorded — over `maxPerMinute` (capped), with the ring full
  * (dropped), or in an append that failed (lost) — is counted, and the counts are appended as a line
@@ -46,9 +49,10 @@
  * the fields it was recording.
  */
 
-import { appendFile, mkdir, readdir, readFile, stat, unlink } from 'node:fs/promises';
+import { mkdir, open, readdir, readFile, stat, unlink } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { setImmediate as yieldNow } from 'node:timers/promises';
+import { threadId } from 'node:worker_threads';
 import { promisify } from 'node:util';
 import { constants as zlibConstants, gunzip as gunzipCallback, gzip as gzipCallback } from 'node:zlib';
 import { config, getLogger, onConfigApplied } from '../config.js';
@@ -70,9 +74,10 @@ const DAY_MS = 86_400_000;
 // Under Harper's root unless `sampling.directory` says otherwise: persistent, and outside the component
 // directory a deploy replaces.
 const DEFAULT_DIRECTORY = 'prerender-sampling';
-// `<YYYY-MM-DD>.w<worker>.ndjson.gz`. Anything else in a sampler's directory is never read or deleted.
-const FILE_RE = /^(\d{4}-\d{2}-\d{2})\.w(\d{3})\.ndjson\.gz$/;
-export const fileNameOf = (day, worker) => `${day}.w${String(worker).padStart(3, '0')}.ndjson.gz`;
+// `<YYYY-MM-DD>.w<worker>.t<thread>.ndjson.gz`. Anything else in a sampler's directory is never read or deleted.
+const FILE_RE = /^(\d{4}-\d{2}-\d{2})\.w(\d{3})\.t(\d+)\.ndjson\.gz$/;
+export const fileNameOf = (day, worker, thread = threadId) =>
+	`${day}.w${String(worker).padStart(3, '0')}.t${thread}.ndjson.gz`;
 
 // Bounds the (route, bot) memo. Route entries are a configured handful; bot names are bounded by the
 // registry, plus whatever names `deriveUnknownBots` mints — which is why there is a cap at all. Past it a
@@ -102,7 +107,6 @@ let lastErrorLogMs = -Infinity;
 // This worker's appends, one at a time: two flushes in flight (the timer and a half-full ring) never
 // write the same file at once.
 let appendQueue = Promise.resolve();
-const madeDirs = new Set();
 
 // `spare` is the second slot array a flush swaps in, kept for the flush after; null while a flush is
 // still working through it.
@@ -404,8 +408,27 @@ const resolveTargets = async (records, urls) => {
 	}
 };
 
+/**
+ * Append `bytes` whole or not at all. A write can land short (a full disk, an I/O error mid-way), and a
+ * partial gzip member followed by the next append would make every member after it unreadable; so a
+ * failed append truncates the file back to the size it had before.
+ */
+const appendWhole = async (path, bytes) => {
+	const handle = await open(path, 'a');
+	let size = -1;
+	try {
+		size = (await handle.stat()).size;
+		await handle.appendFile(bytes);
+	} catch (e) {
+		if (size >= 0) await handle.truncate(size).catch(() => {});
+		throw e;
+	} finally {
+		await handle.close();
+	}
+};
+
 const appendSerially = (path, bytes) => {
-	const run = appendQueue.then(() => appendFile(path, bytes));
+	const run = appendQueue.then(() => appendWhole(path, bytes));
 	appendQueue = run.catch(() => {});
 	return run;
 };
@@ -434,11 +457,10 @@ const writeGroup = async (dir, group, worker, now) => {
 			members.push(await gzip(Buffer.from(`${JSON.stringify({ ts: now, counters: group.counters })}\n`)));
 		}
 		const bytes = members.length === 1 ? members[0] : Buffer.concat(members);
+		// Every time, not cached: an operator who deletes a sampler's folder (to start a study afresh) must not
+		// stop its appends until the worker restarts. One syscall per sampler per flush.
 		const folder = join(dir, group.name);
-		if (!madeDirs.has(folder)) {
-			await mkdir(folder, { recursive: true });
-			madeDirs.add(folder);
-		}
+		await mkdir(folder, { recursive: true });
 		await appendSerially(join(folder, fileNameOf(group.day, worker)), bytes);
 		stats.written += count;
 		stats.appends++;
@@ -666,7 +688,7 @@ export const samplingWorkerState = () => ({
 	),
 });
 
-/** This node's files for one sampler, in name order (day, then worker). */
+/** This node's files for one sampler, in name order (day, then worker), with size and modification time. */
 export async function listSampleFiles(sampler) {
 	const dir = sampleDirectory();
 	if (!dir || !isSamplerName(sampler)) return [];
@@ -677,10 +699,17 @@ export async function listSampleFiles(sampler) {
 		if (e.code === 'ENOENT') return [];
 		throw e;
 	}
-	return names
-		.filter((name) => FILE_RE.test(name))
-		.sort()
-		.map((name) => ({ name, day: name.slice(0, 10), path: join(dir, sampler, name) }));
+	const files = [];
+	for (const name of names.filter((one) => FILE_RE.test(one)).sort()) {
+		const path = join(dir, sampler, name);
+		try {
+			const { size, mtimeMs } = await stat(path);
+			files.push({ name, day: name.slice(0, 10), path, size, mtimeMs });
+		} catch {
+			// Deleted by the sweep between the listing and the stat.
+		}
+	}
+	return files;
 }
 
 /** Per sampler: this node's files, bytes, and first and last day. Reads directory entries, never files. */
@@ -688,14 +717,7 @@ export async function sampleFileSummary(names) {
 	const out = {};
 	for (const name of names) {
 		const files = await listSampleFiles(name);
-		let bytes = 0;
-		for (const file of files) {
-			try {
-				bytes += (await stat(file.path)).size;
-			} catch {
-				// Deleted by the sweep between the listing and the stat.
-			}
-		}
+		const bytes = files.reduce((sum, file) => sum + file.size, 0);
 		out[name] = {
 			files: files.length,
 			bytes,
@@ -707,19 +729,24 @@ export async function sampleFileSummary(names) {
 }
 
 /**
- * One file's bytes: as stored (gzip members), or decoded to NDJSON. A file another worker is appending to
- * right now can end mid-member, so decoding flushes what is complete and keeps whole lines only.
- * `maxOutputLength` bounds the decoded size (a RangeError past it).
+ * One file's bytes, as `format` asks:
+ *   ndjson  decoded. A file a worker is appending to right now can end mid-member, so decoding flushes
+ *           what is complete and keeps whole lines only. `maxOutputLength` bounds the decoded size (a
+ *           RangeError past it).
+ *   gzip    as stored.
+ *   whole   decoded to whole lines and gzipped again: one well-formed member, for a file that may be
+ *           mid-append, so that files after it in a concatenated download stay readable.
  */
-export async function readSampleFile(path, { decode = true, maxOutputLength } = {}) {
+export async function readSampleFile(path, { format = 'ndjson', maxOutputLength } = {}) {
 	const bytes = await readFile(path);
-	if (!decode) return bytes;
+	if (format === 'gzip') return bytes;
 	const text = await gunzip(bytes, {
 		finishFlush: zlibConstants.Z_SYNC_FLUSH,
 		...(maxOutputLength ? { maxOutputLength } : {}),
 	});
 	const end = text.lastIndexOf(10);
-	return end === -1 ? Buffer.alloc(0) : text.subarray(0, end + 1);
+	const lines = end === -1 ? Buffer.alloc(0) : text.subarray(0, end + 1);
+	return format === 'whole' ? gzip(lines) : lines;
 }
 
 /** Test seam: forget everything this worker holds. */
@@ -733,7 +760,6 @@ export const resetSamplingForTests = () => {
 	started = false;
 	flushQueued = false;
 	appendQueue = Promise.resolve();
-	madeDirs.clear();
 	ring.slots = [];
 	ring.spare = null;
 	ring.size = 0;

@@ -1587,9 +1587,10 @@ sampling:
       fields: [url, bot, device, status, cacheStatus, source, ageMs, conditional, sitemap, target]
 ```
 
-**Storage.** Files, the way Harper writes its logs: each worker appends to its own
-`<sampling.directory>/<sampler>/<YYYY-MM-DD>.w<worker>.ndjson.gz` (UTC day of the record), one gzip
-member per batch, and worker 0 deletes files older than `sampling.keepDays` (default 14) every hour. The
+**Storage.** Files, the way Harper writes its logs: each worker thread appends to its own
+`<sampling.directory>/<sampler>/<YYYY-MM-DD>.w<worker>.t<thread>.ndjson.gz` (UTC day of the record), one
+gzip member per 1,024 records, and worker 0 deletes files older than `sampling.keepDays` (default 14) every
+hour. An append that fails is rolled back, so a file is always whole members. The
 directory defaults to `prerender-sampling` under Harper's root; it must be persistent and outside the
 component directory, and it is set in the config file only. Read each node's files and merge them (a
 crawler's requests can land on any node):
@@ -1600,7 +1601,8 @@ curl -s -b "$SESSION" "https://<node>/prerender_admin/samples?sampler=visits-pro
 # more than `limit` files (200) or ~32 MB: repeat with &after=<the x-sampling-next response header>
 ```
 
-Or copy the files off the node: a day's file is a plain gzip stream.
+A file still being written is served as whole records only, in either format. Or copy the files off the
+node: a day's file is a plain gzip stream.
 
 Per (URL, bot, device), the gaps between consecutive visits give the revisit interval and how regular it
 is; visits per URL give popularity strata without any other source; `sitemap` splits listed from unlisted

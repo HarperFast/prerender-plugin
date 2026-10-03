@@ -168,7 +168,7 @@ test('a matching request becomes one record in the sampler’s file for the day,
 	const { files, records } = await sampling.flushSamples();
 	assert.equal(files, 1);
 	assert.equal(records, 1);
-	assert.deepEqual(filesOf('pdp'), [`${today()}.w003.ndjson.gz`]);
+	assert.deepEqual(filesOf('pdp'), [`${today()}.w003.t0.ndjson.gz`]);
 	const [record] = recordsOf('pdp');
 	assert.ok(record.ts >= before);
 	assert.ok(record.ageMs >= 5_000 && record.ageMs < 6_000);
@@ -483,7 +483,7 @@ test('records land in the file of their own UTC day', async () => {
 		Date.now = realNow;
 	}
 	await sampling.flushSamples();
-	assert.deepEqual(filesOf('days'), ['2026-10-02.w003.ndjson.gz', '2026-10-03.w003.ndjson.gz']);
+	assert.deepEqual(filesOf('days'), ['2026-10-02.w003.t0.ndjson.gz', '2026-10-03.w003.t0.ndjson.gz']);
 });
 
 test('the retention sweep deletes files older than keepDays in every sampler directory, and nothing else', async () => {
@@ -493,14 +493,20 @@ test('the retention sweep deletes files older than keepDays in every sampler dir
 		mkdirSync(join(dir, name), { recursive: true });
 		writeFileSync(join(dir, name, file), gzipSync('{}\n'));
 	};
-	write('kept', '2026-10-01.w000.ndjson.gz');
-	write('kept', '2026-10-13.w000.ndjson.gz');
-	write('kept', '2026-10-20.w001.ndjson.gz');
-	write('removed-sampler', '2026-09-01.w000.ndjson.gz');
+	write('kept', '2026-10-01.w000.t7.ndjson.gz');
+	write('kept', '2026-10-13.w000.t7.ndjson.gz');
+	write('kept', '2026-10-20.w001.t8.ndjson.gz');
+	write('removed-sampler', '2026-09-01.w000.t7.ndjson.gz');
 	write('kept', 'notes.txt');
+	write('kept', '2026-09-01.w000.ndjson.gz'); // not this module's name shape: never touched
 	const { deleted } = await sampling.sweepSampleFiles(now);
 	assert.equal(deleted, 2);
-	assert.deepEqual(filesOf('kept'), ['2026-10-13.w000.ndjson.gz', '2026-10-20.w001.ndjson.gz', 'notes.txt']);
+	assert.deepEqual(filesOf('kept'), [
+		'2026-09-01.w000.ndjson.gz',
+		'2026-10-13.w000.t7.ndjson.gz',
+		'2026-10-20.w001.t8.ndjson.gz',
+		'notes.txt',
+	]);
 	assert.deepEqual(filesOf('removed-sampler'), []);
 });
 
@@ -513,8 +519,27 @@ test('reading a file: members decode as one stream, a member being written keeps
 	const text = (await sampling.readSampleFile(path)).toString();
 	assert.ok(text.startsWith('{"a":1}\n{"a":2}\n{"a":3}\n'));
 	assert.ok(text.endsWith('\n'));
-	assert.deepEqual(await sampling.readSampleFile(path, { decode: false }), readFileSync(path));
+	assert.deepEqual(await sampling.readSampleFile(path, { format: 'gzip' }), readFileSync(path));
 	await assert.rejects(sampling.readSampleFile(path, { maxOutputLength: 8 }), RangeError);
+	// `whole`: one well-formed member of the complete lines, so a file after it in one stream stays readable.
+	const whole = await sampling.readSampleFile(path, { format: 'whole' });
+	const joined = gunzipSync(Buffer.concat([whole, gzipSync('{"a":9}\n')])).toString();
+	assert.equal(joined, `${text}{"a":9}\n`);
+});
+
+test('a sampler folder deleted between flushes is created again', async () => {
+	enable([{ name: 'gone', sample: { rate: 1 }, fields: ['url'] }]);
+	serve(urlOf(1));
+	await sampling.flushSamples();
+	rmSync(join(dir, 'gone'), { recursive: true, force: true });
+	serve(urlOf(2));
+	const { files } = await sampling.flushSamples();
+	assert.equal(files, 1);
+	assert.deepEqual(
+		recordsOf('gone').map((r) => r.url),
+		[urlOf(2)]
+	);
+	assert.equal(sampling.samplingWorkerState().counters.gone.lost, 0);
 });
 
 test('the ring follows ringSize live, writing what the old ring held', async () => {
@@ -535,8 +560,9 @@ test('listSampleFiles and the summary read only this sampler’s well-formed fil
 	const files = await sampling.listSampleFiles('list');
 	assert.deepEqual(
 		files.map((f) => f.name),
-		[`${today()}.w003.ndjson.gz`]
+		[`${today()}.w003.t0.ndjson.gz`]
 	);
+	assert.ok(files[0].size > 0 && files[0].mtimeMs > 0);
 	assert.deepEqual(await sampling.listSampleFiles('../list'), [], 'not a sampler name');
 	const summary = await sampling.sampleFileSummary(['list', 'none']);
 	assert.equal(summary.list.files, 1);

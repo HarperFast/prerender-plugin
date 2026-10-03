@@ -274,14 +274,14 @@ const routeOf = (target) => {
  * compiled on its own (neither compiler's verdict on an entry depends on its neighbours), and matched
  * by canonical value, as a multiset so a duplicated bad entry is not excused by one already running.
  */
-const newlyDropped = (inspect, requested, current) => {
-	const droppedIn = (list) => (Array.isArray(list) ? list : []).filter((one) => inspect([one]).dropped > 0);
+const newlyDropped = (inspect, requested, current, inspectCurrent = inspect) => {
+	const droppedIn = (list, by) => (Array.isArray(list) ? list : []).filter((one) => by([one]).dropped > 0);
 	const running = new Map();
-	for (const one of droppedIn(current)) {
+	for (const one of droppedIn(current, inspectCurrent)) {
 		const key = hashConfigValue(one);
 		running.set(key, (running.get(key) ?? 0) + 1);
 	}
-	return droppedIn(requested).filter((one) => {
+	return droppedIn(requested, inspect).filter((one) => {
 		const key = hashConfigValue(one);
 		const left = running.get(key) ?? 0;
 		if (left > 0) running.set(key, left - 1);
@@ -877,7 +877,16 @@ export class PrerenderAdmin extends Resource {
 					continue;
 				}
 			}
-			const fresh = newlyDropped(inspect, entry.value, valueAt(config, entry.path));
+			// The running list is judged by the RUNNING deny list: under the prospective one, a sampler that a
+			// credential rename in this same request breaks would look already dropped, and be excused.
+			const fresh = newlyDropped(
+				inspect,
+				entry.value,
+				valueAt(config, entry.path),
+				entry.path === 'sampling.samplers'
+					? (list) => inspectSamplers(list, { deniedHeaders: credentialHeadersOf(config) })
+					: inspect
+			);
 			if (!fresh.length) continue;
 			rejected.push({
 				path: entry.path,
@@ -892,20 +901,24 @@ export class PrerenderAdmin extends Resource {
 		// A CREDENTIAL HEADER RENAMED ONTO A HEADER A SAMPLER RECORDS drops that sampler on the next apply (a
 		// sampler never records a header the plugin authenticates on) — the same outcome as storing a sampler
 		// that names it, reached from the other side, and refused the same way.
+		// Judged entry by entry on the PROSPECTIVE sampler list: an entry that compiles under the running deny
+		// list and not under the prospective one is dropped by the rename alone, whatever else this request sets.
 		const credentialPaths = touched.filter((path) => CREDENTIAL_HEADER_PATHS.includes(path));
-		if (credentialPaths.length && !setByPath.has('sampling.samplers')) {
-			const running = inspectSamplers(config.sampling.samplers, { deniedHeaders: credentialHeadersOf(config) });
-			const prospective = inspectSamplers(resolved.config.sampling.samplers, {
-				deniedHeaders: credentialHeadersOf(resolved.config),
-			});
-			if (prospective.dropped > running.dropped) {
+		if (credentialPaths.length) {
+			const before = { deniedHeaders: credentialHeadersOf(config) };
+			const after = { deniedHeaders: credentialHeadersOf(resolved.config) };
+			const list = resolved.config.sampling.samplers;
+			const broken = (Array.isArray(list) ? list : []).filter(
+				(one) => inspectSamplers([one], before).usable === 1 && inspectSamplers([one], after).usable === 0
+			);
+			if (broken.length) {
 				for (const path of credentialPaths) {
 					rejected.push({
 						path,
 						requested: setByPath.get(path)?.value ?? null,
 						reason:
 							'a configured sampler records this header, and would be dropped once it carries a credential: ' +
-							prospective.warnings.join('; '),
+							inspectSamplers(broken, after).warnings.join('; '),
 					});
 				}
 			}
@@ -2457,11 +2470,11 @@ export class PrerenderAdmin extends Resource {
 	 * today), in name order (day, then worker), as NDJSON (`format=ndjson`, the default) or as the stored
 	 * gzip members concatenated (`format=gzip`; nothing decompressed here, and `gunzip` reads it as one
 	 * stream). Records carry their own `ts`; the `{"counters":…}` lines among them are the picks that were
-	 * not recorded. Today's files are still being appended to: NDJSON keeps whole lines only, and a gzip
-	 * download of today can end mid-member.
+	 * not recorded. A file still being appended to is served whole lines only, in either format.
 	 *
 	 * At most `limit` files (default 200, max 2000) and about 32 MB per response; when more remain the
-	 * response carries `x-sampling-next`, a file name to pass back as `after`.
+	 * response carries `x-sampling-next`, a file name to pass back as `after`. A single file too large to
+	 * serve (over four times that) is named in `x-sampling-too-large` and skipped.
 	 */
 	static samples(target) {
 		return withHeavySlot(() => this.samplesInner(target));
@@ -2483,26 +2496,44 @@ export class PrerenderAdmin extends Resource {
 		const files = (await listSampleFiles(sampler)).filter(
 			(file) => file.day >= from && file.day <= to && (after === null || file.name > after)
 		);
+		// A file written to within the last two flushes may be mid-append; in a gzip download it is re-encoded
+		// to whole members, so the files after it in the same stream stay readable.
+		const settledBefore = now - 2 * config.sampling.flushInterval - 60_000;
 		const parts = [];
 		let bytes = 0;
 		let read = 0;
 		let unreadable = 0;
+		const tooLarge = [];
 		let next = null;
-		// `next` is the last file this page covered (read or unreadable), so the next page starts after it.
+		// `next` is the last file this page covered (read, skipped or unreadable), so the next page starts after it.
 		for (let i = 0; i < files.length; i++) {
-			if (read === limit || (read > 0 && bytes >= MAX_SAMPLE_RESPONSE_BYTES)) {
+			const file = files[i];
+			const remaining = MAX_SAMPLE_RESPONSE_BYTES - bytes;
+			if (read === limit || (read > 0 && (remaining <= 0 || (!decode && file.size > remaining)))) {
 				next = files[i - 1].name;
 				break;
 			}
-			const budget = read === 0 ? 4 * MAX_SAMPLE_RESPONSE_BYTES : MAX_SAMPLE_RESPONSE_BYTES - bytes;
+			// One file alone may take up to four times the cap; past that it is named, not served.
+			if (!decode && file.size > 4 * MAX_SAMPLE_RESPONSE_BYTES) {
+				tooLarge.push(file.name);
+				continue;
+			}
 			let data;
 			try {
-				data = await readSampleFile(files[i].path, { decode, maxOutputLength: decode ? budget : undefined });
+				data = await readSampleFile(file.path, {
+					format: decode ? 'ndjson' : file.mtimeMs > settledBefore ? 'whole' : 'gzip',
+					maxOutputLength: decode ? (read === 0 ? 4 * MAX_SAMPLE_RESPONSE_BYTES : remaining) : undefined,
+				});
 			} catch (e) {
-				// Past the budget: stop BEFORE this file, so the next page starts with it.
-				if (e instanceof RangeError && read > 0) {
-					next = files[i - 1].name;
-					break;
+				if (e instanceof RangeError) {
+					// Past the budget: stop BEFORE this file, so the next page starts with it. A first file past
+					// four times the cap is too large to decode here at all.
+					if (read > 0) {
+						next = files[i - 1].name;
+						break;
+					}
+					tooLarge.push(file.name);
+					continue;
 				}
 				unreadable++;
 				continue;
@@ -2520,6 +2551,8 @@ export class PrerenderAdmin extends Resource {
 			'x-sampling-files': String(read),
 			'x-sampling-unreadable': String(unreadable),
 		});
+		// Too large to serve here: copy the file off the node, or ask for `format=gzip` if it was NDJSON.
+		if (tooLarge.length) headers['x-sampling-too-large'] = tooLarge.join(',');
 		if (next) headers['x-sampling-next'] = next;
 		return new Response(Buffer.concat(parts), { status: 200, headers });
 	}

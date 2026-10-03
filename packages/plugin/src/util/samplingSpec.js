@@ -43,8 +43,8 @@ export const SAMPLE_FIELDS = Object.freeze({
 	node: "this node's hostname",
 	worker: 'the worker thread index',
 	target:
-		"the URL's target as the batch was written: active, suppressed, or null for none (read at flush, " +
-		'once per distinct URL in the batch, never on the request)',
+		"the URL's target as the batch was written: active, suppressed, null for none, or unknown when the read " +
+		'failed (read at flush, once per distinct URL in the batch, never on the request)',
 	sitemap: 'whether the URL is sitemap-listed, from the same flush-time target read (false without a target)',
 });
 
@@ -69,8 +69,8 @@ export const DEFAULT_FIELDS = Object.freeze([
 
 export const SAMPLE_BY = Object.freeze(['url', 'request']);
 
-// Names go into the chunk row's primary key ahead of a `/`, so they are restricted to characters that
-// sort below nothing surprising and need no escaping in a query string.
+// A name is a directory name on every node and a query parameter on the admin API, so it is limited to
+// characters that need no escaping in either.
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const isSamplerName = (name) => typeof name === 'string' && NAME_RE.test(name);
 // An RFC 9110 field-name token, lowercased at compile time.

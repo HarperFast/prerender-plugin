@@ -249,6 +249,22 @@ test('renaming a credential header onto a header a sampler records is refused: t
 	assert.equal(body.rejected[0].path, 'renderNow.header');
 	assert.match(body.rejected[0].reason, /a configured sampler records this header/);
 	assert.equal(overrideRows.size, 0);
+	// Not even when the same request sets the sampler list too: judged on the prospective list, entry by entry.
+	const both = await PrerenderAdmin.configOverride(
+		{
+			set: [
+				{ path: 'renderNow.header', value: 'x-ops-key' },
+				{ path: 'sampling.samplers', value: [{ name: 'ua', headers: ['x-ops-key'] }, { name: 'other' }] },
+			],
+		},
+		operator
+	);
+	assert.equal(both.status, 409);
+	assert.deepEqual((await both.json()).rejected.map((entry) => entry.path).sort(), [
+		'renderNow.header',
+		'sampling.samplers',
+	]);
+	assert.equal(overrideRows.size, 0);
 	// A rename that drops nothing goes through.
 	const ok = await PrerenderAdmin.configOverride({ set: [{ path: 'renderNow.header', value: 'x-other' }] }, operator);
 	assert.equal(ok.status, 200);
@@ -273,10 +289,10 @@ test('GET sampling shows the compiled samplers, the invalid ones and the files; 
 		);
 		mkdirSync(join(dir, 'ok'));
 		const day = (offset) => new Date(Date.now() + offset * 86_400_000).toISOString().slice(0, 10);
-		writeFileSync(join(dir, 'ok', `${day(-1)}.w000.ndjson.gz`), gzipSync('{"ts":1}\n'));
-		writeFileSync(join(dir, 'ok', `${day(0)}.w000.ndjson.gz`), gzipSync('{"ts":2}\n'));
-		writeFileSync(join(dir, 'ok', `${day(0)}.w001.ndjson.gz`), gzipSync('{"ts":3}\n{"counters":{"capped":1}}\n'));
-		writeFileSync(join(dir, 'ok', `${day(-9)}.w000.ndjson.gz`), gzipSync('{"ts":0}\n'));
+		writeFileSync(join(dir, 'ok', `${day(-1)}.w000.t1.ndjson.gz`), gzipSync('{"ts":1}\n'));
+		writeFileSync(join(dir, 'ok', `${day(0)}.w000.t1.ndjson.gz`), gzipSync('{"ts":2}\n'));
+		writeFileSync(join(dir, 'ok', `${day(0)}.w001.t2.ndjson.gz`), gzipSync('{"ts":3}\n{"counters":{"capped":1}}\n'));
+		writeFileSync(join(dir, 'ok', `${day(-9)}.w000.t1.ndjson.gz`), gzipSync('{"ts":0}\n'));
 
 		const params = (query) => ({ get: (key) => query[key] });
 		const view = await (await PrerenderAdmin.samplingView(params({}))).json();
