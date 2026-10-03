@@ -500,10 +500,17 @@ export async function* walkScheduleRowsDescending({ above, chunkSize = 1000, onU
  * iterator per event). `omitCurrent`: the keeper loads the current rows itself, by the walk above.
  *
  * What a node's subscription receives on a residency-pinned table, measured by bench/queue-keeper
- * (#215, #217): a `put` with the value for every write to a row this node owns, local or replicated;
- * a `delete` with no value for each write THIS node makes to a row it does not own (nothing is stored
- * locally, so the delivery re-read finds nothing); nothing for rows it neither owns nor wrote. After a
- * replication base copy that carries any row of the table, the whole table is re-sent as puts.
+ * (#215, #217) on Harper 5.2: a `put` with the value for every write to a row this node owns, local
+ * or replicated; a `delete` with no value for each write THIS node makes to a row it does not own
+ * (nothing is stored locally, so the delivery re-read finds nothing); nothing for rows it neither owns
+ * nor wrote. After a replication base copy that carries any row of the table, the whole table is
+ * re-sent as puts.
+ *
+ * Harper 5.3 (harper#2767) delivers a write only while the row's local entry still carries that
+ * write's version, so the not-owned `delete`s above are no longer sent at all, and a write already
+ * superseded by a later one is skipped (the later write's event carries the row). Neither changes
+ * the keeper: it ignores rows this node does not own (`classifyScheduleRow`), and every entry it
+ * publishes is checked against its durable row before a claim grants it.
  */
 export const subscribeScheduleChanges = (listener) => scheduleTable().subscribe({ omitCurrent: true, listener });
 

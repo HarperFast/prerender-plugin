@@ -198,8 +198,15 @@ test('walkPrefix: keyset chunks, ge-then-gt, and the walk ends at the first URL 
 		search({ conditions, limit }) {
 			calls.push(conditions[0]);
 			const { comparator, value } = conditions[0];
+			// The walk's verification probe is one `gtlt` range: `> value[0]` and `< value[1]`.
+			const keep =
+				comparator === 'gtlt'
+					? (url) => url > value[0] && url < value[1]
+					: comparator === 'greater_than_equal'
+						? (url) => url >= value
+						: (url) => url > value;
 			return all
-				.filter((url) => (comparator === 'greater_than_equal' ? url >= value : url > value))
+				.filter(keep)
 				.slice(0, limit)
 				.map((url) => ({ url, sitemapUrl: null }));
 		},
@@ -489,9 +496,10 @@ test('a stop issued from another worker reaches the running pass — through sta
 		static async put() {}
 		static async delete() {}
 		static search({ conditions = [], limit = 50, sort } = {}) {
-			const gt = conditions.find((c) => c.comparator === 'greater_than')?.value ?? '';
+			const range = conditions.find((c) => c.comparator === 'gtlt')?.value;
+			const gt = range?.[0] ?? conditions.find((c) => c.comparator === 'greater_than')?.value ?? '';
 			const ge = conditions.find((c) => c.comparator === 'greater_than_or_equal')?.value;
-			const lt = conditions.find((c) => c.comparator === 'less_than')?.value;
+			const lt = range?.[1] ?? conditions.find((c) => c.comparator === 'less_than')?.value;
 			let keys = URLS.filter((u) => (ge !== undefined ? u >= ge : u > gt) && (lt === undefined || u < lt));
 			if (sort?.descending) keys = [...keys].reverse();
 			const page = keys.slice(0, limit);
