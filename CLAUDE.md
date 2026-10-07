@@ -73,10 +73,13 @@ packages' current tarballs to that release tag.
   which RenderQueue builds with `peerOrigin()` in [`util/peer.js`](packages/plugin/src/util/peer.js)
   (`localhost`, `127.0.0.1` and `::1` → `http`).
 
-- **Don't assume `9926` is reachable off-host.** Newer Fabric hosts bind the container's `9926` to
-  the host's loopback and publish it on `443` only: from the internet `9926` is filtered, and
-  node to node it is refused, while `9925` (operations), `9933` (replication) and `8883` (MQTT)
-  stay open. On such a cluster set the plugin's `network.publicPort: 443` (the port in every
+- **Don't assume `9926` is reachable off-host.** Every Fabric host binds the container's ports to
+  the host loopback (`127.0.0.1:9936:9926`, …) and a front proxy publishes them. nginx-fronted hosts
+  listen on `9926` too; hosts fronted by the host-manager's **Symphony** proxy
+  (`/var/hdb/hmroot/symphony/config.json`) listen on `80`, `443`, `9925`, `8883` and `9933` only.
+  There `9926` is filtered from the internet and refused node to node, and the generated config is
+  rewritten on every instance change, so it can't be patched by hand. On such a cluster set the
+  plugin's `network.publicPort: 443` (the port in every
   job's `callbackOrigin` and every peer call), the fleet's `queuePort: 443`, and list the console's
   `nodes` without a port. Harper's own `http.securePort` still reads `9926` there, which is why
   the plugin can't infer it.
