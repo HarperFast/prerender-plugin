@@ -37,13 +37,17 @@ const isLocalHost = (hostname) => hostname === 'localhost' || hostname === '127.
 const formatHost = (hostname) => (hostname.includes(':') && !hostname.startsWith('[') ? `[${hostname}]` : hostname);
 
 /**
- * Base origin for a peer node. Mirrors the `callbackOrigin` logic in RenderQueue: prefer the
- * secure port, fall back to the plain port for a localhost origin.
+ * Base origin for a node, as other nodes and the render fleet reach it: https on
+ * `network.publicPort` when set, else Harper's secure port; plain http on the plain port for a
+ * localhost origin. RenderQueue builds every job's `callbackOrigin` from this too, so a peer call
+ * and a result post can never disagree about where a node answers.
  */
 export const peerOrigin = (hostname) => {
 	const httpConfig = server.config?.http ?? {};
 	const secure = !isLocalHost(hostname);
-	const port = secure ? httpConfig.securePort || httpConfig.port : httpConfig.port || httpConfig.securePort;
+	const port = secure
+		? config.network?.publicPort || httpConfig.securePort || httpConfig.port
+		: httpConfig.port || httpConfig.securePort;
 	return `${secure ? 'https' : 'http'}://${formatHost(hostname)}:${port}`;
 };
 
