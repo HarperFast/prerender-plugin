@@ -65,9 +65,10 @@ export const rawCachePolicy = (entry) => {
  * every device.
  *
  * PER-DEVICE IS THE DEFAULT because the origin fetch is made with a per-device User-Agent
- * (`origin.userAgents`), and an ADAPTIVE origin answers those differently. Replaying its desktop
- * document to a smartphone crawler would be serving the wrong page, silently, under a 200. But an
- * origin whose documents carry the same CONTENT for every device — responsive, or adaptive only in
+ * (`origin.userAgents` — or, under `origin.forwardUserAgent`, the crawler's own, whose device is the
+ * one the edge tagged wherever the edge reads the device off that UA), and an ADAPTIVE origin
+ * answers those differently. Replaying its desktop document to a smartphone crawler would be
+ * serving the wrong page, silently, under a 200. But an origin whose documents carry the same CONTENT for every device — responsive, or adaptive only in
  * presentation — gains little from it, and there the per-device key stores every document twice
  * and makes each device miss on its own: a desktop crawler's fetch never fills the cache for the
  * smartphone crawler asking for the same URL minutes later.

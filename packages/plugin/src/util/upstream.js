@@ -191,9 +191,35 @@ export const sanitizeOriginResponseHeaders = (headers) => {
  */
 const VALIDATOR_HEADERS = ['if-none-match', 'if-modified-since'];
 
+/**
+ * The User-Agent the origin sees: the crawler's own plus `origin.forwardUserAgent.suffix` when forwarding is
+ * on and the request carried one, else this device's fixed browser string (`origin.userAgents`). A request
+ * Harper makes on its own behalf (the negative cache's re-check) has no crawler and takes the fixed string.
+ */
+const originUserAgent = (downstream, deviceType) => {
+	const forward = config.origin.forwardUserAgent;
+	const crawler = forward.enabled ? downstream?.['user-agent'] : undefined;
+	if (typeof crawler === 'string' && crawler !== '') return forward.suffix ? `${crawler} ${forward.suffix}` : crawler;
+	return config.origin.userAgents[deviceType] ?? config.origin.userAgents.desktop;
+};
+
+/**
+ * Is this incoming request Harper's own forwarded-UA proxy fetch, sent back here by the edge? Forwarding puts a
+ * crawler's UA on a fetch the edge would otherwise route as browser traffic, so an edge whose bot routing does
+ * not exempt `securityToken` hands it straight back — and proxying it again would chain until something times
+ * out, every hop holding a connection. Recognised by the suffix (which the default fallback `userAgents` end in
+ * too, so a looped fallback fetch is caught as well); always false while forwarding is off or the suffix is empty.
+ */
+export const isForwardedProxyLoop = (headers) => {
+	const { enabled, suffix } = config.origin.forwardUserAgent;
+	if (!enabled || !suffix) return false;
+	const ua = headers.get('user-agent');
+	return typeof ua === 'string' && ua.endsWith(` ${suffix}`);
+};
+
 export const resolveUpstreamHeaders = (downstream, deviceType, { stripValidators = false } = {}) => {
 	const upstream = {
-		'user-agent': config.origin.userAgents[deviceType] ?? config.origin.userAgents.desktop,
+		'user-agent': originUserAgent(downstream, deviceType),
 		[config.origin.securityToken.header]: config.origin.securityToken.value,
 		// Request gzip (not brotli) from the origin. On a cache miss this response is relayed
 		// to the CDN edge for its alternate-response swap, and the edge cannot apply its outgoing

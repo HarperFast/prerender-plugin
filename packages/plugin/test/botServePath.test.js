@@ -274,6 +274,51 @@ test('a proxied origin 301 reaches the crawler WITH its Location, absolute, reso
 	}
 });
 
+// ── The crawler's User-Agent on the proxy fetch ───────────────────────────────────────────────────
+
+const BINGBOT = 'Mozilla/5.0 (compatible; Bingbot/2.0; +http://www.bing.com/bingbot.htm)';
+
+test('a miss reaches the origin as the crawler plus HarperProxy when forwardUserAgent is on, and as the device browser UA when off', async () => {
+	try {
+		let res = await handleBotRequest(request('/desktop/p/ua-off'));
+		await drain(res.body);
+		assert.equal(origin.requests.at(-1).headers['user-agent'], config.origin.userAgents.desktop);
+
+		applyOptions({ ...BASE_OPTIONS, origin: { forwardUserAgent: { enabled: true } } });
+		res = await handleBotRequest(request('/mobile/p/ua-on'));
+		await drain(res.body);
+		assert.equal(res.status, 200);
+		assert.equal(origin.requests.at(-1).headers['user-agent'], `${BINGBOT} HarperProxy/1.0`);
+		await settle(); // each miss's detached scheduling tail, so it lands here and not in the next test
+	} finally {
+		applyOptions(BASE_OPTIONS);
+	}
+});
+
+test('our own forwarded fetch routed back by the edge is refused 508 — never proxied again', async () => {
+	try {
+		applyOptions({ ...BASE_OPTIONS, origin: { forwardUserAgent: { enabled: true } } });
+		const res = await handleBotRequest(
+			request('/desktop/p/looped', 'GET', { 'user-agent': `${BINGBOT} HarperProxy/1.0` })
+		);
+		assert.equal(res.status, 508);
+		assert.equal(origin.requests.length, 0, 'not proxied');
+		await settle();
+		assert.deepEqual(tableKeys, [], 'not looked up, scheduled or discovered');
+
+		// Forwarding off: the same UA is just a request (our fixed UAs are browsers, which the edge never routes here).
+		applyOptions(BASE_OPTIONS);
+		const plain = await handleBotRequest(
+			request('/desktop/p/looped', 'GET', { 'user-agent': `${BINGBOT} HarperProxy/1.0` })
+		);
+		await drain(plain.body);
+		assert.equal(plain.status, 200);
+		await settle();
+	} finally {
+		applyOptions(BASE_OPTIONS);
+	}
+});
+
 // ── A URL too long to be a key is proxied, not 500'd ──────────────────────────────────────────────
 
 test('a URL too long to be a cache key is proxied to the origin — not the 500 a key throw made it — and touches no table', async () => {

@@ -22,12 +22,15 @@ let cacheKeysOf;
 let origin;
 let port;
 const asked = [];
+// The User-Agent each request to the origin carried, in order.
+const agents = [];
 // id -> { status, body, headers }; absent ids answer the default price.
 let answers = new Map();
 before(async () => {
 	origin = createServer((req, res) => {
 		const id = req.url.replace('/price/', '');
 		asked.push(id);
+		agents.push(req.headers['user-agent']);
 		const answer = answers.get(id) ?? { status: 200, body: { price: 10 } };
 		res.writeHead(answer.status, { 'content-type': 'application/json', ...(answer.headers ?? {}) });
 		res.end(JSON.stringify(answer.body ?? {}));
@@ -160,6 +163,7 @@ beforeEach(async () => {
 	pageFaults = {};
 	holdRow = async () => {};
 	asked.length = 0;
+	agents.length = 0;
 	answers = new Map();
 	globalThis.databases = {
 		coordination: { SharedBuffer: SharedBufferFake },
@@ -255,6 +259,17 @@ test('F3 wired: a URL changed 9h ago by a daytime pass is probed and acted on by
 	assert.equal(probeRows.get(pdp('1')).signature, '[8]', 'the new baseline is written after the action');
 	const schedule = schedules.get(pdp('1'));
 	assert.ok(schedule?.changedAt > 0, 'the render is filed with a change mark');
+});
+
+test('probe requests carry the PROBE’s User-Agent, never the miss proxy’s — the sweep desktop, a document read the served device’s', async () => {
+	configure();
+	seedTarget('1');
+	await changeProbe.runProbeSweepOnce({ startedBy: 'anchor' });
+	const response = await changeProbe.probeDocument(`http://127.0.0.1:${port}/price/2`, 'mobile');
+	await response.body.dump();
+	const { config } = await import('../src/config.js');
+	assert.deepEqual(agents, [config.changeProbe.userAgents.desktop, config.changeProbe.userAgents.mobile]);
+	assert.ok(agents.every((ua) => ua.endsWith(' HarperProbe/1.0')));
 });
 
 test('A4: probe counters are emitted per batch, and a pass that THROWS has still reported what it probed', async () => {

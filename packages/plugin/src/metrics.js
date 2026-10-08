@@ -618,7 +618,7 @@ export const METRICS = Object.freeze({
 			'util/renderSchedule.js (due_now_forward), util/serveCheck.js and util/pageCheck.js (serve_check)',
 		cadence:
 			'per report flush (unrouted), per finished sitemap run (sitemap_*), per delivery failure ' +
-			'(serve_error, page_age_negative), per snapshot (config_warnings), per stats interval (the ladder\u2019s ' +
+			'(serve_error, page_age_negative), per refused proxy loop (proxy_loop), per snapshot (config_warnings), per stats interval (the ladder\u2019s ' +
 			'demand_*), per visit-ring re-union (demand_fill, demand_false_positive), ' +
 			'per failed epoch read (invalidation_error), per heal attempt (invalidation_reenqueue), ' +
 			'per probed batch of a probe pass (the probe_* pass counters, cycle_behind included — increments since ' +
@@ -634,7 +634,10 @@ export const METRICS = Object.freeze({
 		usefulFor:
 			'unrouted = requests served without prerendering, per path bucket: CDN over-forwarding vs. the ' +
 			'coverage backlog (read `total`; the log line keeps the sample paths). sitemap_* = corpus churn and ' +
-			'walk health; failed > 0 was log-only before. serve_error = a response that failed AFTER the 200 and ' +
+			'walk health; failed > 0 was log-only before. proxy_loop = an incoming request that was Harper’s own ' +
+			'forwarded-UA proxy fetch, routed back here by the edge (origin.forwardUserAgent) and refused with 508; ' +
+			'expect zero — any at all means the edge’s bot routing does not exempt the security token. ' +
+			'serve_error = a response that failed AFTER the 200 and ' +
 			'the cache-hit row were committed — truncated bytes reaching a crawler while every serve metric says ' +
 			'success; expect zero. config_warnings = current finding count; alert on change, not level (the ' +
 			'findings are on GET /prerender_admin/config). page_age_negative = served pages discarded from ' +
@@ -822,7 +825,7 @@ export const METRICS = Object.freeze({
 		caveats:
 			'Value semantics per series: unrouted, sitemap_*, the probe_* pass counters and the demand_* decision counters ' +
 			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +
-			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error, ' +
+			'sum (`count` is flushes/runs); serve_error, proxy_loop, page_age_negative, invalidation_error, ' +
 			'invalidation_reenqueue, probe_canary_trip, probe_invalidated, discovery_gated, entity_gate, raw_cache, negative_cache, ' +
 			'gone_reopen, suppression_lifted, suppression_held, due_now_forward and serve_check are counters; negative_gap, probe_detection_lag, entity_serve_ms and served_wrong are durations (ms — read their percentiles, not their total; served_wrong\u2019s count is the number of wrong copies found); ' +
 			'config_warnings is a slow gauge (latest value); ' +
@@ -850,6 +853,7 @@ export const METRICS = Object.freeze({
 					'sitemap_removed',
 					'sitemap_failed',
 					'serve_error',
+					'proxy_loop',
 					'config_warnings',
 					'page_age_negative',
 					'demand_promoted',
@@ -1156,6 +1160,8 @@ export const metrics = Object.freeze({
 
 	/** A committed response whose body failed on the way out — a prerender_ops series. */
 	serveError: (kind) => server.recordAnalytics(true, 'prerender_ops', 'serve_error', kind, null),
+	// An incoming request that was our own forwarded-UA proxy fetch, refused (util/upstream.js#isForwardedProxyLoop).
+	proxyLoop: () => server.recordAnalytics(true, 'prerender_ops', 'proxy_loop', null, null),
 
 	/** One flush-interval's count for one unrouted bucket (read `total` for the request sum). */
 	unrouted: (count, routeClass, bucket) =>

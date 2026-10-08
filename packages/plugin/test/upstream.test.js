@@ -7,6 +7,7 @@ import {
 	configuredStagingIp,
 	dispatcherFor,
 	drainOrDestroy,
+	isForwardedProxyLoop,
 	releaseOriginBody,
 	resolveUpstreamHeaders,
 	sanitizeOriginResponseHeaders,
@@ -268,6 +269,70 @@ test('resolveUpstreamHeaders picks up ignoredHeaders changes across applyOptions
 	// x-first is no longer ignored, x-second now is
 	assert.equal(upstream['x-first'], 'a');
 	assert.equal(upstream['x-second'], undefined);
+});
+
+// --- the User-Agent the origin sees ----------------------------------------------------------
+
+const GOOGLEBOT = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
+
+test('by default the crawler’s User-Agent never reaches the origin: the device’s fixed browser UA does', () => {
+	applyOptions({});
+	assert.equal(
+		resolveUpstreamHeaders({ 'user-agent': GOOGLEBOT }, 'mobile')['user-agent'],
+		config.origin.userAgents.mobile
+	);
+	assert.equal(
+		resolveUpstreamHeaders({ 'user-agent': GOOGLEBOT }, 'nope')['user-agent'],
+		config.origin.userAgents.desktop
+	);
+});
+
+test('forwardUserAgent sends the crawler’s own UA with the suffix after one space', () => {
+	applyOptions({ origin: { forwardUserAgent: { enabled: true } } });
+	assert.equal(
+		resolveUpstreamHeaders({ 'user-agent': GOOGLEBOT }, 'mobile')['user-agent'],
+		`${GOOGLEBOT} HarperProxy/1.0`
+	);
+	applyOptions({ origin: { forwardUserAgent: { enabled: true, suffix: 'AcmeProxy/2' } } });
+	assert.equal(
+		resolveUpstreamHeaders({ 'user-agent': GOOGLEBOT }, 'desktop')['user-agent'],
+		`${GOOGLEBOT} AcmeProxy/2`
+	);
+	applyOptions({});
+});
+
+test('forwardUserAgent with an empty suffix forwards the crawler’s UA verbatim', () => {
+	applyOptions({ origin: { forwardUserAgent: { enabled: true, suffix: '' } } });
+	assert.equal(resolveUpstreamHeaders({ 'user-agent': GOOGLEBOT }, 'desktop')['user-agent'], GOOGLEBOT);
+	applyOptions({});
+});
+
+test('forwardUserAgent falls back to the device UA when there is no crawler UA to forward', () => {
+	applyOptions({ origin: { forwardUserAgent: { enabled: true } } });
+	// No downstream at all, an empty UA, and headers with no UA (the negative cache's background re-check).
+	assert.equal(resolveUpstreamHeaders(undefined, 'tablet')['user-agent'], config.origin.userAgents.tablet);
+	assert.equal(resolveUpstreamHeaders({ 'user-agent': '' }, 'tablet')['user-agent'], config.origin.userAgents.tablet);
+	assert.equal(
+		resolveUpstreamHeaders({ accept: 'text/html' }, 'mobile')['user-agent'],
+		config.origin.userAgents.mobile
+	);
+	applyOptions({});
+});
+
+const uaHeaders = (ua) => ({ get: (name) => (name === 'user-agent' ? ua : null) });
+
+test('isForwardedProxyLoop recognises our own forwarded fetch only while forwarding is on with a suffix', () => {
+	const ours = `${GOOGLEBOT} HarperProxy/1.0`;
+	applyOptions({});
+	assert.equal(isForwardedProxyLoop(uaHeaders(ours)), false, 'forwarding off: no guard');
+	applyOptions({ origin: { forwardUserAgent: { enabled: true } } });
+	assert.equal(isForwardedProxyLoop(uaHeaders(ours)), true);
+	assert.equal(isForwardedProxyLoop(uaHeaders(GOOGLEBOT)), false, 'the crawler itself');
+	assert.equal(isForwardedProxyLoop(uaHeaders('HarperProxy/1.0')), false, 'only as a suffix after a space');
+	assert.equal(isForwardedProxyLoop(uaHeaders(null)), false);
+	applyOptions({ origin: { forwardUserAgent: { enabled: true, suffix: '' } } });
+	assert.equal(isForwardedProxyLoop(uaHeaders(GOOGLEBOT)), false, 'an empty suffix disables the guard');
+	applyOptions({});
 });
 
 // --- origin response-header cap -------------------------------------------------------------

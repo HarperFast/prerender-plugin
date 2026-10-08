@@ -62,6 +62,20 @@ const group = (description, children, extra = {}) => ({
 export const isOption = (node) => !!node?.[OPTION];
 export const isGroup = (node) => !!node?.[GROUP];
 
+// The device-appropriate browser UAs Harper's own origin fetches present (the origin may serve
+// device-specific HTML off them). Each kind of fetch appends its own product token, so the origin's
+// logs can tell the miss proxy (`HarperProxy`) from the change probe (`HarperProbe`).
+const DEVICE_BROWSER_UAS = {
+	mobile:
+		'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/W.X.Y.Z Mobile Safari/537.36',
+	tablet:
+		'Mozilla/5.0 (Linux; Android 7.0; Pixel C Build/NRD90M; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/52.0.2743.98 Safari/537.36',
+	desktop:
+		'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/W.X.Y.Z Safari/537.36',
+};
+const PROXY_TOKEN = 'HarperProxy/1.0';
+const PROBE_TOKEN = 'HarperProbe/1.0';
+
 // Database/table names are fixed (defined statically in src/schemas/schema.graphql).
 // Tables are split across databases by write-transaction coupling so the hot queue
 // (render_schedule) is isolated from target, page-cache, and sitemap writes.
@@ -511,22 +525,46 @@ export const configSchema = group('Prerender plugin configuration.', {
 			'Per-device-type User-Agent strings sent to the origin on the proxy (cache-miss passthrough) ' +
 				'fetch. Each carries a `HarperProxy/1.0` product token so Harper’s proxy traffic is identifiable ' +
 				'in origin/CDN logs while still presenting a real, device-appropriate browser UA (the origin ' +
-				'serves device-specific HTML off it).',
+				'serves device-specific HTML off it).\n\n' +
+				'With `forwardUserAgent.enabled` these are only the fallback, for a request that arrived ' +
+				'without a User-Agent (and for the negative cache’s background re-checks, which have no crawler).',
 			{
-				mobile: option(
-					'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/W.X.Y.Z Mobile Safari/537.36 HarperProxy/1.0',
-					'UA for mobile proxy fetches.'
-				),
-				tablet: option(
-					'Mozilla/5.0 (Linux; Android 7.0; Pixel C Build/NRD90M; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/52.0.2743.98 Safari/537.36 HarperProxy/1.0',
-					'UA for tablet proxy fetches.'
-				),
-				desktop: option(
-					'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/W.X.Y.Z Safari/537.36 HarperProxy/1.0',
-					'UA for desktop proxy fetches.'
-				),
+				mobile: option(`${DEVICE_BROWSER_UAS.mobile} ${PROXY_TOKEN}`, 'UA for mobile proxy fetches.'),
+				tablet: option(`${DEVICE_BROWSER_UAS.tablet} ${PROXY_TOKEN}`, 'UA for tablet proxy fetches.'),
+				desktop: option(`${DEVICE_BROWSER_UAS.desktop} ${PROXY_TOKEN}`, 'UA for desktop proxy fetches.'),
 			},
 			{ movedFrom: 'userAgents' }
+		),
+		forwardUserAgent: group(
+			'Send the CRAWLER’S OWN User-Agent to the origin on the proxy fetch, with `suffix` appended, ' +
+				'instead of the fixed `userAgents` browser strings. Default off.\n\n' +
+				'WHY: with the fixed strings the origin can tell Harper’s fetches from direct traffic, but every ' +
+				'one of them looks like the same browser — the origin’s own bot metrics cannot say which crawler ' +
+				'a fetch was made for. Forwarded, `Googlebot/2.1 (…) HarperProxy/1.0` is both: the crawler, and ' +
+				'Harper on its behalf. An origin-side report that counts crawlers by UA substring must now ' +
+				'exclude `suffix`, or it counts each proxied miss twice (the edge already logged the crawler’s ' +
+				'own request).\n\n' +
+				'Only the proxy fetch is affected — it is the one made on behalf of a single crawler. Renders, ' +
+				'change probes, serve checks and sitemap fetches are Harper’s own traffic and keep their own UAs.\n\n' +
+				'SETTLE TWO THINGS WITH WHOEVER RUNS THE EDGE BEFORE ENABLING. (1) A crawler UA from Harper’s ' +
+				'addresses fails the crawler’s IP verification, so whatever routes bot traffic to Harper must ' +
+				'exempt requests carrying `securityToken` — else the edge sends Harper’s fetch straight back to ' +
+				'Harper. A request arriving here whose UA ends in ` <suffix>` is that loop, and is refused with ' +
+				'508 (`prerender_ops` `proxy_loop`) instead of being proxied again; an empty `suffix` disables ' +
+				'this guard. (2) The raw cache (`render.raw`) stores a proxied document and replays it to OTHER ' +
+				'crawlers — correct only if the origin answers crawlers the same as each other. The experiment ' +
+				'that settles it: fetch one URL from the origin, with the token, once with a browser UA and once ' +
+				'with a crawler UA, and compare status, canonical and body (past per-request churn). A ' +
+				'difference the origin does not declare in `Vary` means leave this off, or turn the raw cache off.',
+			{
+				enabled: option(false, 'Forward the crawler’s User-Agent on the proxy fetch.'),
+				suffix: option(
+					PROXY_TOKEN,
+					'Product token appended to the forwarded UA, after one space, so Harper’s fetches stay ' +
+						'identifiable. Also the loop guard’s marker (see above); empty forwards the UA verbatim and ' +
+						'disables the guard.'
+				),
+			}
 		),
 		ignoredHeaders: option(
 			[],
@@ -1134,8 +1172,9 @@ export const configSchema = group('Prerender plugin configuration.', {
 			'The probe is an accelerator on top of the baseline render cadence, never a gate on it — the ' +
 			'failure mode to survive is the origin replatforming under a rule, which surfaces as a high ' +
 			'probe_failed share and a loud log line, not as schedule churn. Probes run owner-scoped on ' +
-			'worker 0 of every node (each node probes the URLs it owns), carry the same User-Agent and ' +
-			'security token as every other origin fetch, and are rate-capped per node — AGREE THE RATE ' +
+			'worker 0 of every node (each node probes the URLs it owns), carry the security token like every ' +
+			'other origin fetch but their own User-Agents (`userAgents`, `HarperProbe/1.0`), and are ' +
+			'rate-capped per node — AGREE THE RATE ' +
 			'WITH WHOEVER RUNS THE ORIGIN before enabling a sweep over a large corpus: probe endpoints ' +
 			'are typically uncached, so every request is origin backend work.',
 		{
@@ -1625,6 +1664,19 @@ export const configSchema = group('Prerender plugin configuration.', {
 							'shed (`shed`); the next request for the page queues it again.',
 						{ unit: 'ms', min: SECOND }
 					),
+				}
+			),
+			userAgents: group(
+				'Per-device-type User-Agent strings every probe request sends — the sweep, the canary and ' +
+					'`serveCheck` alike. The same device browser strings as `origin.userAgents` but with a ' +
+					'`HarperProbe/1.0` product token, so the origin’s logs can tell probe traffic from the miss ' +
+					'proxy’s (`HarperProxy/1.0`). A rule’s endpoint and the sweep send `desktop`; a serve check ' +
+					'reading the document sends the served device’s, so a device-specific origin answers with ' +
+					'the document that page was rendered from.',
+				{
+					mobile: option(`${DEVICE_BROWSER_UAS.mobile} ${PROBE_TOKEN}`, 'UA for mobile probe requests.'),
+					tablet: option(`${DEVICE_BROWSER_UAS.tablet} ${PROBE_TOKEN}`, 'UA for tablet probe requests.'),
+					desktop: option(`${DEVICE_BROWSER_UAS.desktop} ${PROBE_TOKEN}`, 'UA for desktop probe requests.'),
 				}
 			),
 			requestTimeout: option(10 * SECOND, 'Per-probe timeout, headers and body both.', {

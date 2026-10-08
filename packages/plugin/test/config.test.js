@@ -57,6 +57,16 @@ test('proxy device UAs carry the HarperProxy product token', () => {
 	}
 });
 
+test('probe device UAs are the proxy’s browser strings with their own HarperProbe token', () => {
+	applyOptions({});
+	for (const [device, ua] of Object.entries(config.changeProbe.userAgents)) {
+		assert.match(ua, /HarperProbe\/1\.0$/);
+		assert.equal(ua.replace('HarperProbe/1.0', 'HarperProxy/1.0'), config.origin.userAgents[device], device);
+	}
+	assert.equal(config.origin.forwardUserAgent.enabled, false, 'forwarding is opt-in');
+	assert.equal(config.origin.forwardUserAgent.suffix, 'HarperProxy/1.0');
+});
+
 test('applyOptions exposes analytics + cacheKey defaults', () => {
 	applyOptions({});
 	assert.equal(config.analytics.enabled, true);
