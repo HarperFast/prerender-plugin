@@ -24,6 +24,7 @@ import { metrics } from '../metrics.js';
 import { Target, countedStrikes } from './Target.js';
 import { getDesiredPause, setDesiredPause } from '../util/queueControl.js';
 import { getResidencyByUrl } from '../util/residency.js';
+import { peerOrigin } from '../util/peer.js';
 import {
 	claimSchedules,
 	deleteSchedule,
@@ -34,9 +35,6 @@ import {
 	releaseLease,
 	writeSchedule,
 } from '../util/renderSchedule.js';
-
-const protocol = server.hostname === 'localhost' ? 'http' : 'https';
-const port = protocol === 'https' ? server.config.http.securePort || server.config.http.port : server.config.http.port;
 
 // The `RenderSchedule` table is deliberately NOT destructured here. Every read, write and delete
 // of it goes through `util/renderSchedule.js`, which owns the write contract (`put` replaces the
@@ -1688,7 +1686,9 @@ export class RenderQueue extends Resource {
 				deviceTypes,
 				deviceType: deviceTypes[0],
 				expiresAt: granted.expiresAtMs,
-				callbackOrigin: `${protocol}://${server.hostname}:${port}`,
+				// Where the fleet posts this job's result: this node as off-host callers reach it
+				// (`network.publicPort`), the same origin every peer call uses.
+				callbackOrigin: peerOrigin(server.hostname),
 				// `fromSitemap` is off the durable row the claim just read, so the job is built with no
 				// per-job Target read.
 				isFromSitemap: !!granted.fromSitemap,

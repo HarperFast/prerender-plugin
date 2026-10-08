@@ -89,6 +89,12 @@ rest: true # required for the @export-ed table REST endpoints
     #                    accept-encoding, cookie, authorization, and the securityToken/debugHeader
     #                    names); matched case-insensitively
 
+  network:
+    publicPort: 0 # port other nodes and the render fleet reach this node on: every job's callbackOrigin
+    #               and every peer call. 0 = Harper's http.securePort. Set 443 on a host that publishes
+    #               Harper only on 443 (newer Fabric hosts bind 9926 to loopback); the fleet's
+    #               queuePort must match.
+
   debugHeader: # when this request header is present (any value), debug response headers are added
     key: x-harper-prerender-debug
 

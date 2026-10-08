@@ -785,6 +785,28 @@ test('a CHANGED row keeps its mark through a failed render, and loses it when a 
 	assert.equal(stores.renderSchedule.get(A).demandPeriod, undefined, 'with its demand estimate');
 });
 
+// ───────────────────────────── where the fleet posts the result ─────────────────────────────
+
+test('a job’s callbackOrigin names this node on network.publicPort, else Harper’s own port', async (t) => {
+	const before = config.network.publicPort;
+	t.after(() => {
+		config.network.publicPort = before;
+	});
+
+	seedUrlRow();
+	let [job] = await claim();
+	assert.equal(job.callbackOrigin, 'https://test-node:9926', 'default: the port Harper serves on');
+
+	// A host that publishes Harper's port only on 443 (newer Fabric hosts bind 9926 to loopback):
+	// a result posted to :9926 never arrives, so the claim must hand out the published port.
+	// (A is leased now, so the second claim takes B.)
+	config.network.publicPort = 443;
+	seedUrlRow({ url: B });
+	[job] = await claim();
+	assert.equal(job.url, B);
+	assert.equal(job.callbackOrigin, 'https://test-node:443');
+});
+
 // ───────────────────────────── one-device rows beside the rotation ─────────────────────────────
 
 test('a per-device row for a NON-default device is a one-off: page stored, row retired, URL row untouched', async () => {

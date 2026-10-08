@@ -628,6 +628,22 @@ export const configSchema = group('Prerender plugin configuration.', {
 		}
 	),
 
+	network: group('How other cluster nodes and the render fleet reach this node over HTTPS.', {
+		publicPort: option(
+			0,
+			'Port other nodes and the render fleet use to reach this node’s HTTP API: the port in every ' +
+				'render job’s `callbackOrigin` (where the fleet posts its result) and in every peer call ' +
+				'(the serve-path rescue, the invalidation heal, the explainer’s owner read).\n\n' +
+				'0 (default) = Harper’s own `http.securePort`, which is right when that port is published ' +
+				'on the host. Set it when the host fronts Harper on a different port: newer Fabric hosts ' +
+				'bind the container’s 9926 to loopback only and publish it on 443, so there nothing ' +
+				'off-host can reach `:9926` and every result post fails — set `publicPort: 443`. The render ' +
+				'fleet claims on its own `queuePort`, which must be changed to match. A localhost origin ' +
+				'ignores this (it speaks plain http on Harper’s plain port).',
+			{ min: 0, max: 65535 }
+		),
+	}),
+
 	peerRescue: group(
 		'Cluster peer rescue for the serve path. A cache serve reads the stored body before committing ' +
 			'a status; when that LOCAL read fails — the blob file is gone (a dangling reference), or the ' +

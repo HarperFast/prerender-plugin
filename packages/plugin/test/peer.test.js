@@ -33,6 +33,22 @@ test('a peer is addressed over https on the secure port', () => {
 	assert.equal(peer.peerOrigin('node-b.example.com'), 'https://node-b.example.com:9926');
 });
 
+test('network.publicPort replaces the secure port for every off-host caller', async (t) => {
+	// Newer Fabric hosts bind the container's 9926 to loopback and publish it on 443: a peer or a
+	// render-fleet result post to :9926 is refused, so the origin must name the published port.
+	const { config } = await import('../src/config.js');
+	const before = config.network.publicPort;
+	t.after(() => {
+		config.network.publicPort = before;
+	});
+
+	assert.equal(before, 0, 'default 0 = Harper’s own securePort');
+	config.network.publicPort = 443;
+	assert.equal(peer.peerOrigin('node-b.example.com'), 'https://node-b.example.com:443');
+	// A localhost origin never takes it: it speaks plain http on Harper's plain port.
+	assert.equal(peer.peerOrigin('localhost'), 'http://localhost:9925');
+});
+
 test('only a localhost origin uses plain http', () => {
 	assert.equal(peer.peerOrigin('localhost'), 'http://localhost:9925');
 	assert.equal(peer.peerOrigin('127.0.0.1'), 'http://127.0.0.1:9925');

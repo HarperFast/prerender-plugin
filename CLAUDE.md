@@ -69,9 +69,20 @@ packages' current tarballs to that release tag.
   connection closed with zero bytes → undici `UND_ERR_SOCKET: other side closed`, which the
   consumer mislabels as an unreachable host and circuit-breaks. Build queue URLs as
   `localhost`/`127.0.0.1` → `http`, else `https` — see the claim path in
-  [`RenderQueueConsumer.ts`](packages/browser/src/RenderQueueConsumer.ts) and `callbackOrigin` in
-  [`RenderQueue.js`](packages/plugin/src/resources/RenderQueue.js) (which currently checks only
-  `localhost`, not `127.0.0.1`).
+  [`RenderQueueConsumer.ts`](packages/browser/src/RenderQueueConsumer.ts) and `callbackOrigin`,
+  which RenderQueue builds with `peerOrigin()` in [`util/peer.js`](packages/plugin/src/util/peer.js)
+  (`localhost`, `127.0.0.1` and `::1` → `http`).
+
+- **Don't assume `9926` is reachable off-host.** Every Fabric host binds the container's ports to
+  the host loopback (`127.0.0.1:9936:9926`, …) and a front proxy publishes them. nginx-fronted hosts
+  listen on `9926` too; hosts fronted by the host-manager's **Symphony** proxy
+  (`/var/hdb/hmroot/symphony/config.json`) listen on `80`, `443`, `9925`, `8883` and `9933` only.
+  There `9926` is filtered from the internet and refused node to node, and the generated config is
+  rewritten on every instance change, so it can't be patched by hand. On such a cluster set the
+  plugin's `network.publicPort: 443` (the port in every
+  job's `callbackOrigin` and every peer call), the fleet's `queuePort: 443`, and list the console's
+  `nodes` without a port. Harper's own `http.securePort` still reads `9926` there, which is why
+  the plugin can't infer it.
 
 - **Residency: an unowned READ blocks, an unowned WRITE does not.** `RenderSchedule` is pinned with
   `setResidencyById`, so on a 4-node cluster ~75% of its keys belong to another node. A point read of
