@@ -174,7 +174,7 @@ export const prefetchHeaders = (
 		'sec-fetch-site': 'none',
 		'sec-fetch-user': '?1',
 	};
-	const base = profile?.userAgent ?? defaultUserAgent;
+	const base = profile.userAgent ?? defaultUserAgent;
 	const userAgent = base ? withUserAgentSuffix(base, config.userAgentSuffix) : undefined;
 	if (userAgent) headers['user-agent'] = userAgent;
 	// CLIENT HINTS, because they are what modern device detection reads. An origin or CDN keyed on
@@ -184,7 +184,7 @@ export const prefetchHeaders = (
 	// from the profile the render itself uses, so the two agree by construction. The brand list
 	// (`Sec-CH-UA`) is deliberately omitted rather than invented: a fabricated brand/version set is
 	// likelier to be wrong than absent, and nothing routes on it.
-	const mobile = profile?.viewport?.isMobile === true || /Mobile|Android|iPhone|iPad/i.test(userAgent ?? '');
+	const mobile = profile.viewport.isMobile === true || /Mobile|Android|iPhone|iPad/i.test(userAgent ?? '');
 	headers['sec-ch-ua-mobile'] = mobile ? '?1' : '?0';
 	const platform = platformOf(userAgent);
 	if (platform) headers['sec-ch-ua-platform'] = `"${platform}"`;
