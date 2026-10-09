@@ -222,7 +222,7 @@ fetched — it is its own response, arrived early), and the later variants repla
 without cookies. A prefetched document is that device's own response, so prefetch needs none of the
 cross-device guards and works on its own for a single-device job; with `enabled` it is also what the
 siblings replay. The request is built to be what the navigation would send (device user agent or the
-browser's own, `extraHeaders`, the bypass token, the job's headers, Chrome's navigation `Accept` and
+browser's own plus `userAgentSuffix`, `extraHeaders`, the bypass token, the job's headers, Chrome's navigation `Accept` and
 `Sec-Fetch-*`), and host resolution follows `hostResolverRules` exactly as Chrome does — a deployment
 pinned to a staging edge never has its prefetch reach production. Only a final `200 text/html` within
 32 MB is held; a redirect, an error status, a non-HTML body, a timeout (`timeoutMs`) or any failure
@@ -390,6 +390,7 @@ include what you change:
 	},
 	"injectWebComponentsPolyfill": true, // force ShadyDOM/ShadyCSS so shadow-DOM CSS serializes
 	"extraHeaders": {}, // extra request headers on the navigation request
+	"userAgentSuffix": "", // product token appended to every UA a render sends, e.g. "HarperRender/1.0" (see below)
 	// optional: config patches that apply only to the renders they match. See "Scoped overrides".
 	"overrides": [
 		{
@@ -403,6 +404,26 @@ include what you change:
 
 Invalid config (missing viewport, `defaultDevice` not in `devices`, non-positive budgets) throws at
 `startWorker()`.
+
+### `userAgentSuffix` — labelling render traffic for the origin
+
+Renders otherwise reach the origin as ordinary browsers: the bypass token identifies them to the CDN, but
+the origin's client-side analytics never sees that header, so every render counts as a real visitor there. Set
+`userAgentSuffix` (e.g. `"HarperRender/1.0"`) and it is appended, after one space, to every User-Agent a
+render sends — the navigation, every subresource, `navigator.userAgent` inside the page, and the document
+prefetch — so the origin can filter render traffic on it. A device profile without a `userAgent` gets
+Chrome's own UA plus the token. Empty (the default) changes nothing. A scoped override can set it per
+route or device, and the prefetch follows the same override as the page.
+
+On a profile **without** a `userAgent`, the suffix turns Chrome's own UA into an override, and Chrome sends
+no `Sec-CH-UA*` client hints and an empty `navigator.userAgentData` for an overridden UA (measured, Chrome 148) — exactly as for a profile that sets `userAgent` itself. A profile that already sets one sees no
+difference; one that does not loses its client hints, so include that in the comparison below.
+
+Keep a real-browser UA as the base: sites commonly gate third-party tags on the UA (refusing a
+`HeadlessChrome` one is typical), and appending leaves the base the gate reads intact. Keep the word
+`prerender` out of the token — sites and middleware read a `prerender` UA as a prerender service's own
+fetch, the usual loop guard. Render a sample of pages with and without it before enabling: a tag that
+sniffs the UA for bot words could change what the snapshot contains.
 
 ### Scoped overrides — per-route settle, and per-route everything else
 

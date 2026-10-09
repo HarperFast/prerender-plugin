@@ -2,6 +2,7 @@ import dns from 'node:dns';
 import { Agent, fetch } from 'undici';
 import type RenderJob from './RenderJob.js';
 import { settings } from './settings.js';
+import { resolveConfigForJob, withUserAgentSuffix } from './config.js';
 import type { CapturedDocument } from './documentReuse.js';
 
 /**
@@ -23,7 +24,7 @@ import type { CapturedDocument } from './documentReuse.js';
  * before. Prefetch is an optimisation, never a substitute for the origin's answer.
  *
  * FIDELITY. The request is built to be what the navigation would have sent: the device profile's user
- * agent (or the browser's own, for a profile without one), `config.extraHeaders`, the origin-bypass
+ * agent (or the browser's own, for a profile without one) plus `config.userAgentSuffix`, `config.extraHeaders`, the origin-bypass
  * token, the job's own headers, and Chrome's navigation `Accept` / `Sec-Fetch-*` set. Host resolution
  * follows `hostResolverRules` exactly as Chrome's `--host-resolver-rules` does — connect to the mapped
  * IP, keep the Host header and TLS SNI — because a deployment that pins its origin host to a staging
@@ -160,7 +161,9 @@ export const prefetchHeaders = (
 	deviceType: string,
 	defaultUserAgent?: string
 ): Record<string, string> => {
-	const config = settings.config;
+	// The config THIS render resolves (scoped overrides applied), so a device UA, `userAgentSuffix` or
+	// `extraHeaders` an override sets reaches the prefetch exactly as it reaches the page.
+	const { config } = resolveConfigForJob(settings.config, { url: job.url, deviceType });
 	const profile = config.devices[deviceType] ?? config.devices[config.defaultDevice];
 	const headers: Record<string, string> = {
 		'accept': NAVIGATION_ACCEPT,
@@ -171,7 +174,8 @@ export const prefetchHeaders = (
 		'sec-fetch-site': 'none',
 		'sec-fetch-user': '?1',
 	};
-	const userAgent = profile?.userAgent ?? defaultUserAgent;
+	const base = profile.userAgent ?? defaultUserAgent;
+	const userAgent = base ? withUserAgentSuffix(base, config.userAgentSuffix) : undefined;
 	if (userAgent) headers['user-agent'] = userAgent;
 	// CLIENT HINTS, because they are what modern device detection reads. An origin or CDN keyed on
 	// `Sec-CH-UA-Mobile` answers a request without it as a desktop client whatever the UA string
@@ -180,7 +184,7 @@ export const prefetchHeaders = (
 	// from the profile the render itself uses, so the two agree by construction. The brand list
 	// (`Sec-CH-UA`) is deliberately omitted rather than invented: a fabricated brand/version set is
 	// likelier to be wrong than absent, and nothing routes on it.
-	const mobile = profile?.viewport?.isMobile === true || /Mobile|Android|iPhone|iPad/i.test(userAgent ?? '');
+	const mobile = profile.viewport.isMobile === true || /Mobile|Android|iPhone|iPad/i.test(userAgent ?? '');
 	headers['sec-ch-ua-mobile'] = mobile ? '?1' : '?0';
 	const platform = platformOf(userAgent);
 	if (platform) headers['sec-ch-ua-platform'] = `"${platform}"`;

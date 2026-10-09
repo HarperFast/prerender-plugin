@@ -190,3 +190,15 @@ test('navigation.finalDomStable defaults off and must be a boolean', () => {
 		/navigation.finalDomStable must be a boolean/
 	);
 });
+
+test('userAgentSuffix defaults to empty and must be header-safe words', () => {
+	assert.equal(defaultConfig().userAgentSuffix, '');
+	assert.equal(mergeConfig({ userAgentSuffix: 'HarperRender/1.0' }).userAgentSuffix, 'HarperRender/1.0');
+	assert.equal(
+		mergeConfig({ userAgentSuffix: 'HarperRender/1.0 (+https://example.com)' }).userAgentSuffix,
+		'HarperRender/1.0 (+https://example.com)'
+	);
+	for (const bad of ['Harper\nRender/1', ' HarperRender/1.0', 'HarperRender/1.0 ', 'a  b', 'Harpér/1', 42]) {
+		assert.throws(() => mergeConfig({ userAgentSuffix: bad as never }), /userAgentSuffix/, JSON.stringify(bad));
+	}
+});

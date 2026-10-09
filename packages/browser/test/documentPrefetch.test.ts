@@ -118,6 +118,60 @@ test("a profile without a user agent sends the browser's own, and none when that
 	);
 });
 
+// Re-resolve the settings with `config` for one test, then put the suite's own back.
+const SUITE_CONFIG = {
+	devices: {
+		desktop: { userAgent: 'DesktopUA/1', viewport: { width: 1, height: 1 } },
+		bare: { viewport: { width: 1, height: 1 } },
+	},
+	extraHeaders: { 'X-Extra': 'e1', 'X-Both': 'from-config' },
+};
+const withConfig = (config: Record<string, unknown>, fn: () => void) => {
+	const resolve = (c: Record<string, unknown>) =>
+		resolveSettings(
+			{
+				harper: {},
+				hostResolverRules: { [HOST]: '127.0.0.1' },
+				bypass: { header: 'x-bypass', token: 'tok-1' },
+				config: c,
+			},
+			{ requireHarper: false }
+		);
+	resolve({ ...SUITE_CONFIG, ...config });
+	try {
+		fn();
+	} finally {
+		resolve(SUITE_CONFIG);
+	}
+};
+
+test('userAgentSuffix is appended to the profile UA and to the browser’s own, never invented without one', () => {
+	withConfig({ userAgentSuffix: 'HarperRender/1.0' }, () => {
+		assert.equal(prefetchHeaders(job('/p'), 'desktop')['user-agent'], 'DesktopUA/1 HarperRender/1.0');
+		assert.equal(
+			prefetchHeaders(job('/p'), 'bare', 'HeadlessChrome/1')['user-agent'],
+			'HeadlessChrome/1 HarperRender/1.0'
+		);
+		assert.equal('user-agent' in prefetchHeaders(job('/p'), 'bare'), false, 'no base UA: nothing to append to');
+	});
+});
+
+test('a scoped override reaches the prefetch exactly as it reaches the page: suffix and device UA', () => {
+	withConfig(
+		{
+			overrides: [
+				{ name: 'pdp-ua', pathPattern: '^/product/', config: { userAgentSuffix: 'HarperRender/2.0' } },
+				{ name: 'bare-ua', devices: ['bare'], config: { devices: { bare: { userAgent: 'BareUA/9' } } } },
+			],
+		},
+		() => {
+			assert.equal(prefetchHeaders(job('/product/1'), 'desktop')['user-agent'], 'DesktopUA/1 HarperRender/2.0');
+			assert.equal(prefetchHeaders(job('/other'), 'desktop')['user-agent'], 'DesktopUA/1', 'override path not matched');
+			assert.equal(prefetchHeaders(job('/other'), 'bare', 'HeadlessChrome/1')['user-agent'], 'BareUA/9');
+		}
+	);
+});
+
 test('the host-resolver rule is honoured: connects to the mapped IP with the Host header intact', async () => {
 	seen.length = 0;
 	const result = await prefetchDocument(job('/plain'), 'desktop', { timeoutMs: 2000 });
