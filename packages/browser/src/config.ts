@@ -31,6 +31,10 @@ export type DeviceProfile = {
 	viewport: Viewport;
 };
 
+/** `userAgent` with `config.userAgentSuffix` appended after one space; unchanged when the suffix is empty. */
+export const withUserAgentSuffix = (userAgent: string, suffix: string): string =>
+	suffix ? `${userAgent} ${suffix}` : userAgent;
+
 export type BlockConfig = {
 	/** Puppeteer resource types aborted before they load (e.g. image, media, font, stylesheet). */
 	resourceTypes: string[];
@@ -500,6 +504,22 @@ export type PrerenderConfig = {
 	injectWebComponentsPolyfill: boolean;
 	/** Extra request headers added to the navigation request (besides the bypass token and job headers). */
 	extraHeaders: Record<string, string>;
+	/**
+	 * Product token appended, after one space, to every User-Agent a render sends: the page's own
+	 * (navigation, subresources, `navigator.userAgent`) and its document prefetch's. A device profile
+	 * without a `userAgent` gets Chrome's own UA plus the token. Empty (the default) changes nothing.
+	 *
+	 * WHY: render traffic is otherwise identifiable only by the bypass-token header, which an origin's
+	 * analytics never sees, so renders count as real visitors there. A token such as `HarperRender/1.0`
+	 * lets the origin filter them.
+	 *
+	 * Keep a real-browser UA as the base: sites gate third-party tags on the UA (a HeadlessChrome UA is
+	 * a common one to refuse), and appending leaves the base intact. Keep the word `prerender` out of
+	 * the token — sites and middleware treat a `prerender` UA as a prerender service's own fetch, the
+	 * usual loop guard. Render a sample with and without it before enabling: a tag that sniffs the UA
+	 * for bot words could change what the snapshot contains.
+	 */
+	userAgentSuffix: string;
 	documentReuse: DocumentReuseConfig;
 	variantContext: VariantContextConfig;
 	/**
@@ -608,6 +628,7 @@ export const defaultConfig = (): PrerenderConfig => ({
 	cacheKey: { plusIsSpace: false, trailingSlash: 'strip' },
 	injectWebComponentsPolyfill: true,
 	extraHeaders: {},
+	userAgentSuffix: '',
 	documentReuse: {
 		enabled: false,
 		sampleEvery: 0,
@@ -734,6 +755,13 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 	}
 	if (!isPlainObject(config.variantContext) || typeof config.variantContext.shared !== 'boolean') {
 		throw new Error('prerender config: variantContext.shared must be a boolean');
+	}
+	// Printable ASCII words separated by single spaces: it lands in a request header verbatim, and a
+	// control character there fails every request the page makes.
+	if (typeof config.userAgentSuffix !== 'string' || !/^([\x21-\x7e]+( [\x21-\x7e]+)*)?$/.test(config.userAgentSuffix)) {
+		throw new Error(
+			'prerender config: userAgentSuffix must be printable ASCII words separated by single spaces (empty = off)'
+		);
 	}
 	const cookies: unknown = config.documentReuse.cookies;
 	if (!isPlainObject(cookies)) {

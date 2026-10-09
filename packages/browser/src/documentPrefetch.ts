@@ -2,6 +2,7 @@ import dns from 'node:dns';
 import { Agent, fetch } from 'undici';
 import type RenderJob from './RenderJob.js';
 import { settings } from './settings.js';
+import { resolveConfigForJob, withUserAgentSuffix } from './config.js';
 import type { CapturedDocument } from './documentReuse.js';
 
 /**
@@ -160,7 +161,9 @@ export const prefetchHeaders = (
 	deviceType: string,
 	defaultUserAgent?: string
 ): Record<string, string> => {
-	const config = settings.config;
+	// The config THIS render resolves (scoped overrides applied), so a device UA, `userAgentSuffix` or
+	// `extraHeaders` an override sets reaches the prefetch exactly as it reaches the page.
+	const { config } = resolveConfigForJob(settings.config, { url: job.url, deviceType });
 	const profile = config.devices[deviceType] ?? config.devices[config.defaultDevice];
 	const headers: Record<string, string> = {
 		'accept': NAVIGATION_ACCEPT,
@@ -171,7 +174,8 @@ export const prefetchHeaders = (
 		'sec-fetch-site': 'none',
 		'sec-fetch-user': '?1',
 	};
-	const userAgent = profile?.userAgent ?? defaultUserAgent;
+	const base = profile?.userAgent ?? defaultUserAgent;
+	const userAgent = base ? withUserAgentSuffix(base, config.userAgentSuffix) : undefined;
 	if (userAgent) headers['user-agent'] = userAgent;
 	// CLIENT HINTS, because they are what modern device detection reads. An origin or CDN keyed on
 	// `Sec-CH-UA-Mobile` answers a request without it as a desktop client whatever the UA string

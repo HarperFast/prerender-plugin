@@ -1,8 +1,9 @@
+import type { Browser, Page } from 'puppeteer';
 import { Renderer } from './Worker.js';
 import type { RenderTimings, WaitForResult } from './RenderJob.js';
 import { settings } from './settings.js';
 import { CACHE_REPLAY_HEADER, getResourceCache } from './ResourceCache.js';
-import { resolveConfigForJob, type PostProcessConfig } from './config.js';
+import { resolveConfigForJob, withUserAgentSuffix, type PostProcessConfig } from './config.js';
 import { canonicalizeUrl, canonicalVerdict } from './util/url.js';
 import { markRenderPhase } from './util/renderPhase.js';
 import { monitorSource } from './domMonitor.js';
@@ -30,6 +31,21 @@ import {
 } from './documentReuse.js';
 
 const noop = () => {};
+
+// Chrome's own user agent, asked once per browser: what a device profile without a `userAgent`
+// sends, and the base `userAgentSuffix` is appended to for it. A failed ask is forgotten, so the
+// next page asks again rather than inheriting the rejection.
+const chromeUserAgents = new WeakMap<Browser, Promise<string>>();
+const chromeUserAgent = (page: Page): Promise<string> => {
+	const browser = page.browser();
+	let userAgent = chromeUserAgents.get(browser);
+	if (!userAgent) {
+		userAgent = browser.userAgent();
+		chromeUserAgents.set(browser, userAgent);
+		userAgent.catch(() => chromeUserAgents.delete(browser));
+	}
+	return userAgent;
+};
 
 // 1×1 transparent GIF used to satisfy blocked image requests (see block.stubImages).
 const STUB_IMAGE = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
@@ -125,8 +141,15 @@ const renderer: Renderer = async (page, job) => {
 	// is complete before the next variant starts.
 	let documentCapture: Promise<void> | null = null;
 
-	if (profile.userAgent) {
-		setupPromises.push(page.setUserAgent(profile.userAgent));
+	// The device's UA, or Chrome's own for a profile that names none, plus `userAgentSuffix`. With
+	// neither, nothing is overridden and the page keeps Chrome's own, as it always has.
+	if (profile.userAgent || config.userAgentSuffix) {
+		setupPromises.push(
+			(async () => {
+				const base = profile.userAgent ?? (await chromeUserAgent(page));
+				await page.setUserAgent(withUserAgentSuffix(base, config.userAgentSuffix));
+			})()
+		);
 	}
 
 	if (config.injectWebComponentsPolyfill) {
