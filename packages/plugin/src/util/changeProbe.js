@@ -197,7 +197,8 @@ const readBounded = async (stream, maxBytes) => {
 };
 
 /**
- * One probe HTTP request. The configured desktop User-Agent always rides along (probes are
+ * One probe HTTP request. The probe's own desktop User-Agent (`changeProbe.userAgents`, never the miss
+ * proxy's — the origin tells the two apart by product token) always rides along (probes are
  * per-URL, not per-device: the premise of watching these fields is that they are
  * device-invariant). The origin SECURITY TOKEN and the staging-IP DNS pin ride along ONLY for a
  * same-origin probe — both belong to the served origin, and a `request`-mode rule may name any
@@ -213,7 +214,7 @@ const probeRequest = ({ url, method, headers, body }, targetUrl) => {
 		path: urlObj.pathname + urlObj.search,
 		method,
 		headers: {
-			'user-agent': config.origin.userAgents.desktop,
+			'user-agent': config.changeProbe.userAgents.desktop,
 			...(sameOrigin ? { [config.origin.securityToken.header]: config.origin.securityToken.value } : {}),
 			'accept-encoding': 'gzip',
 			...headers,
@@ -351,7 +352,7 @@ export const probeRuleOnce = (rule, url) => probeOnce(rule, url);
 
 /**
  * The page's own DOCUMENT, as the probe would fetch it (the origin token same-origin only, gzip), with
- * `deviceType`'s User-Agent (`origin.userAgents`, the miss proxy's) so a device-specific origin answers
+ * `deviceType`'s probe User-Agent (`changeProbe.userAgents`) so a device-specific origin answers
  * with the document the served page was rendered from: `{ statusCode, headers, body }` with the body a
  * STREAM, so the caller reads only as far as it needs (util/documentFacts.js `documentFactsFromStream`)
  * and destroys the rest. Throws on fetch failure.
@@ -363,7 +364,7 @@ export const probeDocument = (url, deviceType = null) =>
 			method: 'GET',
 			headers: {
 				'accept': 'text/html',
-				'user-agent': config.origin.userAgents[deviceType] ?? config.origin.userAgents.desktop,
+				'user-agent': config.changeProbe.userAgents[deviceType] ?? config.changeProbe.userAgents.desktop,
 			},
 		},
 		url

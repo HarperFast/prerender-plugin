@@ -84,6 +84,9 @@ rest: true # required for the @export-ed table REST endpoints
       desktop: 'Mozilla/5.0 ... HarperProxy/1.0'
       mobile: 'Mozilla/5.0 ... HarperProxy/1.0'
       tablet: 'Mozilla/5.0 ... HarperProxy/1.0'
+    forwardUserAgent: # send the crawler's own UA on the miss-proxy fetch instead, + suffix
+      enabled: false # off = userAgents above; read the option's description before enabling
+      suffix: HarperProxy/1.0 # appended after one space; empty forwards the crawler's UA verbatim
     ignoredHeaders: [] # extra request header names not forwarded to the origin, on top of the
     #                    always-ignored set (hop-by-hop headers plus host, user-agent,
     #                    accept-encoding, cookie, authorization, and the securityToken/debugHeader

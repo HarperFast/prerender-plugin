@@ -274,6 +274,27 @@ test('a proxied origin 301 reaches the crawler WITH its Location, absolute, reso
 	}
 });
 
+// ── The crawler's User-Agent on the proxy fetch ───────────────────────────────────────────────────
+
+const BINGBOT = 'Mozilla/5.0 (compatible; Bingbot/2.0; +http://www.bing.com/bingbot.htm)';
+
+test('a miss reaches the origin as the crawler plus HarperProxy when forwardUserAgent is on, and as the device browser UA when off', async () => {
+	try {
+		let res = await handleBotRequest(request('/desktop/p/ua-off'));
+		await drain(res.body);
+		assert.equal(origin.requests.at(-1).headers['user-agent'], config.origin.userAgents.desktop);
+
+		applyOptions({ ...BASE_OPTIONS, origin: { forwardUserAgent: { enabled: true } } });
+		res = await handleBotRequest(request('/mobile/p/ua-on'));
+		await drain(res.body);
+		assert.equal(res.status, 200);
+		assert.equal(origin.requests.at(-1).headers['user-agent'], `${BINGBOT} HarperProxy/1.0`);
+		await settle(); // each miss's detached scheduling tail, so it lands here and not in the next test
+	} finally {
+		applyOptions(BASE_OPTIONS);
+	}
+});
+
 // ── A URL too long to be a key is proxied, not 500'd ──────────────────────────────────────────────
 
 test('a URL too long to be a cache key is proxied to the origin — not the 500 a key throw made it — and touches no table', async () => {

@@ -270,6 +270,54 @@ test('resolveUpstreamHeaders picks up ignoredHeaders changes across applyOptions
 	assert.equal(upstream['x-second'], undefined);
 });
 
+// --- the User-Agent the origin sees ----------------------------------------------------------
+
+const GOOGLEBOT = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
+
+test('by default the crawler’s User-Agent never reaches the origin: the device’s fixed browser UA does', () => {
+	applyOptions({});
+	assert.equal(
+		resolveUpstreamHeaders({ 'user-agent': GOOGLEBOT }, 'mobile')['user-agent'],
+		config.origin.userAgents.mobile
+	);
+	assert.equal(
+		resolveUpstreamHeaders({ 'user-agent': GOOGLEBOT }, 'nope')['user-agent'],
+		config.origin.userAgents.desktop
+	);
+});
+
+test('forwardUserAgent sends the crawler’s own UA with the suffix after one space', () => {
+	applyOptions({ origin: { forwardUserAgent: { enabled: true } } });
+	assert.equal(
+		resolveUpstreamHeaders({ 'user-agent': GOOGLEBOT }, 'mobile')['user-agent'],
+		`${GOOGLEBOT} HarperProxy/1.0`
+	);
+	applyOptions({ origin: { forwardUserAgent: { enabled: true, suffix: 'AcmeProxy/2' } } });
+	assert.equal(
+		resolveUpstreamHeaders({ 'user-agent': GOOGLEBOT }, 'desktop')['user-agent'],
+		`${GOOGLEBOT} AcmeProxy/2`
+	);
+	applyOptions({});
+});
+
+test('forwardUserAgent with an empty suffix forwards the crawler’s UA verbatim', () => {
+	applyOptions({ origin: { forwardUserAgent: { enabled: true, suffix: '' } } });
+	assert.equal(resolveUpstreamHeaders({ 'user-agent': GOOGLEBOT }, 'desktop')['user-agent'], GOOGLEBOT);
+	applyOptions({});
+});
+
+test('forwardUserAgent falls back to the device UA when there is no crawler UA to forward', () => {
+	applyOptions({ origin: { forwardUserAgent: { enabled: true } } });
+	// No downstream at all, an empty UA, and headers with no UA (the negative cache's background re-check).
+	assert.equal(resolveUpstreamHeaders(undefined, 'tablet')['user-agent'], config.origin.userAgents.tablet);
+	assert.equal(resolveUpstreamHeaders({ 'user-agent': '' }, 'tablet')['user-agent'], config.origin.userAgents.tablet);
+	assert.equal(
+		resolveUpstreamHeaders({ accept: 'text/html' }, 'mobile')['user-agent'],
+		config.origin.userAgents.mobile
+	);
+	applyOptions({});
+});
+
 // --- origin response-header cap -------------------------------------------------------------
 //
 // Asserted behaviorally against a real server rather than by reading undici's internal
