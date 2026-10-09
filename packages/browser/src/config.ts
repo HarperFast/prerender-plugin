@@ -509,9 +509,15 @@ export type PrerenderConfig = {
 	 * (navigation, subresources, `navigator.userAgent`) and its document prefetch's. A device profile
 	 * without a `userAgent` gets Chrome's own UA plus the token. Empty (the default) changes nothing.
 	 *
-	 * WHY: render traffic is otherwise identifiable only by the bypass-token header, which an origin's
-	 * analytics never sees, so renders count as real visitors there. A token such as `HarperRender/1.0`
-	 * lets the origin filter them.
+	 * WHY: render traffic is otherwise identifiable only by the bypass-token header, which the origin's
+	 * client-side analytics never sees, so renders count as real visitors there. A token such as
+	 * `HarperRender/1.0` lets the origin filter them.
+	 *
+	 * CLIENT HINTS. On a profile without a `userAgent` this turns Chrome's own UA into an override, and
+	 * Chrome sends no `Sec-CH-UA*` headers and an empty `navigator.userAgentData` for an overridden UA —
+	 * the suffix's or a profile's own (measured: Chrome 148). A profile that already sets `userAgent`
+	 * sees no difference; one that does not loses its client hints. The metadata is not re-supplied:
+	 * Chrome exposes no getter for its own, and an invented brand list is likelier wrong than absent.
 	 *
 	 * Keep a real-browser UA as the base: sites gate third-party tags on the UA (a HeadlessChrome UA is
 	 * a common one to refuse), and appending leaves the base intact. Keep the word `prerender` out of

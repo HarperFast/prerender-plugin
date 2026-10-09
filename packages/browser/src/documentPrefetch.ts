@@ -24,7 +24,7 @@ import type { CapturedDocument } from './documentReuse.js';
  * before. Prefetch is an optimisation, never a substitute for the origin's answer.
  *
  * FIDELITY. The request is built to be what the navigation would have sent: the device profile's user
- * agent (or the browser's own, for a profile without one), `config.extraHeaders`, the origin-bypass
+ * agent (or the browser's own, for a profile without one) plus `config.userAgentSuffix`, `config.extraHeaders`, the origin-bypass
  * token, the job's own headers, and Chrome's navigation `Accept` / `Sec-Fetch-*` set. Host resolution
  * follows `hostResolverRules` exactly as Chrome's `--host-resolver-rules` does — connect to the mapped
  * IP, keep the Host header and TLS SNI — because a deployment that pins its origin host to a staging

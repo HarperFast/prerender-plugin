@@ -408,12 +408,16 @@ Invalid config (missing viewport, `defaultDevice` not in `devices`, non-positive
 ### `userAgentSuffix` — labelling render traffic for the origin
 
 Renders otherwise reach the origin as ordinary browsers: the bypass token identifies them to the CDN, but
-an origin's analytics never sees that header, so every render counts as a real visitor there. Set
+the origin's client-side analytics never sees that header, so every render counts as a real visitor there. Set
 `userAgentSuffix` (e.g. `"HarperRender/1.0"`) and it is appended, after one space, to every User-Agent a
 render sends — the navigation, every subresource, `navigator.userAgent` inside the page, and the document
 prefetch — so the origin can filter render traffic on it. A device profile without a `userAgent` gets
 Chrome's own UA plus the token. Empty (the default) changes nothing. A scoped override can set it per
 route or device, and the prefetch follows the same override as the page.
+
+On a profile **without** a `userAgent`, the suffix turns Chrome's own UA into an override, and Chrome sends
+no `Sec-CH-UA*` client hints and an empty `navigator.userAgentData` for an overridden UA (measured, Chrome 148) — exactly as for a profile that sets `userAgent` itself. A profile that already sets one sees no
+difference; one that does not loses its client hints, so include that in the comparison below.
 
 Keep a real-browser UA as the base: sites commonly gate third-party tags on the UA (refusing a
 `HeadlessChrome` one is typical), and appending leaves the base the gate reads intact. Keep the word
