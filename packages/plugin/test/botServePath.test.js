@@ -295,30 +295,6 @@ test('a miss reaches the origin as the crawler plus HarperProxy when forwardUser
 	}
 });
 
-test('our own forwarded fetch routed back by the edge is refused 508 — never proxied again', async () => {
-	try {
-		applyOptions({ ...BASE_OPTIONS, origin: { forwardUserAgent: { enabled: true } } });
-		const res = await handleBotRequest(
-			request('/desktop/p/looped', 'GET', { 'user-agent': `${BINGBOT} HarperProxy/1.0` })
-		);
-		assert.equal(res.status, 508);
-		assert.equal(origin.requests.length, 0, 'not proxied');
-		await settle();
-		assert.deepEqual(tableKeys, [], 'not looked up, scheduled or discovered');
-
-		// Forwarding off: the same UA is just a request (our fixed UAs are browsers, which the edge never routes here).
-		applyOptions(BASE_OPTIONS);
-		const plain = await handleBotRequest(
-			request('/desktop/p/looped', 'GET', { 'user-agent': `${BINGBOT} HarperProxy/1.0` })
-		);
-		await drain(plain.body);
-		assert.equal(plain.status, 200);
-		await settle();
-	} finally {
-		applyOptions(BASE_OPTIONS);
-	}
-});
-
 // ── A URL too long to be a key is proxied, not 500'd ──────────────────────────────────────────────
 
 test('a URL too long to be a cache key is proxied to the origin — not the 500 a key throw made it — and touches no table', async () => {

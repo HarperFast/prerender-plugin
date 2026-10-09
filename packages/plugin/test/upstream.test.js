@@ -7,7 +7,6 @@ import {
 	configuredStagingIp,
 	dispatcherFor,
 	drainOrDestroy,
-	isForwardedProxyLoop,
 	releaseOriginBody,
 	resolveUpstreamHeaders,
 	sanitizeOriginResponseHeaders,
@@ -316,22 +315,6 @@ test('forwardUserAgent falls back to the device UA when there is no crawler UA t
 		resolveUpstreamHeaders({ accept: 'text/html' }, 'mobile')['user-agent'],
 		config.origin.userAgents.mobile
 	);
-	applyOptions({});
-});
-
-const uaHeaders = (ua) => ({ get: (name) => (name === 'user-agent' ? ua : null) });
-
-test('isForwardedProxyLoop recognises our own forwarded fetch only while forwarding is on with a suffix', () => {
-	const ours = `${GOOGLEBOT} HarperProxy/1.0`;
-	applyOptions({});
-	assert.equal(isForwardedProxyLoop(uaHeaders(ours)), false, 'forwarding off: no guard');
-	applyOptions({ origin: { forwardUserAgent: { enabled: true } } });
-	assert.equal(isForwardedProxyLoop(uaHeaders(ours)), true);
-	assert.equal(isForwardedProxyLoop(uaHeaders(GOOGLEBOT)), false, 'the crawler itself');
-	assert.equal(isForwardedProxyLoop(uaHeaders('HarperProxy/1.0')), false, 'only as a suffix after a space');
-	assert.equal(isForwardedProxyLoop(uaHeaders(null)), false);
-	applyOptions({ origin: { forwardUserAgent: { enabled: true, suffix: '' } } });
-	assert.equal(isForwardedProxyLoop(uaHeaders(GOOGLEBOT)), false, 'an empty suffix disables the guard');
 	applyOptions({});
 });
 

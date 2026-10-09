@@ -547,22 +547,21 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'Only the proxy fetch is affected — it is the one made on behalf of a single crawler. Renders, ' +
 				'change probes, serve checks and sitemap fetches are Harper’s own traffic and keep their own UAs.\n\n' +
 				'SETTLE TWO THINGS WITH WHOEVER RUNS THE EDGE BEFORE ENABLING. (1) A crawler UA from Harper’s ' +
-				'addresses fails the crawler’s IP verification, so whatever routes bot traffic to Harper must ' +
-				'exempt requests carrying `securityToken` — else the edge sends Harper’s fetch straight back to ' +
-				'Harper. A request arriving here whose UA ends in ` <suffix>` is that loop, and is refused with ' +
-				'508 (`prerender_ops` `proxy_loop`) instead of being proxied again; an empty `suffix` disables ' +
-				'this guard. (2) The raw cache (`render.raw`) stores a proxied document and replays it to OTHER ' +
-				'crawlers — correct only if the origin answers crawlers the same as each other. The experiment ' +
-				'that settles it: fetch one URL from the origin, with the token, once with a browser UA and once ' +
-				'with a crawler UA, and compare status, canonical and body (past per-request churn). A ' +
-				'difference the origin does not declare in `Vary` means leave this off, or turn the raw cache off.',
+				'addresses fails the crawler’s IP verification, so everything the edge does to an unverified ' +
+				'crawler must exempt requests carrying `securityToken`: the rule that routes bot traffic to ' +
+				'Harper (else the fetch comes straight back here), and bot mitigation’s deny, challenge or ' +
+				'serve-alternate actions (else the crawler is relayed a 403, or a 200 page the raw cache stores ' +
+				'and replays). (2) The raw cache (`render.raw`) stores a proxied document and replays it to ' +
+				'OTHER crawlers — correct only if the origin answers crawlers the same as each other. One ' +
+				'experiment settles both: fetch a URL through the edge, with the token, once with a browser UA ' +
+				'and once with a crawler UA plus `suffix`, and compare status, canonical and body (past ' +
+				'per-request churn). Any difference means leave this off.',
 			{
 				enabled: option(false, 'Forward the crawler’s User-Agent on the proxy fetch.'),
 				suffix: option(
 					PROXY_TOKEN,
 					'Product token appended to the forwarded UA, after one space, so Harper’s fetches stay ' +
-						'identifiable. Also the loop guard’s marker (see above); empty forwards the UA verbatim and ' +
-						'disables the guard.'
+						'identifiable. Empty forwards the crawler’s UA verbatim.'
 				),
 			}
 		),

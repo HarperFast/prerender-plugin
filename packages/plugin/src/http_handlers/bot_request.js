@@ -15,7 +15,7 @@ import {
 } from '../util/routeClass.js';
 import { Target } from '../resources/Target.js';
 import { QueueState } from '../resources/QueueState.js';
-import { fetchOriginResource, isForwardedProxyLoop } from '../util/upstream.js';
+import { fetchOriginResource } from '../util/upstream.js';
 import { PrerenderedPage } from '../resources/PrerenderedPage.js';
 import { resolveServingPolicy, pollForFreshRender } from '../util/renderNow.js';
 import { resolveServeStatus } from '../util/pageFreshness.js';
@@ -55,13 +55,6 @@ export async function handleBotRequest(request) {
 	let sampleUrl = null;
 
 	try {
-		// OUR OWN PROXY FETCH, ROUTED BACK (util/upstream.js#isForwardedProxyLoop): refused before it is counted
-		// as the crawler it names, so a misconfigured edge shows up as `proxy_loop` and 508s, not doubled
-		// bot traffic and a chain of proxies.
-		if (isForwardedProxyLoop(request.headers)) {
-			metrics.proxyLoop();
-			return { headers: {}, status: 508 };
-		}
 		const target = resolveBotTarget(request);
 		if (!target) {
 			return { headers: {}, status: 400 };
