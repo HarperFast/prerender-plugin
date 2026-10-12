@@ -193,8 +193,9 @@ const VALIDATOR_HEADERS = ['if-none-match', 'if-modified-since'];
 
 /**
  * The User-Agent the origin sees: the crawler's own plus `origin.forwardUserAgent.suffix` when forwarding is
- * on and the request carried one, else this device's fixed browser string (`origin.userAgents`). A request
- * Harper makes on its own behalf (the negative cache's re-check) has no crawler and takes the fixed string.
+ * on and the request carried one, else this device's fixed browser string (`origin.userAgents`). The negative
+ * cache's background re-check carries the UA of the crawler whose request started it (util/negativeCache.js),
+ * so it is labelled the same way.
  */
 const originUserAgent = (downstream, deviceType) => {
 	const forward = config.origin.forwardUserAgent;
