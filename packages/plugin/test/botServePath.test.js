@@ -295,6 +295,44 @@ test('a miss reaches the origin as the crawler plus HarperProxy when forwardUser
 	}
 });
 
+test('a negative-cache re-check reaches the origin as the crawler that started it plus HarperProxy, and as the device browser UA with forwarding off', async () => {
+	const GOOGLEBOT = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
+	origin.respond = (_req, res) => {
+		res.writeHead(404, { 'content-type': 'text/html' });
+		res.end('<html>gone</html>');
+	};
+	// Store the 404, then age it past `freshMs` (1h) so the next request answers from storage and re-checks.
+	const storedAndAged = async (path) => {
+		await drain((await handleBotRequest(request(path))).body);
+		for (let i = 0; i < 100 && negativeRows.size === 0; i++) await settle(20);
+		const [key, row] = [...negativeRows.entries()][0];
+		negativeRows.set(key, { ...row, checkedAt: new Date(Date.now() - 2 * 3_600_000) });
+	};
+	const recheckUserAgent = async (path) => {
+		const before = origin.requests.length;
+		const res = await handleBotRequest(request(path, 'GET', { 'user-agent': GOOGLEBOT }));
+		await drain(res.body);
+		assert.equal(res.headers.get('x-harper-cache'), 'negative-revalidate');
+		for (let i = 0; i < 100 && origin.requests.length === before; i++) await settle(20);
+		const recheck = origin.requests.at(-1);
+		assert.equal(recheck.method, 'HEAD');
+		return recheck.headers['user-agent'];
+	};
+	try {
+		applyOptions({ ...BASE_OPTIONS, origin: { forwardUserAgent: { enabled: true } } });
+		await storedAndAged('/desktop/neg/ua-on');
+		assert.equal(await recheckUserAgent('/desktop/neg/ua-on'), `${GOOGLEBOT} HarperProxy/1.0`);
+
+		negativeRows.clear();
+		applyOptions(BASE_OPTIONS);
+		await storedAndAged('/desktop/neg/ua-off');
+		assert.equal(await recheckUserAgent('/desktop/neg/ua-off'), config.origin.userAgents.desktop);
+		await settle(); // the re-check's detached settle, so it lands here and not in the next test
+	} finally {
+		applyOptions(BASE_OPTIONS);
+	}
+});
+
 // ── A URL too long to be a key is proxied, not 500'd ──────────────────────────────────────────────
 
 test('a URL too long to be a cache key is proxied to the origin — not the 500 a key throw made it — and touches no table', async () => {

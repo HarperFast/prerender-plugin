@@ -527,7 +527,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'in origin/CDN logs while still presenting a real, device-appropriate browser UA (the origin ' +
 				'serves device-specific HTML off it).\n\n' +
 				'With `forwardUserAgent.enabled` these are only the fallback, for a request that arrived ' +
-				'without a User-Agent (and for the negative cache’s background re-checks, which have no crawler).',
+				'without a User-Agent.',
 			{
 				mobile: option(`${DEVICE_BROWSER_UAS.mobile} ${PROXY_TOKEN}`, 'UA for mobile proxy fetches.'),
 				tablet: option(`${DEVICE_BROWSER_UAS.tablet} ${PROXY_TOKEN}`, 'UA for tablet proxy fetches.'),
@@ -544,7 +544,9 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'Harper on its behalf. An origin-side report that counts crawlers by UA substring must now ' +
 				'exclude `suffix`, or it counts each proxied miss twice (the edge already logged the crawler’s ' +
 				'own request).\n\n' +
-				'Only the proxy fetch is affected — it is the one made on behalf of a single crawler. Renders, ' +
+				'Only the proxy fetch is affected — it is the one made on behalf of a single crawler — and the ' +
+				'negative cache’s background re-check (`render.negative`), which carries the UA of the crawler ' +
+				'whose request started it. Renders, ' +
 				'change probes, serve checks and sitemap fetches are Harper’s own traffic and keep their own UAs.\n\n' +
 				'SETTLE TWO THINGS WITH WHOEVER RUNS THE EDGE BEFORE ENABLING. (1) A crawler UA from Harper’s ' +
 				'addresses fails the crawler’s IP verification, so everything the edge does to an unverified ' +

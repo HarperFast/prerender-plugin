@@ -296,11 +296,18 @@ const attachNegativeCapture = (resource, { key, policy, guarded }) => {
 	return { ...resource, content: downstream, releaseBody: () => discardStream(downstream) };
 };
 
-// What a background re-check sends. There is no request to borrow headers from — the one that triggered
-// it has already been answered — so it carries only what the origin fetch adds itself (user agent per
-// device, the bypass token, accept-encoding) plus an `accept`. `get` answers null so the staging toggle,
-// which reads a request header, can never switch a re-check to the staging edge.
-const RECHECK_HEADERS = Object.freeze({ asObject: Object.freeze({ accept: 'text/html' }), get: () => null });
+// What a background re-check sends. The request that triggered it has already been answered, so it
+// borrows one header from it: the crawler's User-Agent. The re-check is an origin fetch made because that
+// crawler asked for this URL, so under `origin.forwardUserAgent` it reaches the origin labelled the way a
+// miss is (`<crawler UA> HarperProxy/1.0`), and with forwarding off, or no UA, it takes the fixed device
+// string. Everything else is what the origin fetch adds itself (the bypass token, accept-encoding) plus an
+// `accept`. `get` answers null so the staging toggle, which reads a request header, can never switch a
+// re-check to the staging edge.
+const recheckHeaders = (userAgent) => ({
+	asObject:
+		typeof userAgent === 'string' ? { 'accept': 'text/html', 'user-agent': userAgent } : { accept: 'text/html' },
+	get: () => null,
+});
 
 /** Re-checks in flight, by key: one per URL per worker, and at most `maxConcurrentChecks` at once. */
 const inFlightChecks = new Map();
@@ -383,7 +390,9 @@ export const refreshNegativeBody = async ({ key, resource, policy, nowMs = Date.
  * `negative-revalidate` (source origin) only then, so bot_serve and origin_fetch agree one for one.
  *
  * A HEAD, unless `refreshBody` (the stored bytes have outlived `lifeMs`): then a GET, whose 404 replaces
- * them. Bounded like a capture — `maxBytes` per check, `maxConcurrentChecks` checks.
+ * them. Bounded like a capture — `maxBytes` per check, `maxConcurrentChecks` checks. `userAgent` is the
+ * User-Agent of the request that started it (see `recheckHeaders`); a request that joins one already in
+ * flight is not re-sent under its own.
  *
  * Per worker, not per node: two workers can re-check the same key at once. That is at most one extra
  * request per worker per key, and coordinating across threads would cost more than it saves.
@@ -397,6 +406,7 @@ export const startNegativeRecheck = ({
 	onLive,
 	refreshBody = false,
 	confirmedAtMs = NaN,
+	userAgent,
 	fetchOrigin = fetchOriginResource,
 }) => {
 	if (inFlightChecks.has(key)) {
@@ -414,7 +424,7 @@ export const startNegativeRecheck = ({
 				url,
 				deviceType,
 				method: refreshBody ? 'GET' : 'HEAD',
-				headers: RECHECK_HEADERS,
+				headers: recheckHeaders(userAgent),
 				reason: 'revalidate',
 			});
 		} catch (e) {
@@ -455,6 +465,7 @@ export const answerFromNegativeCache = async ({
 	deviceType,
 	method,
 	botName,
+	userAgent,
 	policy,
 	epochOf = async () => null,
 	onLive,
@@ -526,6 +537,7 @@ export const answerFromNegativeCache = async ({
 					onLive,
 					refreshBody: negativeBodyExpired(row, policy, nowMs),
 					confirmedAtMs: checkedAtMs,
+					userAgent,
 				})
 			: false;
 	return {
