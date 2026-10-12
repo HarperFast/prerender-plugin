@@ -295,20 +295,21 @@ test('a miss reaches the origin as the crawler plus HarperProxy when forwardUser
 	}
 });
 
-test('a negative-cache re-check reaches the origin as the crawler that started it plus HarperProxy, and as the device browser UA with forwarding off', async () => {
+test('a stored 404 reaches the origin as a proxied miss (crawler plus HarperProxy when forwarding), and its background re-check as the probe, forwarding on or off', async () => {
 	const GOOGLEBOT = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
 	origin.respond = (_req, res) => {
 		res.writeHead(404, { 'content-type': 'text/html' });
 		res.end('<html>gone</html>');
 	};
-	// Store the 404, then age it past `freshMs` (1h) so the next request answers from storage and re-checks.
-	const storedAndAged = async (path) => {
+	// The first ask proxies and stores the 404; age it past `freshMs` (1h) so the next answers from storage
+	// and re-checks. Returns the User-Agent of each origin request: the proxied miss, then the re-check.
+	const missThenRecheck = async (path) => {
 		await drain((await handleBotRequest(request(path))).body);
+		const miss = origin.requests.at(-1);
 		for (let i = 0; i < 100 && negativeRows.size === 0; i++) await settle(20);
 		const [key, row] = [...negativeRows.entries()][0];
 		negativeRows.set(key, { ...row, checkedAt: new Date(Date.now() - 2 * 3_600_000) });
-	};
-	const recheckUserAgent = async (path) => {
+
 		const before = origin.requests.length;
 		const res = await handleBotRequest(request(path, 'GET', { 'user-agent': GOOGLEBOT }));
 		await drain(res.body);
@@ -316,17 +317,20 @@ test('a negative-cache re-check reaches the origin as the crawler that started i
 		for (let i = 0; i < 100 && origin.requests.length === before; i++) await settle(20);
 		const recheck = origin.requests.at(-1);
 		assert.equal(recheck.method, 'HEAD');
-		return recheck.headers['user-agent'];
+		return [miss.headers['user-agent'], recheck.headers['user-agent']];
 	};
 	try {
 		applyOptions({ ...BASE_OPTIONS, origin: { forwardUserAgent: { enabled: true } } });
-		await storedAndAged('/desktop/neg/ua-on');
-		assert.equal(await recheckUserAgent('/desktop/neg/ua-on'), `${GOOGLEBOT} HarperProxy/1.0`);
+		let [miss, recheck] = await missThenRecheck('/desktop/neg/ua-on');
+		assert.equal(miss, `${BINGBOT} HarperProxy/1.0`);
+		assert.equal(recheck, config.changeProbe.userAgents.desktop, 'never the crawler that asked, nor HarperProxy');
+		assert.match(recheck, /HarperProbe\/1\.0$/);
 
 		negativeRows.clear();
 		applyOptions(BASE_OPTIONS);
-		await storedAndAged('/desktop/neg/ua-off');
-		assert.equal(await recheckUserAgent('/desktop/neg/ua-off'), config.origin.userAgents.desktop);
+		[miss, recheck] = await missThenRecheck('/mobile/neg/ua-off');
+		assert.equal(miss, config.origin.userAgents.mobile);
+		assert.equal(recheck, config.changeProbe.userAgents.mobile, "the device's probe UA");
 		await settle(); // the re-check's detached settle, so it lands here and not in the next test
 	} finally {
 		applyOptions(BASE_OPTIONS);
