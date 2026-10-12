@@ -553,7 +553,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'crawler must exempt requests carrying `securityToken`: the rule that routes bot traffic to ' +
 				'Harper (else the fetch comes straight back here), and bot mitigation’s deny, challenge or ' +
 				'serve-alternate actions (else the crawler is relayed a 403, or a 200 page the raw cache stores ' +
-				'and replays). (2) The raw cache (`render.raw`) stores a proxied document and replays it to ' +
+				'and replays, and a negative-cache re-check reads that 200 as a dead URL come back live). (2) The raw cache (`render.raw`) stores a proxied document and replays it to ' +
 				'OTHER crawlers — correct only if the origin answers crawlers the same as each other. One ' +
 				'experiment settles both: fetch a URL through the edge, with the token, once with a browser UA ' +
 				'and once with a crawler UA plus `suffix`, and compare status, canonical and body (past ' +
