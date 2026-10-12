@@ -544,16 +544,15 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'Harper on its behalf. An origin-side report that counts crawlers by UA substring must now ' +
 				'exclude `suffix`, or it counts each proxied miss twice (the edge already logged the crawler’s ' +
 				'own request).\n\n' +
-				'Only the proxy fetch is affected — it is the one made on behalf of a single crawler — and the ' +
-				'negative cache’s background re-check (`render.negative`), which carries the UA of the crawler ' +
-				'whose request started it. Renders, ' +
-				'change probes, serve checks and sitemap fetches are Harper’s own traffic and keep their own UAs.\n\n' +
+				'Only the proxy fetch is affected — it is the one made on behalf of a single crawler. Renders, ' +
+				'change probes, serve checks, the negative cache’s background re-checks and sitemap fetches are ' +
+				'Harper’s own traffic and keep their own UAs.\n\n' +
 				'SETTLE TWO THINGS WITH WHOEVER RUNS THE EDGE BEFORE ENABLING. (1) A crawler UA from Harper’s ' +
 				'addresses fails the crawler’s IP verification, so everything the edge does to an unverified ' +
 				'crawler must exempt requests carrying `securityToken`: the rule that routes bot traffic to ' +
 				'Harper (else the fetch comes straight back here), and bot mitigation’s deny, challenge or ' +
 				'serve-alternate actions (else the crawler is relayed a 403, or a 200 page the raw cache stores ' +
-				'and replays, and a negative-cache re-check reads that 200 as a dead URL come back live). (2) The raw cache (`render.raw`) stores a proxied document and replays it to ' +
+				'and replays). (2) The raw cache (`render.raw`) stores a proxied document and replays it to ' +
 				'OTHER crawlers — correct only if the origin answers crawlers the same as each other. One ' +
 				'experiment settles both: fetch a URL through the edge, with the token, once with a browser UA ' +
 				'and once with a crawler UA plus `suffix`, and compare status, canonical and body (past ' +
@@ -1669,11 +1668,13 @@ export const configSchema = group('Prerender plugin configuration.', {
 			),
 			userAgents: group(
 				'Per-device-type User-Agent strings every probe request sends — the sweep, the canary and ' +
-					'`serveCheck` alike. The same device browser strings as `origin.userAgents` but with a ' +
-					'`HarperProbe/1.0` product token, so the origin’s logs can tell probe traffic from the miss ' +
-					'proxy’s (`HarperProxy/1.0`). A rule’s endpoint and the sweep send `desktop`; a serve check ' +
-					'reading the document sends the served device’s, so a device-specific origin answers with ' +
-					'the document that page was rendered from.',
+					'`serveCheck` alike — and the negative cache’s background re-check (`render.negative`), which ' +
+					'checks a stored 404 the same way a serve check checks a cached page. The same device browser ' +
+					'strings as `origin.userAgents` but with a `HarperProbe/1.0` product token, so the origin’s ' +
+					'logs can tell probe traffic from the miss proxy’s (`HarperProxy/1.0`). A rule’s endpoint and ' +
+					'the sweep send `desktop`; a serve check reading the document, and a re-check, send the ' +
+					'served device’s, so a device-specific origin answers with the document that page was ' +
+					'rendered from.',
 				{
 					mobile: option(`${DEVICE_BROWSER_UAS.mobile} ${PROBE_TOKEN}`, 'UA for mobile probe requests.'),
 					tablet: option(`${DEVICE_BROWSER_UAS.tablet} ${PROBE_TOKEN}`, 'UA for tablet probe requests.'),

@@ -193,9 +193,9 @@ const VALIDATOR_HEADERS = ['if-none-match', 'if-modified-since'];
 
 /**
  * The User-Agent the origin sees: the crawler's own plus `origin.forwardUserAgent.suffix` when forwarding is
- * on and the request carried one, else this device's fixed browser string (`origin.userAgents`). The negative
- * cache's background re-check carries the UA of the crawler whose request started it (util/negativeCache.js),
- * so it is labelled the same way.
+ * on and the request carried one, else this device's fixed browser string (`origin.userAgents`). A fetch Harper
+ * makes to check its own copy names its User-Agent itself (`fetchOriginResource`'s `userAgent`) and never
+ * comes here: the negative cache's re-check sends the probe's (util/negativeCache.js).
  */
 const originUserAgent = (downstream, deviceType) => {
 	const forward = config.origin.forwardUserAgent;
@@ -204,9 +204,9 @@ const originUserAgent = (downstream, deviceType) => {
 	return config.origin.userAgents[deviceType] ?? config.origin.userAgents.desktop;
 };
 
-export const resolveUpstreamHeaders = (downstream, deviceType, { stripValidators = false } = {}) => {
+export const resolveUpstreamHeaders = (downstream, deviceType, { stripValidators = false, userAgent } = {}) => {
 	const upstream = {
-		'user-agent': originUserAgent(downstream, deviceType),
+		'user-agent': userAgent ?? originUserAgent(downstream, deviceType),
 		[config.origin.securityToken.header]: config.origin.securityToken.value,
 		// Request gzip (not brotli) from the origin. On a cache miss this response is relayed
 		// to the CDN edge for its alternate-response swap, and the edge cannot apply its outgoing
@@ -370,7 +370,7 @@ const publicLocation = (location, base) => {
 };
 
 export const fetchOriginResource = async (request) => {
-	const { url, deviceType, method = 'GET', body, stripValidators = false, reason = 'other' } = request;
+	const { url, deviceType, method = 'GET', body, stripValidators = false, reason = 'other', userAgent } = request;
 	const headers = request.headers.asObject;
 
 	const urlObj = url instanceof URL ? url : new URL(url);
@@ -391,7 +391,7 @@ export const fetchOriginResource = async (request) => {
 			origin: urlObj.origin,
 			path: urlObj.pathname + urlObj.search,
 			method,
-			headers: resolveUpstreamHeaders(headers, deviceType, { stripValidators }),
+			headers: resolveUpstreamHeaders(headers, deviceType, { stripValidators, userAgent }),
 			body,
 		});
 	} catch (e) {
