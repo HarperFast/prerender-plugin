@@ -312,6 +312,7 @@ test('pageCheck compiles only with in-bounds indices, and only for source "reque
 		priceFrom: 2,
 		availableFrom: 3,
 		vocabulary: null,
+		offersLimit: null,
 		fields: [],
 		ignoreChanges: [],
 	});
@@ -362,14 +363,16 @@ test('pageClaimFromOffers reduces offers to (prices, anyInStock); nothing usable
 	assert.deepEqual(JSON.parse(pageClaimFromOffers(['15.99', 'USD', 'OutOfStock', '15.99', 'USD', 'OutOfStock'])), [
 		['15.99'],
 		false,
+		2,
 	]);
 	// one available SKU is enough
 	assert.deepEqual(JSON.parse(pageClaimFromOffers(['15.99', 'USD', 'OutOfStock', '16.99', 'USD', 'InStock'])), [
 		['15.99', '16.99'],
 		true,
+		2,
 	]);
 	// an absent price must NOT become 0.00 (Number(null) === 0)
-	assert.deepEqual(JSON.parse(pageClaimFromOffers([null, null, 'InStock'])), [[], true]);
+	assert.deepEqual(JSON.parse(pageClaimFromOffers([null, null, 'InStock'])), [[], true, 1]);
 	assert.equal(pageClaimFromOffers(null), null);
 	assert.equal(pageClaimFromOffers([]), null);
 });
@@ -377,24 +380,26 @@ test('pageClaimFromOffers reduces offers to (prices, anyInStock); nothing usable
 test('availability reduces recognized vocabulary only — anything else is NO verdict, never a guess', async () => {
 	// A URL form or unstripped schema.org prefix still reads (defense against a renderer that
 	// didn't normalize), and Google's own in-stock set counts as available.
-	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'https://schema.org/InStock'])), [['9.99'], true]);
-	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'LimitedAvailability'])), [['9.99'], true]);
-	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'SoldOut'])), [['9.99'], false]);
+	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'https://schema.org/InStock'])), [['9.99'], true, 1]);
+	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'LimitedAvailability'])), [['9.99'], true, 1]);
+	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'SoldOut'])), [['9.99'], false, 1]);
 	// PreOrder (and any private vocabulary) is neither available nor unavailable: the verdict is
 	// null, so availability can never disagree — a wrong guess here would hard-expire every
 	// matched page on every pass.
-	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'PreOrder'])), [['9.99'], null]);
-	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'InventoryLevel:42'])), [['9.99'], null]);
+	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'PreOrder'])), [['9.99'], null, 1]);
+	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'InventoryLevel:42'])), [['9.99'], null, 1]);
 	// Mixed definitive-negative + unrecognized must NOT read as "unavailable" — the unrecognized
 	// offer might be the buyable one.
 	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'OutOfStock', '9.99', 'USD', 'PreOrder'])), [
 		['9.99'],
 		null,
+		2,
 	]);
 	// ...but any recognized available offer wins outright.
 	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'PreOrder', '9.99', 'USD', 'InStock'])), [
 		['9.99'],
 		true,
+		2,
 	]);
 	// No readable price AND no verdict = no claim at all.
 	assert.equal(pageClaimFromOffers(['$9.99', 'USD', 'PreOrder']), null);
@@ -450,6 +455,59 @@ test('compareClaims is THREE-WAY: agreed, disagreed, or nothing comparable', asy
 	assert.equal(compareClaims(null, JSON.stringify([['35.99'], true])), null);
 	assert.equal(compareClaims('not json', JSON.stringify([['35.99'], true])), null);
 	assert.equal(compareClaims(JSON.stringify({ a: 1 }), JSON.stringify([['35.99'], true])), null);
+});
+
+test('compareClaims with offersLimit: a page AT its offer cap makes no price claim when the price is absent — and no agreement either', async () => {
+	const { compareClaims } = await import('../src/util/changeProbeSpec.js');
+	const limit = { offersLimit: 50 };
+	// Measured: 50 offers listed of up to ~550 variants, every variant at the endpoint's lowest price unlisted.
+	const atCap = JSON.stringify([['44.97'], true, 50]);
+	// No disagreement, so no re-render loop — but availability agreeing is NOT proof: a capped page whose
+	// listed prices are all stale misses the new price exactly the same way, and must not be certified.
+	assert.equal(compareClaims(atCap, JSON.stringify([['37.47'], true]), limit), null);
+	assert.equal(compareClaims(JSON.stringify([['44.97'], null, 50]), JSON.stringify([['37.47'], null]), limit), null);
+	assert.equal(compareClaims(atCap, JSON.stringify([['37.47'], false]), limit), false, 'availability still decides');
+	assert.equal(compareClaims(atCap, JSON.stringify([['44.97'], true]), limit), true, 'a listed price still agrees');
+	// Not exactly at the cap: every variant is listed (under it), or several products each listed in full (over).
+	assert.equal(compareClaims(JSON.stringify([['44.97'], true, 49]), JSON.stringify([['37.47'], true]), limit), false);
+	assert.equal(compareClaims(JSON.stringify([['44.97'], true, 51]), JSON.stringify([['37.47'], true]), limit), false);
+	// No limit configured, or a claim recorded before the count existed: compared exactly as before.
+	assert.equal(compareClaims(atCap, JSON.stringify([['37.47'], true])), false);
+	assert.equal(compareClaims(atCap, JSON.stringify([['37.47'], true]), { offersLimit: null }), false);
+	assert.equal(compareClaims(JSON.stringify([['44.97'], true]), JSON.stringify([['37.47'], true]), limit), false);
+	assert.equal(compareClaims(atCap, JSON.stringify([['37.47'], true]), null), false, 'no options object at all');
+});
+
+test('pageCheck.offersLimit compiles to an integer >= 1, or null with a warning', () => {
+	const base = {
+		label: 'pdp',
+		pathPattern: '^/p/(\\d+)',
+		source: 'request',
+		request: { urlTemplate: 'https://api.example.com/p/$1' },
+		extract: ['a', 'b'],
+	};
+	const compiled = (offersLimit) => {
+		const warnings = [];
+		const [rule] = compileProbeRules(
+			[{ ...base, pageCheck: { enabled: true, priceFrom: 0, availableFrom: 1, offersLimit } }],
+			warnings
+		);
+		return { offersLimit: rule.pageCheck.offersLimit, warnings };
+	};
+	assert.deepEqual(compiled(50), { offersLimit: 50, warnings: [] });
+	assert.deepEqual(compiled(undefined), { offersLimit: null, warnings: [] });
+	assert.deepEqual(compiled(null), { offersLimit: null, warnings: [] });
+	for (const bad of [0, -1, 2.5, '50']) {
+		const { offersLimit, warnings } = compiled(bad);
+		assert.equal(offersLimit, null, `${JSON.stringify(bad)} is dropped`);
+		assert.match(warnings[0], /offersLimit must be an integer >= 1/);
+	}
+	// Not part of the rule fingerprint: setting it re-baselines nothing.
+	const [a] = compileProbeRules([{ ...base, pageCheck: { enabled: true, priceFrom: 0, availableFrom: 1 } }]);
+	const [b] = compileProbeRules([
+		{ ...base, pageCheck: { enabled: true, priceFrom: 0, availableFrom: 1, offersLimit: 50 } },
+	]);
+	assert.equal(a.fingerprint, b.fingerprint);
 });
 
 test('apiClaimOf projects through the mapping; absent mapped fields yield no claim', async () => {
@@ -545,6 +603,7 @@ test('pageCheck.availableValues / unavailableValues compile into the vocabulary,
 		priceFrom: 0,
 		availableFrom: 1,
 		vocabulary: null,
+		offersLimit: null,
 		fields: [],
 		ignoreChanges: [],
 	});
@@ -1245,6 +1304,27 @@ test('number: numeric equality, "4.0" meets 4, with an optional tolerance; no nu
 });
 
 const offers = (...list) => ({ product: { offers: list } });
+
+test('priceSet with offersLimit: a single price absent from a page AT its cap is no claim; under it, a disagreement', () => {
+	const set = field('priceSet', 'product.offers');
+	const listed = (n, price) => offers(...Array.from({ length: n }, (_, i) => [String(i), price, 'USD', 'InStock']));
+	const cap = { offersLimit: 50 };
+	assert.equal(compareField(set, 37.47, listed(50, '44.97'), cap), null, 'the cheapest variant may be unlisted');
+	assert.equal(compareField(set, 44.97, listed(50, '44.97'), cap), true, 'a listed price still agrees');
+	assert.equal(compareField(set, 37.47, listed(49, '44.97'), cap), false, 'under the cap: every variant is listed');
+	assert.equal(compareField(set, 37.47, listed(51, '44.97'), cap), false, 'over the cap: not one capped product');
+	assert.equal(compareField(set, 37.47, listed(50, '44.97')), false, 'no limit: as before');
+	// The decline is flagged, so a caller can refuse to take anything else on the page as proof.
+	const ctx = { offersLimit: 50 };
+	compareField(set, 37.47, listed(50, '44.97'), ctx);
+	assert.equal(ctx.unshown, true);
+	const listedCtx = { offersLimit: 50 };
+	compareField(set, 44.97, listed(50, '44.97'), listedCtx);
+	assert.equal(listedCtx.unshown, undefined, 'a price the page lists is an ordinary agreement');
+	// A list compares what the page lists already, cap or not.
+	assert.equal(compareField(set, [37.47, 44.97], listed(50, '44.97'), cap), true);
+	assert.equal(compareField(set, [37.47], listed(50, '44.97'), cap), false, 'a printed price the endpoint dropped');
+});
 
 test('priceSet: a single endpoint price must be printed; for a list, every printed price must still be offered', () => {
 	const set = field('priceSet', 'product.offers');

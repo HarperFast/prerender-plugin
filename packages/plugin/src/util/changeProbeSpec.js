@@ -263,7 +263,28 @@ const compilePageCheck = (pc, extract, label, warn) => {
 			availableFrom = pc.availableFrom;
 		}
 	}
-	return { priceFrom, availableFrom, vocabulary: compileVocabulary(pc, label, warn), fields, ignoreChanges };
+	return {
+		priceFrom,
+		availableFrom,
+		vocabulary: compileVocabulary(pc, label, warn),
+		offersLimit: compileOffersLimit(pc.offersLimit, label, warn),
+		fields,
+		ignoreChanges,
+	};
+};
+
+/**
+ * `pageCheck.offersLimit`: the most offers the origin's structured data lists on one page, when it caps
+ * them (null, the default: it lists every variant). A page at the cap may leave out the variant carrying
+ * the endpoint's price, so a single price absent from it is no claim (`compareClaims`, `priceSet`). An
+ * invalid value is dropped with a warning — comparing as though nothing were capped is the historical
+ * behavior, not a new failure.
+ */
+const compileOffersLimit = (raw, label, warn) => {
+	if (raw === undefined || raw === null) return null;
+	if (Number.isInteger(raw) && raw >= 1) return raw;
+	warn(`change-probe ${label}: pageCheck.offersLimit must be an integer >= 1 — ignored`);
+	return null;
 };
 
 /**
@@ -632,7 +653,22 @@ export const pageClaimFromOffers = (flat) => {
 	}
 	const inStock = sawAvailable ? true : sawUnavailable && !sawUnrecognized ? false : null;
 	if (!prices.size && inStock === null) return null;
-	return JSON.stringify([[...prices].sort(), inStock]);
+	// The offer COUNT rides as a third element: a page listing `pageCheck.offersLimit` offers may leave out
+	// the variant carrying the endpoint's price (`compareClaims`). A claim stored before it existed has two
+	// elements and is compared exactly as it always was.
+	return JSON.stringify([[...prices].sort(), inStock, Math.floor(flat.length / 3)]);
+};
+
+/**
+ * Does a page listing `count` offers possibly leave some out — does it list EXACTLY the origin's cap
+ * (`pageCheck.offersLimit`, passed as `ctx.offersLimit` / `options.offersLimit`)? Only then is a price
+ * missing from the page no evidence that the page is wrong. No limit configured: never. Exactly, not at
+ * least: the claim's count is every Product offer on the page, and a page of several products past the
+ * cap between them has listed each one in full.
+ */
+const offersTruncated = (count, limits) => {
+	const offersLimit = limits?.offersLimit ?? null;
+	return offersLimit !== null && count === offersLimit;
 };
 
 /**
@@ -707,8 +743,13 @@ export const apiClaimOf = (values, pageCheck) => {
  * page's set — not whether the sets are equal. Each dimension compares only when both sides
  * actually claim it; a null/empty side is "no claim", which is never a disagreement. Agreement
  * needs at least one dimension compared and none disagreeing.
+ *
+ * A page AT ITS OFFER CAP (`options.offersLimit`, the rule's `pageCheck.offersLimit`, against the offer
+ * count the claim carries) makes no price claim when the endpoint's price is absent from it: the variant
+ * carrying that price may simply be unlisted, and a re-render lists the same offers again. Nor can the
+ * verdict then be an agreement — at best null, false only when availability disagrees.
  */
-export const compareClaims = (pageClaim, apiClaim) => {
+export const compareClaims = (pageClaim, apiClaim, options = {}) => {
 	if (!pageClaim || !apiClaim) return null;
 	try {
 		const page = JSON.parse(pageClaim);
@@ -718,7 +759,7 @@ export const compareClaims = (pageClaim, apiClaim) => {
 		// non-array throws, and this runs inside the sweep's per-URL path where an uncaught throw
 		// would end the whole pass. Anything unrecognisable reads as "no comparable claim".
 		if (!Array.isArray(page) || !Array.isArray(api)) return null;
-		const [pagePrices, pageInStock] = page;
+		const [pagePrices, pageInStock, pageOffers] = page;
 		const [apiPrices, apiInStock] = api;
 		if (!Array.isArray(pagePrices) || !Array.isArray(apiPrices)) return null;
 		let compared = false;
@@ -733,11 +774,17 @@ export const compareClaims = (pageClaim, apiClaim) => {
 		// unreadable price format (currency-prefixed strings, an AggregateOffer) must reduce to
 		// "no price claim", not to "disagrees with every endpoint price" — the latter re-expires
 		// the page after every render, forever.
+		// A price the page cannot show (`offersTruncated`) makes the verdict at best "no claim", never an
+		// agreement on what else compared: a capped page whose listed prices are ALL stale (the whole product
+		// repriced) misses the new price exactly as a current one misses an unlisted variant's, and an
+		// availability-only "agree" would certify it — a verification through an invalidation, a 'healed'.
+		let priceUnshown = false;
 		if (pagePrices.length > 0 && apiPrices.length > 0) {
-			if (!apiPrices.every((price) => pagePrices.includes(price))) return false;
-			compared = true;
+			if (apiPrices.every((price) => pagePrices.includes(price))) compared = true;
+			else if (offersTruncated(pageOffers, options)) priceUnshown = true;
+			else return false;
 		}
-		return compared ? true : null;
+		return compared && !priceUnshown ? true : null;
 	} catch {
 		return null;
 	}
@@ -973,15 +1020,29 @@ const COMPARATORS = {
 	// because the affected products are a small minority. What the subset test gives up is a new
 	// price on a listed variant while its old price survives on another; per-variant exactness is
 	// what `skus` is for.
+	//
+	// The single price has the same blind spot from the other side: the variant that carries it may be one
+	// the page does not list. Measured on the same origin, 19 of 21 single-price disagreements on one node
+	// were pages listing exactly 50 offers with every variant at the endpoint's lowest price left out. So a
+	// page listing exactly `pageCheck.offersLimit` offers (`ctx.offersLimit`) cannot show that a price is
+	// ABSENT — no claim, never a disagreement, and never proof (`ctx.unshown`). It can still show one is present.
 	priceSet: {
 		kinds: ['offers'],
 		keys: [],
 		options: noOptions,
-		compare: (api, page) => {
+		compare: (api, page, _field, ctx) => {
 			const a = priceSetOf(Array.isArray(api) ? api : [api]);
 			const b = Array.isArray(page) ? priceSetOf(page.map((offer) => (Array.isArray(offer) ? offer[1] : null))) : null;
 			if (a === null || b === null) return null;
-			if (!Array.isArray(api)) return b.has([...a][0]);
+			if (!Array.isArray(api)) {
+				if (b.has([...a][0])) return true;
+				if (!offersTruncated(page.length, ctx)) return false;
+				// No claim — and not the ordinary kind: the page MIGHT be wrong here (every listed price stale),
+				// so nothing compared beside it may stand as proof the page is current. Flagged on the
+				// comparison's context (`ctx.unshown`), which the callers read before certifying anything.
+				if (ctx) ctx.unshown = true;
+				return null;
+			}
 			return [...b].every((price) => a.has(price));
 		},
 	},
@@ -1075,8 +1136,12 @@ const fieldApplies = (field, ctx) => {
 /**
  * One mapped field's verdict: true (the page agrees with the endpoint value), false (disagrees),
  * null (not compared). `facts` is a parsed page record (`parsePageFacts`), `ctx` is
- * `{ pageUrl, vocabulary }`. Never throws — a comparator fault on data from a previous release or
- * a corrupted row must not end the sweep; it is no claim.
+ * `{ pageUrl, vocabulary, offersLimit }`. Never throws — a comparator fault on data from a previous
+ * release or a corrupted row must not end the sweep; it is no claim.
+ *
+ * One null is not the ordinary kind: a comparator that declined because the page CANNOT SHOW the value
+ * (a single price on a page at its offer cap, `priceSet`) sets `ctx.unshown`, and a caller must then not
+ * take anything else compared on that page as proof it is current. Reset it per field to attribute it.
  */
 export const compareField = (field, apiValue, facts, ctx = {}) => {
 	if (!facts || apiValue === null || apiValue === undefined) return null;

@@ -1238,7 +1238,7 @@ test('recordPageClaim SEEDS a missing row with put — patch cannot create', asy
 	assert.equal(calls.put[0].id, CLAIM_URL);
 	assert.deepEqual(calls.put[0].row, {
 		url: CLAIM_URL,
-		pageSignature: JSON.stringify([['35.99'], true]),
+		pageSignature: JSON.stringify([['35.99'], true, 1]),
 		// The RENDER's lastCached, passed in — not `Date.now()` at claim time. The serve path tests a
 		// device key with `lastCached >= basisAt`, so a stamp taken even milliseconds later would make
 		// the page this claim certifies fail its own test.
@@ -1256,7 +1256,7 @@ test('recordPageClaim UPDATES an existing row with patch — put would clobber t
 	assert.deepEqual(calls.patch[0].patch, {
 		// The key rides in every patch, so one that races the row's delete cannot leave a keyless stub.
 		url: CLAIM_URL,
-		pageSignature: JSON.stringify([['35.99'], false]),
+		pageSignature: JSON.stringify([['35.99'], false, 1]),
 		pageClaimAt: new Date(1_700_000_000_000),
 	});
 });
@@ -1842,16 +1842,74 @@ test('disarmedFieldsOnNode: a running pass\u2019s heartbeat guard outranks the l
 	});
 	assert.deepEqual([...(await changeProbe.disarmedFieldsOnNode(rule))], ['0:title']);
 	// No pass running: the last pass's record is what there is.
+	const finishedAt = Date.now();
 	changeProbe.resetChangeProbeState();
 	await changeProbe.publishProbeStateForTest({
-		sweep: { running: false, startedAt: 1, heartbeatAt: 1, progress: null, lastRun: { fieldGuard: guardOf(false) } },
+		sweep: {
+			running: false,
+			startedAt: 1,
+			heartbeatAt: 1,
+			progress: null,
+			lastRun: { finishedAt, fieldGuard: guardOf(false) },
+		},
 	});
 	assert.deepEqual([...(await changeProbe.disarmedFieldsOnNode(rule))], ['0:title']);
 	changeProbe.resetChangeProbeState();
 	await changeProbe.publishProbeStateForTest({
-		sweep: { running: false, startedAt: 1, heartbeatAt: 1, progress: null, lastRun: { fieldGuard: guardOf(true) } },
+		sweep: {
+			running: false,
+			startedAt: 1,
+			heartbeatAt: 1,
+			progress: null,
+			lastRun: { finishedAt, fieldGuard: guardOf(true) },
+		},
 	});
 	assert.deepEqual([...(await changeProbe.disarmedFieldsOnNode(rule))], []);
+	// Published BEFORE this process started: a guard that no longer exists. A restart re-arms every field, and
+	// the record it left behind must not keep the serve checks off one for the rest of the day.
+	changeProbe.resetChangeProbeState();
+	await changeProbe.publishProbeStateForTest({
+		sweep: {
+			running: false,
+			startedAt: 1,
+			heartbeatAt: 1,
+			progress: null,
+			lastRun: { finishedAt: 1, fieldGuard: guardOf(false) },
+		},
+	});
+	assert.deepEqual([...(await changeProbe.disarmedFieldsOnNode(rule))], [], 'a dead process\u2019s pass record');
+	changeProbe.resetChangeProbeState();
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: true, startedAt: 1, heartbeatAt: 2, progress: { fieldGuard: guardOf(false) } },
+	});
+	assert.deepEqual([...(await changeProbe.disarmedFieldsOnNode(rule))], [], 'a dead process\u2019s last beat');
+	// The worker threads restarted IN PLACE (a component deploy): the process is the same, the guard is not.
+	// The scheduler worker publishes when its guard began, and a record from before it is a guard that is gone.
+	const restartedAt = Date.now();
+	changeProbe.resetChangeProbeState();
+	await changeProbe.publishProbeStateForTest({
+		scheduler: { guardSince: restartedAt },
+		sweep: {
+			running: false,
+			startedAt: 1,
+			heartbeatAt: 1,
+			progress: null,
+			lastRun: { finishedAt: restartedAt - 1, fieldGuard: guardOf(false) },
+		},
+	});
+	assert.deepEqual([...(await changeProbe.disarmedFieldsOnNode(rule))], [], 'before the guard began');
+	changeProbe.resetChangeProbeState();
+	await changeProbe.publishProbeStateForTest({
+		scheduler: { guardSince: restartedAt },
+		sweep: {
+			running: false,
+			startedAt: 1,
+			heartbeatAt: 1,
+			progress: null,
+			lastRun: { finishedAt: restartedAt, fieldGuard: guardOf(false) },
+		},
+	});
+	assert.deepEqual([...(await changeProbe.disarmedFieldsOnNode(rule))], ['0:title'], 'this guard’s own pass');
 	changeProbe.resetChangeProbeState();
 	applyOptions({ changeProbe: { enabled: false } });
 });
@@ -2672,13 +2730,16 @@ const RECORD = async (over = {}) => {
 const BASELINE_AT = 1000;
 const RENDERED_AT = new Date(2000);
 
+// The production default of `rearmBelow` unless a test names its own.
 const guardFor = (settings = { threshold: 0.2, minWitnessed: 10 }) => {
 	const disarmed = [];
+	const rearmed = [];
 	const guard = changeProbe.createMappingGuard({
-		settings: () => settings,
+		settings: () => ({ rearmBelow: 0.05, ...settings }),
 		onDisarm: (rule, field, entry) => disarmed.push({ rule: rule.label, field: field.label, ...entry }),
+		onRearm: (rule, field, entry) => rearmed.push({ rule: rule.label, field: field.label, ...entry }),
 	});
-	return { guard, disarmed };
+	return { guard, disarmed, rearmed };
 };
 
 const runMappedPass = async ({ rulesRaw = [MAPPED_RULE], rows, answers, stored = {}, ...overrides }) => {
@@ -2737,6 +2798,205 @@ test('MAPPED FIELD: the page disagrees with an UNCHANGED origin -> trigger, coun
 	assert.deepEqual(stats.fieldMismatch, { pdp: { '0:title': 1 } }, 'decomposed by field');
 	assert.deepEqual(stats.slotChanges, {}, 'no origin change to decompose');
 	assert.equal(written[0].clearClaim, true, 'the trigger clears the record with the claim');
+});
+
+test('offersLimit through the pass: a capped page missing the endpoint price is neither re-rendered NOR certified', async () => {
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	// The claim pair. The whole product repriced from 44.97 to 37.47 and the page is stale on every price it
+	// lists — indistinguishable, from the claim, from a current page whose cheapest variant is unlisted.
+	const CLAIM_RULE = {
+		label: 'pdp',
+		pathPattern: '^/product/prd-([^/]+)',
+		source: 'request',
+		request: { urlTemplate: 'https://api.example.com/p/$1' },
+		extract: ['price', 'status'],
+		// A scope, or verification is never armed and the assertions below could not fail.
+		invalidateScope: 'route:prefix:/product/',
+		pageCheck: { enabled: true, priceFrom: 0, availableFrom: 1, offersLimit: 50 },
+	};
+	const [claimRule] = compileProbeRules([CLAIM_RULE]);
+	const signature = await signedBy(CLAIM_RULE, { price: 37.47, status: 'In Stock' });
+	const recorded = [];
+	const claim = await runMappedPass({
+		rulesRaw: [CLAIM_RULE],
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		stored: {
+			[URL_A]: { signature, fingerprint: claimRule.fingerprint, pageSignature: JSON.stringify([['44.97'], true, 50]) },
+		},
+		isArmed: async () => true,
+		recordCheck: async (url) => recorded.push(url),
+	});
+	assert.deepEqual(claim.triggered, [], 'no disagreement: no re-render loop');
+	assert.deepEqual(claim.verified, [], 'and no verification on availability alone');
+	assert.deepEqual(recorded, [], 'nor a check that would spare it');
+	// The control: the same page listing the endpoint's price IS verified and recorded.
+	const recordedAgreeing = [];
+	const agreeing = await runMappedPass({
+		rulesRaw: [CLAIM_RULE],
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		stored: {
+			[URL_A]: { signature, fingerprint: claimRule.fingerprint, pageSignature: JSON.stringify([['37.47'], true, 50]) },
+		},
+		isArmed: async () => true,
+		recordCheck: async (url) => recordedAgreeing.push(url),
+	});
+	assert.equal(agreeing.verified.length, 1);
+	assert.deepEqual(recordedAgreeing, [URL_A]);
+	// Through an invalidation (`coverageOf`): the whole product repriced and the capped page shows none of it.
+	// An availability-only agreement here made the page 'described' (verified through the invalidation) or
+	// 'healed' — the one failure verification must never produce.
+	const coverage = [];
+	const repriced = await signedBy(CLAIM_RULE, { price: 37.47, status: 'In Stock' });
+	const old = await signedBy(CLAIM_RULE, { price: 44.97, status: 'In Stock' });
+	const covered = await runMappedPass({
+		rulesRaw: [CLAIM_RULE],
+		rows: [row(URL_A)],
+		answers: { [URL_A]: repriced },
+		stored: {
+			[URL_A]: {
+				signature: old,
+				fingerprint: claimRule.fingerprint,
+				pageSignature: JSON.stringify([['44.97'], true, 50]),
+			},
+		},
+		coverageOf: async (url, facts) => {
+			coverage.push(facts);
+			return null;
+		},
+	});
+	assert.deepEqual(covered.triggered, [URL_A], 'the reprice is acted on');
+	assert.equal(coverage.length, 1);
+	assert.equal(coverage[0].pageAgrees, false);
+	assert.equal(coverage[0].changeShown, false);
+	// A mapped scalar priceSet: the title agreeing beside it is not proof either.
+	const MAPPED_SCALAR = {
+		...CLAIM_RULE,
+		extract: ['title', 'lowest'],
+		invalidateScope: 'route:prefix:/product/',
+		pageCheck: {
+			enabled: true,
+			offersLimit: 2,
+			fields: [
+				{ slot: 0, fact: 'title', compare: 'text' },
+				{ slot: 1, fact: 'product.offers', compare: 'priceSet' },
+			],
+		},
+	};
+	const [scalarRule] = compileProbeRules([MAPPED_SCALAR]);
+	const scalarSig = await signedBy(MAPPED_SCALAR, { title: 'Red Shoe', lowest: 9.99 });
+	const recordedScalar = [];
+	const scalar = await runMappedPass({
+		rulesRaw: [MAPPED_SCALAR],
+		rows: [row(URL_A)],
+		answers: { [URL_A]: scalarSig },
+		stored: {
+			[URL_A]: {
+				signature: scalarSig,
+				fingerprint: scalarRule.fingerprint,
+				// Two priced offers, at the cap of 2 (an offer with no readable price makes the set unreadable).
+				pageFacts: await RECORD({
+					product: {
+						offers: [
+							['111', '19.99', 'USD', 'InStock'],
+							['222', '24.99', 'USD', 'InStock'],
+						],
+					},
+				}),
+			},
+		},
+		isArmed: async () => true,
+		recordCheck: async (url) => recordedScalar.push(url),
+	});
+	assert.deepEqual(scalar.triggered, [], 'no disagreement');
+	assert.deepEqual(scalar.verified, [], 'no verification on the title alone');
+	assert.deepEqual(recordedScalar, [], 'no check on the title alone');
+	assert.equal(scalar.stats.pageMismatch, 0);
+	// The control: the same page listing the endpoint's price is an ordinary agreement, and is recorded.
+	const listedSig = await signedBy(MAPPED_SCALAR, { title: 'Red Shoe', lowest: 19.99 });
+	const recordedListed = [];
+	const listed = await runMappedPass({
+		rulesRaw: [MAPPED_SCALAR],
+		rows: [row(URL_A)],
+		answers: { [URL_A]: listedSig },
+		stored: {
+			[URL_A]: {
+				signature: listedSig,
+				fingerprint: scalarRule.fingerprint,
+				pageFacts: await RECORD({
+					product: {
+						offers: [
+							['111', '19.99', 'USD', 'InStock'],
+							['222', '24.99', 'USD', 'InStock'],
+						],
+					},
+				}),
+			},
+		},
+		isArmed: async () => true,
+		recordCheck: async (url) => recordedListed.push(url),
+	});
+	assert.deepEqual(recordedListed, [URL_A]);
+	assert.equal(listed.verified.length, 1, 'and verified: the assertions above could fail');
+});
+
+test('actOnPageMismatch false (the canary): a page-only disagreement is counted, NOT acted on, and a guard with no witness is not fed', async () => {
+	const signature = await apiSig();
+	const reads = [];
+	const guard = { isArmed: (rule, field) => (reads.push(field.label), true), snapshot: () => ({}) };
+	const { stats, triggered, written } = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		stored: { [URL_A]: { signature, pageFacts: await RECORD({ title: 'Red Shoe (Old Name)' }) } },
+		guard,
+		actOnPageMismatch: false,
+	});
+	assert.deepEqual(triggered, [], 'not re-rendered: the sweep corrects it, once per pass');
+	assert.deepEqual(written, [], 'nothing to write: the origin did not move');
+	assert.equal(stats.pageMismatch, 1, 'still seen and counted');
+	assert.deepEqual(stats.fieldMismatch, { pdp: { '0:title': 1 } });
+	assert.ok(reads.includes('0:title'), 'the guard is still consulted');
+});
+
+test('actOnPageMismatch false: a page mismatch beside an IGNORED change stays quiet; beside a CAUGHT-UP one it acts', async () => {
+	const before = await apiSig();
+	const changed = await apiSig({ regular: 49.99 });
+	const ignored = await apiSig({ inventory: 3 });
+	const retitled = await apiSig({ title: 'Red Shoe II' });
+	const stale = await RECORD({ title: 'Red Shoe (Old Name)' });
+	const { triggered, written } = await runMappedPass({
+		rows: [row(URL_A), row(URL_B), row(URL_C), row(URL_D)],
+		answers: { [URL_A]: changed, [URL_B]: ignored, [URL_C]: ignored, [URL_D]: retitled },
+		stored: {
+			// An origin change in an unmapped slot: re-rendered as always.
+			[URL_A]: { signature: before, pageFacts: stale },
+			// An ignored change beside a page mismatch: ignored slots are the ones that churn between canary
+			// passes, so acting here would re-render an unfixable page every interval. The baseline moves quietly.
+			[URL_B]: { signature: before, pageFacts: stale },
+			// An ignored change and a page that agrees: the quiet baseline, as always.
+			[URL_C]: { signature: before, pageFacts: await RECORD() },
+			// A change the page already shows (the title), beside a field it gets wrong (the image): acted on.
+			[URL_D]: {
+				signature: before,
+				pageFacts: await RECORD({
+					title: 'Red Shoe II',
+					product: { image: 'https://media.example.com/i/boot?w=1000' },
+				}),
+			},
+		},
+		actOnPageMismatch: false,
+	});
+	assert.deepEqual(triggered.sort(), [URL_A, URL_D]);
+	assert.deepEqual(
+		written.map((w) => [w.url, w.signature, Boolean(w.clearClaim)]).sort(),
+		[
+			[URL_A, changed, true],
+			[URL_B, ignored, false],
+			[URL_C, ignored, false],
+			[URL_D, retitled, true],
+		].sort()
+	);
 });
 
 test('a SCOPED field is compared only where its pathPattern matches: a placeholder elsewhere neither triggers nor feeds the guard', async () => {
@@ -3115,7 +3375,9 @@ test('MAPPING GUARD: a broken mapping is DISARMED after minWitnessed and stops t
 		disarmed.map((d) => [d.rule, d.field, d.witnessed, d.disagreed]),
 		[['pdp', '0:title', 10, 10]]
 	);
-	assert.deepEqual(stats.fieldGuard.pdp['0:title'], { witnessed: 30, disagreed: 30, armed: false });
+	// The counts restart at the disarm: what is left is the 20 comparisons since, all disagreeing — a re-arm is
+	// judged on those alone.
+	assert.deepEqual(stats.fieldGuard.pdp['0:title'], { witnessed: 20, disagreed: 20, armed: false });
 	assert.deepEqual(
 		stats.fieldGuard.pdp['1:canonical'],
 		{ witnessed: 30, disagreed: 0, armed: true },
@@ -3143,7 +3405,8 @@ test('MAPPING GUARD: rare round trips never disarm — and each one re-renders',
 });
 
 test('MAPPING GUARD: the rate is RECENT — a mapping right for a long time and then broken is still disarmed promptly', async () => {
-	const { guard, disarmed } = guardFor({ threshold: 0.2, minWitnessed: 10 }); // memory ~100 comparisons
+	// rearmBelow 0: the pre-0.106 guard, which never re-arms by itself.
+	const { guard, disarmed } = guardFor({ threshold: 0.2, minWitnessed: 10, rearmBelow: 0 }); // memory ~100 comparisons
 	const rule = { label: 'pdp', extract: ['title'] };
 	const title = { slot: 0, fact: 'title', compare: 'text', options: {}, label: '0:title' };
 	// A week of agreement...
@@ -3157,13 +3420,152 @@ test('MAPPING GUARD: the rate is RECENT — a mapping right for a long time and 
 	}
 	assert.equal(disarmed.length, 1);
 	assert.ok(spent < 60, `disarmed after ${spent} disagreements, not after outweighing 100,000 agreements`);
-	// The halved sample never drops below minWitnessed, and a disarm is sticky.
+	// The halved sample never drops below minWitnessed, and with rearmBelow 0 a disarm is sticky.
 	for (let i = 0; i < 1000; i++) guard.witness(rule, title, false);
-	assert.equal(guard.isArmed(rule, title), false, 'only a mapping edit or a restart re-arms');
+	assert.equal(guard.isArmed(rule, title), false, 'rearmBelow 0: only a mapping edit or a restart re-arms');
 	// A correct mapping at a steady 2% never trips however long it runs.
 	const { guard: steady } = guardFor({ threshold: 0.2, minWitnessed: 10 });
 	for (let i = 0; i < 100_000; i++) steady.witness(rule, title, i % 50 === 0);
 	assert.equal(steady.isArmed(rule, title), true);
+});
+
+test('MAPPING GUARD: a correct mapping disarmed by a BURST re-arms once the rate falls — on comparisons made since', async () => {
+	// The 2026-10-09 shape: a correct mapping whose first 200 comparisons after a restart came from pages the
+	// origin's endpoint and page disagreed about for hours (21-30%), then 0.4-0.8% for the next ~600k.
+	const { guard, disarmed, rearmed } = guardFor({ threshold: 0.2, minWitnessed: 20 });
+	const rule = { label: 'pdp', extract: ['skus'] };
+	const offers = { slot: 0, fact: 'product.offers', compare: 'skus', options: {}, label: '0:product.offers' };
+	for (let i = 0; i < 20; i++) guard.witness(rule, offers, i % 4 === 0); // 25%
+	assert.equal(guard.isArmed(rule, offers), false);
+	assert.deepEqual(
+		disarmed.map((d) => [d.witnessed, d.disagreed]),
+		[[20, 5]],
+		'the disarm is reported with the counts that made it'
+	);
+	// The burst passes. 19 more comparisons are not a verdict: each one needs minWitnessed since the last.
+	for (let i = 0; i < 19; i++) guard.witness(rule, offers, false);
+	assert.equal(guard.isArmed(rule, offers), false, 'no verdict before minWitnessed comparisons since the disarm');
+	guard.witness(rule, offers, false);
+	assert.equal(guard.isArmed(rule, offers), true, 'the burst that disarmed it does not hold it disarmed');
+	assert.deepEqual(
+		rearmed.map((r) => [r.rule, r.field, r.witnessed, r.disagreed]),
+		[['pdp', '0:product.offers', 20, 0]]
+	);
+	// Armed again, on a fresh sample: a second burst needs minWitnessed of its own before it can disarm.
+	for (let i = 0; i < 19; i++) guard.witness(rule, offers, true);
+	assert.equal(guard.isArmed(rule, offers), true, 'a field cannot flip faster than once per minWitnessed');
+	guard.witness(rule, offers, true);
+	assert.equal(guard.isArmed(rule, offers), false);
+	assert.equal(disarmed.length, 2);
+});
+
+test('MAPPING GUARD: a BROKEN mapping never re-arms — it keeps disagreeing on nearly everything', async () => {
+	const { guard, rearmed } = guardFor({ threshold: 0.2, minWitnessed: 10 });
+	const rule = { label: 'pdp', extract: ['title'] };
+	const title = { slot: 0, fact: 'title', compare: 'text', options: {}, label: '0:title' };
+	// Mapped to the wrong slot: 95% disagreement, with the odd coincidental match.
+	for (let i = 0; i < 100_000; i++) guard.witness(rule, title, i % 20 !== 0);
+	assert.equal(guard.isArmed(rule, title), false);
+	assert.deepEqual(rearmed, []);
+	// A rate between the two thresholds holds whatever state the field is in.
+	const { guard: between, rearmed: none } = guardFor({ threshold: 0.2, minWitnessed: 10 });
+	for (let i = 0; i < 10; i++) between.witness(rule, title, true);
+	for (let i = 0; i < 100_000; i++) between.witness(rule, title, i % 10 === 0); // 10%
+	assert.equal(between.isArmed(rule, title), false, '10% is not low enough to re-arm');
+	assert.deepEqual(none, []);
+});
+
+test('MAPPING GUARD: each re-arm of the same field waits twice as long — a mapping wrong on PART of the slice stops flapping', async () => {
+	const { guard, rearmed } = guardFor({ threshold: 0.2, minWitnessed: 10 });
+	const rule = { label: 'pdp', extract: ['title'] };
+	const title = { slot: 0, fact: 'title', compare: 'text', options: {}, label: '0:title' };
+	const goodUntilArmed = () => {
+		let n = 0;
+		while (!guard.isArmed(rule, title) && n < 10_000) {
+			guard.witness(rule, title, false);
+			n++;
+		}
+		return n;
+	};
+	const disarm = () => {
+		while (guard.isArmed(rule, title)) guard.witness(rule, title, true);
+	};
+	const waits = [];
+	for (let k = 0; k < 4; k++) {
+		disarm();
+		waits.push(goodUntilArmed());
+	}
+	assert.deepEqual(waits, [10, 20, 40, 80], 'minWitnessed x 2^k comparisons since each disarm');
+	assert.deepEqual(
+		rearmed.map((r) => r.rearms),
+		[1, 2, 3, 4]
+	);
+	assert.equal(guard.snapshot([{ label: 'pdp', pageCheck: { fields: [title] } }]).pdp['0:title'].rearms, 4);
+});
+
+test('MAPPING GUARD: the backoff EASES with every full pass a field spends armed — and not for one disarmed each pass', async () => {
+	const rule = { label: 'pdp', extract: ['title'] };
+	const title = { slot: 0, fact: 'title', compare: 'text', options: {}, label: '0:title' };
+	const cycle = (guard) => {
+		while (guard.isArmed(rule, title)) guard.witness(rule, title, true);
+		let n = 0;
+		while (!guard.isArmed(rule, title)) {
+			guard.witness(rule, title, false);
+			n++;
+		}
+		return n;
+	};
+	// A correct mapping that bursts now and then: two bursts back to back, then clean passes.
+	const { guard: correct } = guardFor({ threshold: 0.2, minWitnessed: 10 });
+	assert.deepEqual([cycle(correct), cycle(correct)], [10, 20]);
+	correct.passEnded(); // the pass the bursts were in: not clean
+	correct.passEnded(); // a full pass armed
+	assert.equal(cycle(correct), 20, 'one doubling off');
+	correct.passEnded();
+	correct.passEnded();
+	correct.passEnded();
+	assert.equal(cycle(correct), 10, 'back to a prompt re-arm');
+	// A mapping wrong on part of the slice disarms in every pass: never a clean one, no easing.
+	const { guard: segment } = guardFor({ threshold: 0.2, minWitnessed: 10 });
+	const waits = [];
+	for (let pass = 0; pass < 4; pass++) {
+		waits.push(cycle(segment));
+		segment.passEnded();
+	}
+	assert.deepEqual(waits, [10, 20, 40, 80]);
+});
+
+test('MAPPING GUARD: a RE-ARMED field triggers again', async () => {
+	const { guard } = guardFor({ threshold: 0.2, minWitnessed: 10 });
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const [rule] = compileProbeRules([MAPPED_RULE]);
+	const title = rule.pageCheck.fields.find((f) => f.fact === 'title');
+	for (let i = 0; i < 10; i++) guard.witness(rule, title, true);
+	assert.equal(guard.isArmed(rule, title), false);
+	const signature = await apiSig();
+	const stale = { signature, pageFacts: await RECORD({ title: 'Red Shoe (Old Name)' }) };
+	const before = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		stored: { [URL_A]: stale },
+		guard,
+	});
+	assert.deepEqual(before.triggered, [], 'disarmed: counted, not acted on');
+	// That pass witnessed one more disagreement; agreements bring the rate since the disarm under rearmBelow.
+	let agreements = 0;
+	while (!guard.isArmed(rule, title) && agreements < 100) {
+		guard.witness(rule, title, false);
+		agreements++;
+	}
+	assert.equal(guard.isArmed(rule, title), true);
+	assert.equal(agreements, 20, '1 of 21 is under 5%');
+	const after = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		stored: { [URL_A]: stale },
+		guard,
+	});
+	assert.deepEqual(after.triggered, [URL_A]);
 });
 
 test('MAPPING GUARD: only WITNESSED comparisons count — a record older than the baseline proves nothing', async () => {
@@ -3446,7 +3848,7 @@ test('recordPageClaim stores the canonical page record in the SAME write as the 
 	assert.equal(calls.patch.length, 1, 'one write — no extra read or write for the record');
 	assert.deepEqual(calls.patch[0].patch, {
 		url: CLAIM_URL,
-		pageSignature: JSON.stringify([['35.99'], true]),
+		pageSignature: JSON.stringify([['35.99'], true, 1]),
 		pageFacts: JSON.stringify(canonicalPageFacts(FACTS_IN)),
 		pageClaimAt: new Date(1_700_000_000_000),
 	});
@@ -3473,7 +3875,11 @@ test('recordPageClaim: ABSENT pageFacts is an old renderer — warn hourly, and 
 	assert.match(warns[0], /older than @harperfast\/prerender-browser 1\.37\.0/);
 	// Null, not left alone: the row's older record describes a page this render just replaced.
 	assert.equal(calls.patch[0].patch.pageFacts, null);
-	assert.equal(calls.patch[0].patch.pageSignature, JSON.stringify([['35.99'], true]), 'the claim is recorded as ever');
+	assert.equal(
+		calls.patch[0].patch.pageSignature,
+		JSON.stringify([['35.99'], true, 1]),
+		'the claim is recorded as ever'
+	);
 	// On a missing row with nothing to record, no row is created at all.
 	const empty = await mappedClaimHarness();
 	await changeProbe.recordPageClaim(CLAIM_URL, null, 1_700_000_000_000);

@@ -1253,7 +1253,12 @@ function detailsOf(status, counted, model) {
 				),
 				el('div', {
 					cls: 'hint',
-					text: 'Per node (the guard is per process). A disarmed field stops triggering until its mapping changes or the process restarts.',
+					text:
+						'Per node (the guard lives on the worker the sweep runs on, and only the sweep feeds it). A disarmed field ' +
+						'stops triggering until its rate since the disarm falls (plugin >= 0.106.0; a field that keeps re-arming ' +
+						'waits twice as long each time, easing back as it stays armed), its mapping changes, or the process ' +
+						'restarts. For a disarmed field the ' +
+						'counts are the sample since the disarm.',
 				}),
 			])
 		);

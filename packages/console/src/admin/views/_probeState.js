@@ -582,9 +582,11 @@ export function nodeFlags(desc) {
 				'field-disarmed',
 				'bad',
 				(nodes) =>
-					`A mapped page field is DISARMED on ${list(nodes)}: it disagreed with the origin on too many witnessed ` +
-					'comparisons to be a correct mapping. Its mismatches no longer trigger re-renders until the mapping is ' +
-					'edited or the process restarts — check the extract path it reads.',
+					`A mapped page field was DISARMED on ${list(nodes)} at the end of the last pass: it disagreed with the ` +
+					'origin on too many witnessed comparisons. Its mismatches do not trigger re-renders until it re-arms — ' +
+					'by itself once its rate falls (plugin >= 0.106.0), or when the mapping is edited or the process ' +
+					'restarts. One that stays disarmed pass after pass is likely mapped wrong: check the extract path it ' +
+					'reads. One that re-arms met a stretch where the origin’s endpoint and page disagreed.',
 				`${node}: ${disarmed.join(', ')}`
 			)
 		);

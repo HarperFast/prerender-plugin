@@ -104,6 +104,20 @@ const YIELD_EVERY = 200;
 // table (see schema.graphql), read per probed URL.
 const TARGET_SELECT = ['url', 'sitemapUrl', 'renderInterval', 'demandInterval', 'state', 'unlistedAt'];
 
+// When this THREAD's mapping guard began (the module loads once per worker thread), published by the
+// scheduler worker — the one the sweep runs on — as `scheduler.guardSince`; and when the PROCESS began, the
+// floor for a node whose scheduler has not republished since. Published pass state from before either
+// describes a guard that is gone (`disarmedFieldsOnNode`). Harper restarts worker threads in place (a
+// component deploy, `restart_service http_workers`), which `process.uptime()` alone does not see.
+const THREAD_STARTED_AT = Date.now();
+const PROCESS_STARTED_AT = (() => {
+	try {
+		return Date.now() - process.uptime() * 1000;
+	} catch {
+		return -Infinity;
+	}
+})();
+
 // Compile + memoize the rule list, keyed on config identity — applyOptions rebuilds config from
 // defaults on every change, so a fresh array means a reload (the routeClass memo pattern).
 let compiledRules = null;
@@ -382,15 +396,26 @@ export const isFieldArmed = (rule, field) => theMappingGuard().isArmed(rule, fie
  * The guard lives with the sweep, on one worker, so a check running on any other worker must read the
  * published state, or it would compare a field the guard stopped trusting and re-render pages for it on
  * every window. Re-read at most every few seconds.
+ *
+ * Only state published by the CURRENT GUARD counts: since the scheduler worker's thread began
+ * (`scheduler.guardSince`) and this process did. The guard is in memory and a restart — of the process or
+ * of the worker threads — re-arms every field, but the last pass's record outlives it, and read as current
+ * it kept every serve check off a field for the rest of the day after the restart meant to re-arm it.
  */
 export const disarmedFieldsOnNode = async (rule) => {
 	const out = new Set();
 	for (const field of rule.pageCheck?.fields ?? []) if (!isFieldArmed(rule, field)) out.add(field.label);
 	try {
-		const sweep = (await sweepStateForRenderCheck())?.sweep;
+		const state = await sweepStateForRenderCheck();
+		const sweep = state?.sweep;
 		// The running pass's beat is newer than the last pass's record.
-		const guards = (sweep?.running === true && sweep.progress?.fieldGuard) || sweep?.lastRun?.fieldGuard;
-		const published = guards?.[rule.label];
+		const beat = sweep?.running === true && sweep.progress?.fieldGuard ? sweep : null;
+		const publishedAt = epochMsOf(beat ? (beat.heartbeatAt ?? beat.startedAt) : sweep?.lastRun?.finishedAt);
+		const guardSince = epochMsOf(state?.scheduler?.guardSince);
+		if (!(publishedAt >= Math.max(PROCESS_STARTED_AT, Number.isFinite(guardSince) ? guardSince : -Infinity))) {
+			return out;
+		}
+		const published = (beat ? beat.progress.fieldGuard : sweep.lastRun.fieldGuard)?.[rule.label];
 		for (const [label, state] of Object.entries(published ?? {})) if (state?.armed === false) out.add(label);
 	} catch {
 		// Unknown: this worker's own guard is what there is.
@@ -797,7 +822,7 @@ const renderClaimVerdict = async (url, rule, claim, stored) => {
 	if (!stored.signature || (fingerprint !== null && fingerprint !== rule.fingerprint)) return null;
 	const slots = signatureSlots(stored.signature);
 	if (!slots) return null; // a status-signal literal carries no price/availability to compare
-	if (compareClaims(claim, apiClaimOf(slots, rule.pageCheck)) !== false) return null;
+	if (compareClaims(claim, apiClaimOf(slots, rule.pageCheck), rule.pageCheck) !== false) return null;
 	const probedAt = epochOf(stored.probedAt);
 	const refiledAt = epochOf(stored.renderRefiledAt);
 	if (Number.isFinite(refiledAt) && !(probedAt > refiledAt)) return { outcome: 'bounded' };
@@ -1094,7 +1119,7 @@ const confirmStaleRender = async (url, target, claimAtMs = NaN) => {
 		return;
 	}
 	const verdict = stored?.pageSignature
-		? compareClaims(stored.pageSignature, apiClaimOf(values, rule.pageCheck))
+		? compareClaims(stored.pageSignature, apiClaimOf(values, rule.pageCheck), rule.pageCheck)
 		: null;
 	if (verdict === null) {
 		countProbe('render_mismatch', 'recheck_inconclusive');
@@ -1224,8 +1249,32 @@ export const verificationArmedFor = async (scope) => {
  * So the guard counts, per field, witnessed comparisons and witnessed disagreements, and DISARMS the
  * field once its disagreement rate reaches `threshold` over at least `minWitnessed` comparisons. A
  * disarmed field stops triggering (and stops counting toward caught-up and verification) but is
- * still compared and still counted in `fieldMismatch`, and it stays disarmed until its mapping
- * changes (a different entry, slot path or rule label is a different key) or the process restarts.
+ * still compared and still counted in `fieldMismatch`.
+ *
+ * AND RE-ARMS IT when the rate falls below `rearmBelow` (an edited mapping, a different entry, slot path
+ * or rule label, is a different key with a clean record; a restart starts every field armed). "Well under
+ * 1%" is the steady state, not a bound. When the origin's own two sources diverge — its endpoint updated
+ * and its page not yet, as on a large overnight reprice, when a render filed seconds after the probe saw a
+ * new price captured the old one — a correct mapping disagrees on a CLUSTER of pages for hours. Measured on
+ * one deployment: a sample of 200 hit 21-30% on every node the afternoon after such a reprice, and the
+ * mapping, correct throughout, disagreed on 0.4-0.8% of the ~600k comparisons that followed. Without a way
+ * back it stayed disarmed for days, and the pages that really were wrong (most of them, sampled) stopped
+ * being corrected. A broken mapping keeps disagreeing on nearly everything and never re-arms.
+ *
+ * EVERY VERDICT IS ON A FRESH SAMPLE. Both counts reset at each transition, so a disarm and a re-arm each
+ * need `minWitnessed` comparisons made since the last one: the burst that disarmed a field cannot hold it
+ * disarmed, and a field cannot flip back and forth faster than once per `minWitnessed` comparisons, even
+ * with no gap between the two thresholds.
+ *
+ * A FIELD THAT KEEPS COMING BACK. A mapping wrong on PART of the slice — a page type the endpoint describes
+ * with a placeholder, which the walk reaches as one contiguous key range — disarms there and would re-arm
+ * on the correct remainder every pass, paying a few hundred re-renders each time. So each re-arm waits
+ * twice as long as the one before: after k re-arms the next needs `minWitnessed` x 2^k comparisons since
+ * the disarm (k up to MAX_REARM_DOUBLINGS). And each full pass a field spends ARMED takes one doubling back
+ * off (`passEnded`), so the two cases part: a correct mapping that bursts now and then is soon back to
+ * re-arming after `minWitnessed`, while one wrong on part of the slice — never armed for a whole pass —
+ * costs less every pass. Its DISARMED warning (and the snapshot's `rearms`) names it each time; the fix
+ * for it is the field's `pathPattern`, not the guard. A restart starts the count over.
  *
  * AGGREGATE ONLY, BY DESIGN. It never suppresses an individual witnessed disagreement: a single one
  * is exactly the round trip the page check exists to catch, and it must re-render. Only the RATE
@@ -1237,15 +1286,24 @@ export const verificationArmedFor = async (scope) => {
  * Without it, a mapping that was right for a week and then broke — the site redesigns its title
  * template, and every re-render still disagrees — would need hundreds of thousands of disagreements
  * to outweigh the week of agreement, re-rendering every page it matches on every pass until then.
- * The halved sample never drops below `minWitnessed`, so the threshold stays consultable.
+ * The halved sample never drops below `minWitnessed`, so the threshold stays consultable. A disarmed
+ * field's sample is bounded the same way.
  *
- * Per process, in memory: the sweep and canary run on worker 0, so that is where the evidence
- * accumulates. A pass started by hand on another worker starts with its own, empty guard.
+ * FED BY THE SWEEP ONLY. The sweep walks this node's whole slice once per pass; the canary re-probes one
+ * fixed cohort every few minutes, so once a pass ends its comparisons alone would fill the window, and a
+ * cohort is one correlated sample (after a restart, a key-order one: the catalog's oldest products). The
+ * canary reads the guard (`readOnlyGuard`) and leaves page-only disagreements to the sweep.
+ *
+ * Per process, in memory, on the worker the sweep runs on. A pass started by hand on another worker starts
+ * with its own, empty guard.
  */
 // The guard's memory, in multiples of `minWitnessed` (see BOUNDED MEMORY above).
 const GUARD_WINDOW = 10;
+// Re-arm backoff (see A FIELD THAT KEEPS COMING BACK above): at most 2^10 x `minWitnessed` comparisons
+// before a re-arm, about one pass of one node's slice at the default.
+const MAX_REARM_DOUBLINGS = 10;
 
-export const createMappingGuard = ({ settings, onDisarm = () => {} }) => {
+export const createMappingGuard = ({ settings, onDisarm = () => {}, onRearm = () => {} }) => {
 	const entries = new Map();
 	// A field's key, cached per compiled field object (a config reload compiles new ones). The rule
 	// label and the slot's extract PATH are in it, so re-pointing a slot or renaming the rule is a
@@ -1271,22 +1329,53 @@ export const createMappingGuard = ({ settings, onDisarm = () => {} }) => {
 		witness(rule, field, disagreed) {
 			const key = keyOf(rule, field);
 			let entry = entries.get(key);
-			if (!entry) entries.set(key, (entry = { witnessed: 0, disagreed: 0, disarmed: false }));
+			if (!entry) {
+				entries.set(
+					key,
+					(entry = { witnessed: 0, disagreed: 0, disarmed: false, since: 0, rearms: 0, disarmedInPass: false })
+				);
+			}
 			entry.witnessed++;
+			entry.since++;
 			if (disagreed) entry.disagreed++;
-			if (entry.disarmed) return;
-			const { threshold, minWitnessed } = settings();
-			if (entry.witnessed >= minWitnessed && entry.disagreed / entry.witnessed >= threshold) {
-				entry.disarmed = true;
-				onDisarm(rule, field, entry);
-				return;
+			const { threshold, minWitnessed, rearmBelow } = settings();
+			if (entry.witnessed >= minWitnessed) {
+				const rate = entry.disagreed / entry.witnessed;
+				const flips = entry.disarmed
+					? rate < rearmBelow && entry.since >= minWitnessed * 2 ** Math.min(entry.rearms, MAX_REARM_DOUBLINGS)
+					: rate >= threshold;
+				if (flips) {
+					entry.disarmed = !entry.disarmed;
+					if (entry.disarmed) entry.disarmedInPass = true;
+					else entry.rearms++;
+					(entry.disarmed ? onDisarm : onRearm)(rule, field, { ...entry });
+					entry.witnessed = 0;
+					entry.disagreed = 0;
+					entry.since = 0;
+					return;
+				}
 			}
 			if (entry.witnessed >= GUARD_WINDOW * minWitnessed) {
 				entry.witnessed /= 2;
 				entry.disagreed /= 2;
 			}
 		},
-		/** `{ [rule]: { [field]: { witnessed, disagreed, armed } } }` for every mapped field of `rules`. */
+		/**
+		 * A full sweep pass ended: a field that spent ALL of it armed takes one doubling off its re-arm backoff.
+		 * A field disarmed at any point of it (or still disarmed, so at the start of the next) does not.
+		 */
+		passEnded() {
+			for (const entry of entries.values()) {
+				if (!entry.disarmedInPass && !entry.disarmed && entry.rearms > 0) entry.rearms--;
+				entry.disarmedInPass = entry.disarmed;
+			}
+		},
+		/**
+		 * `{ [rule]: { [field]: { witnessed, disagreed, armed, rearms? } } }` for every mapped field of `rules`.
+		 * The counts are the recent sample SINCE THE FIELD'S LAST TRANSITION — for a disarmed field, what a
+		 * re-arm is judged on. `rearms` appears once a field has re-armed: a number that keeps growing pass
+		 * after pass is a mapping wrong on part of the slice.
+		 */
 		snapshot(rules) {
 			const out = {};
 			for (const rule of rules) {
@@ -1297,6 +1386,7 @@ export const createMappingGuard = ({ settings, onDisarm = () => {} }) => {
 						witnessed: Math.round(entry?.witnessed ?? 0),
 						disagreed: Math.round(entry?.disagreed ?? 0),
 						armed: entry?.disarmed !== true,
+						...(entry?.rearms ? { rearms: entry.rearms } : {}),
 					};
 				}
 			}
@@ -1305,22 +1395,41 @@ export const createMappingGuard = ({ settings, onDisarm = () => {} }) => {
 	};
 };
 
+/** What the canary is given: the guard's verdicts, never its evidence (see FED BY THE SWEEP ONLY). */
+const readOnlyGuard = (guard) => ({ isArmed: guard.isArmed, snapshot: guard.snapshot });
+
+const rateOf = (entry) => `${((entry.disagreed / entry.witnessed) * 100).toFixed(1)}%`;
+
 const warnDisarmed = (rule, field, entry) => {
 	logger.warn?.(
 		`[prerender] change-probe ${rule.label}: pageCheck field ${field.label} (extract[${field.slot}] ` +
 			`"${rule.extract?.[field.slot]}", compare ${field.compare}) is DISARMED — the cached page disagreed with ` +
 			`the origin on ${Math.round(entry.disagreed)} of ${Math.round(entry.witnessed)} recent witnessed comparisons ` +
-			`(${((entry.disagreed / entry.witnessed) * 100).toFixed(1)}%), where a correct mapping disagrees only on ` +
-			`rare round trips. It no longer triggers re-renders (its mismatches are still counted in fieldMismatch) ` +
-			`until the mapping is edited or the process restarts. Check that extract[${field.slot}] really holds what ` +
-			`the page shows as ${field.fact}.`
+			`(${rateOf(entry)}), where a correct mapping disagrees only on rare round trips. It no longer triggers ` +
+			`re-renders (its mismatches are still counted in fieldMismatch) until its rate falls below ` +
+			`changeProbe.mappingGuard.rearmBelow, the mapping is edited, or the process restarts. If it stays ` +
+			`disarmed, check that extract[${field.slot}] really holds what the page shows as ${field.fact}; if it ` +
+			`re-arms, the origin's endpoint and page disagreed for a while.`
 	);
 };
 
-// The node's guard — one per process, shared by the sweep and the canary (see createMappingGuard).
+const noteRearmed = (rule, field, entry) => {
+	(logger.notify ?? logger.info).call(
+		logger,
+		`[prerender] change-probe ${rule.label}: pageCheck field ${field.label} RE-ARMED — the cached page ` +
+			`disagreed with the origin on ${rateOf(entry)} of its recent witnessed comparisons, ${entry.since} made ` +
+			`since it was disarmed (re-arm ${entry.rearms}). Its mismatches trigger re-renders again.`
+	);
+};
+
+// The node's guard — one per process, fed by the sweep, read by the canary (see createMappingGuard).
 let mappingGuard = null;
 const theMappingGuard = () =>
-	(mappingGuard ??= createMappingGuard({ settings: () => config.changeProbe.mappingGuard, onDisarm: warnDisarmed }));
+	(mappingGuard ??= createMappingGuard({
+		settings: () => config.changeProbe.mappingGuard,
+		onDisarm: warnDisarmed,
+		onRearm: noteRearmed,
+	}));
 
 // A Date column as epoch ms, BigInt-safe (see readSignature); NaN when unreadable.
 const epochOf = (value) => {
@@ -1364,8 +1473,14 @@ export const runProbePass = async ({
 	verify = null,
 	isArmed = null,
 	// The mapping-defect guard (createMappingGuard). Null = no guard: every mapped field is armed and
-	// nothing is witnessed, which is what a caller that does not wire it gets.
+	// nothing is witnessed, which is what a caller that does not wire it gets. A guard with no `witness`
+	// (`readOnlyGuard`, the canary's) is consulted but never fed.
 	guard = null,
+	// Whether a cached page that disagrees with an UNCHANGED origin is re-rendered. The sweep does, once per
+	// pass. The canary does not: its cohort is re-probed every few minutes, so a page a re-render cannot fix
+	// (the origin's endpoint and page disagreeing for hours, a field the page cannot show) would re-render
+	// on every canary pass. Its origin CHANGES are acted on as always.
+	actOnPageMismatch = true,
 	dryRun,
 	concurrency,
 	ratePerSecond,
@@ -1610,7 +1725,7 @@ export const runProbePass = async ({
 		// The claim pair's verdict: true compared-and-agreed, false disagreed, null nothing comparable.
 		let claimVerdict = null;
 		if (claimPair && stored?.pageSignature && valuesOf()) {
-			claimVerdict = compareClaims(stored.pageSignature, apiClaimOf(values, pageCheck));
+			claimVerdict = compareClaims(stored.pageSignature, apiClaimOf(values, pageCheck), pageCheck);
 		}
 		const pageDisagrees = claimVerdict === false;
 
@@ -1625,15 +1740,24 @@ export const runProbePass = async ({
 		let mappedDisagrees = false;
 		let firstWrong = null;
 		let mappedAgreed = 0;
+		// An armed field that could not compare because the page cannot show the value (`ctx.unshown`, an
+		// offer-capped page): no disagreement, but nothing else may then stand as proof the page is current.
+		let unshown = false;
 		const armed = (field) => !guard || guard.isArmed(rule, field);
 		if (mappedFields.length && stored?.pageFacts && valuesOf()) {
 			facts = parsePageFacts(stored.pageFacts);
 			if (facts) {
-				const ctx = { pageUrl: row.url, vocabulary: pageCheck.vocabulary ?? null };
-				verdicts = mappedFields.map((field) => ({
-					field,
-					verdict: compareField(field, values[field.slot], facts, ctx),
-				}));
+				const ctx = {
+					pageUrl: row.url,
+					vocabulary: pageCheck.vocabulary ?? null,
+					offersLimit: pageCheck.offersLimit ?? null,
+				};
+				verdicts = mappedFields.map((field) => {
+					ctx.unshown = false;
+					const verdict = compareField(field, values[field.slot], facts, ctx);
+					if (ctx.unshown && armed(field)) unshown = true;
+					return { field, verdict };
+				});
 				// WITNESSED: the page was rendered after the baseline was taken, and the origin still says
 				// exactly what it said then — so a correct mapping MUST agree unless the value made a
 				// round trip in between. Only these comparisons feed the mapping-defect guard. An
@@ -1642,7 +1766,7 @@ export const runProbePass = async ({
 					!extended && Boolean(stored.signature) && !signatureChanged && epochOf(stored.pageClaimAt) > stored.probedAt;
 				for (const { field, verdict } of verdicts) {
 					if (verdict === null) continue;
-					if (witnessed) guard?.witness(rule, field, verdict === false);
+					if (witnessed) guard?.witness?.(rule, field, verdict === false);
 					if (verdict === false) {
 						bump(stats.fieldMismatch, rule.label, field.label);
 						if (armed(field)) {
@@ -1686,7 +1810,11 @@ export const runProbePass = async ({
 			const onSlot = verdicts.filter(({ field, verdict }) => field.slot === slot && verdict !== null && armed(field));
 			if (!onSlot.length) return false;
 			storedValues ??= signatureSlots(stored.signature) ?? [];
-			const ctx = { pageUrl: row.url, vocabulary: pageCheck.vocabulary ?? null };
+			const ctx = {
+				pageUrl: row.url,
+				vocabulary: pageCheck.vocabulary ?? null,
+				offersLimit: pageCheck.offersLimit ?? null,
+			};
 			return onSlot.every(({ field }) => fieldCaughtUp(field, storedValues[slot], values[slot], facts, ctx));
 		};
 		let ignoredOnly = false;
@@ -1717,7 +1845,7 @@ export const runProbePass = async ({
 		// like a caught-up change. HEALED NEEDS EVERY CHANGED SLOT SHOWN: in the claim pair, which agreed,
 		// or on an armed mapped field that agreed — an unmapped slot that moved could be a second change
 		// after the heal render, which only a re-render resolves (review, round 3).
-		const pageAgrees = claimVerdict === true && !mappedDisagrees;
+		const pageAgrees = claimVerdict === true && !mappedDisagrees && !unshown;
 		let coverage = null;
 		if (coverageOf && !dryRun && stored?.signature && (needsRender || pageDisagrees || mappedDisagrees)) {
 			const pairSlots = claimPair ? [pageCheck.priceFrom, pageCheck.availableFrom] : [];
@@ -1756,7 +1884,16 @@ export const runProbePass = async ({
 			await write(row.url, observed, { rowExists: true, fingerprint: rule.fingerprint });
 			return;
 		}
-		if (!needsRender && !pageDisagrees && !mappedDisagrees) {
+		// A page-only disagreement this pass does not act on (`actOnPageMismatch`) takes the quiet path when
+		// the origin is unchanged, or changed only in `ignoreChanges` slots — the fields that churn between
+		// canary passes, and acting there would re-render an unfixable page every interval after all. The
+		// baseline moves if it must; nothing is expired, filed, verified or recorded as a check. (A baseline
+		// written here makes a running sweep skip the row as already probed, so such a mismatch can wait a
+		// pass.) Beside a CAUGHT-UP change it acts as the sweep would: that change moves the baseline once.
+		if (
+			!needsRender &&
+			(!(pageDisagrees || mappedDisagrees) || (!actOnPageMismatch && (!signatureChanged || ignoredOnly)))
+		) {
 			if (!stored?.signature) {
 				// First observation: baseline it, trigger nothing — the page's content is not known
 				// to have changed, the probe just hadn't seen it before.
@@ -1777,7 +1914,7 @@ export const runProbePass = async ({
 			// alone is not a comparison: an unrecognised availability word beside a null endpoint price
 			// compares nothing and used to pass here); else at least one armed mapped field that agreed.
 			// A caught-up row is not verified on this pass — its baseline just moved — and is on the next.
-			const proof = claimPair ? claimVerdict === true : mappedAgreed > 0;
+			const proof = !unshown && (claimPair ? claimVerdict === true : mappedAgreed > 0);
 			if (verificationArmed && proof && !caughtUp && !mappedDisagrees) {
 				// PROOF, not absence of news. Both conditions are load-bearing and neither is
 				// redundant:
@@ -1796,8 +1933,9 @@ export const runProbePass = async ({
 				//                         comment). Writing unconditionally would add ~200k writes per
 				//                         node per cycle in the steady state to buy nothing.
 				//
-				// `!mappedDisagrees` is structurally true here (a disagreement leaves this branch), and is
-				// stated anyway: no armed mapped field may disagree with a page this certifies.
+				// `!mappedDisagrees` is LOAD-BEARING: a pass that does not act on page mismatches
+				// (`actOnPageMismatch`, the canary) brings its disagreeing pages through this branch, and no
+				// armed mapped field may disagree with a page this certifies.
 				//
 				// Awaited, not detached: it shares the pass's pacing budget, and a write storm that
 				// outruns the probe is exactly what the paced sweep exists to prevent.
@@ -1980,8 +2118,9 @@ export const runProbePass = async ({
 	}
 	await flush();
 
-	// Where each mapped field's guard stands after this pass (cumulative for the process, not the
-	// pass): how close a mapping is to being disarmed, and which ones are. Only for rules that map.
+	// Where each mapped field's guard stands after this pass (the guard's recent sample, which spans passes
+	// in one process): how close a mapping is to a transition, and which ones are disarmed. Only for rules
+	// that map.
 	if (guard && rules.some((rule) => rule.pageCheck?.fields?.length)) stats.fieldGuard = guard.snapshot(rules);
 
 	return stats;
@@ -2669,6 +2808,8 @@ export const runProbeSweepOnce = async ({
 		// same row, and letting the two interleave could write back the scheduler branch it read
 		// before this landed.
 		if (!partialWalk) await publishScheduler();
+		// A full pass ended: fields armed through all of it ease their re-arm backoff (createMappingGuard).
+		if (!partialWalk) theMappingGuard().passEnded();
 		emit(counts());
 		logPass(stats, 'sweep', limits.dryRun);
 		lastSweep = {
@@ -2920,6 +3061,9 @@ export const runProbeCanaryOnce = async ({ dryRun, startedBy = null } = {}) => {
 				...canaryLive,
 				triggered: canaryTriggers.stats.triggered,
 				errors: canaryTriggers.stats.errors + (canaryLive?.rowErrors ?? 0),
+				// Not a detection: the canary leaves page-only mismatches to the sweep, so the same unfixed page
+				// would add to `probe_page_mismatch` every interval. Its own record keeps the count.
+				pageMismatch: undefined,
 			});
 			const stats = await runProbePass({
 				rows: readCohortRows(urls),
@@ -2932,12 +3076,14 @@ export const runProbeCanaryOnce = async ({ dryRun, startedBy = null } = {}) => {
 				write: writeSignature,
 				// The same pipeline as the sweep: every change acted on as it is found.
 				submitTrigger: canaryTriggers.submit,
-				// The SAME guard as the sweep, reading AND witnessing: the canary re-probes its cohort
-				// every few minutes, so a broken mapping would otherwise re-render the whole cohort on
-				// every canary pass until the (possibly daily) sweep got round to disarming it. Repeat
-				// witnesses of one cohort do not skew the rate — they repeat its agreements and its
-				// disagreements alike.
-				guard: theMappingGuard(),
+				// The sweep's guard, READ ONLY, and no re-render for a page-only disagreement. Witnessing made
+				// one cohort the guard's whole sample whenever no pass ran — after a restart, the key-order
+				// bootstrap cohort — and a cluster of it disagreeing for hours after a reprice (the origin's
+				// endpoint updated, its page not yet) disarmed a correct mapping on every node. Acting made a
+				// page a re-render cannot fix re-render every half hour. Page mismatches are the sweep's to
+				// correct, once per pass; this keeps detecting changes. (createMappingGuard)
+				guard: readOnlyGuard(theMappingGuard()),
+				actOnPageMismatch: false,
 				...limits,
 				// NEVER skips. The cohort is small and re-probed on a deliberately fast cadence, and a
 				// skip here would silence the mass-change detector between sweeps — the one thing it
@@ -3308,6 +3454,8 @@ const publishScheduler = () => {
 				canaryArmedAt,
 				sliceSize: measuredSliceSize,
 				cohortSizes: Object.fromEntries([...cohorts].map(([label, urls]) => [label, urls.length])),
+				// When the guard the sweep feeds began (`disarmedFieldsOnNode`): this thread, the scheduler's.
+				guardSince: THREAD_STARTED_AT,
 				loadMonitor: loopLagMonitorState(),
 			},
 		});
