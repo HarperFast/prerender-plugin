@@ -1317,6 +1317,19 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'confined to them writes the new baseline and triggers nothing (counted `ignored`), and the canary ' +
 					'does not count it as a change, so a site-wide edit of such a field cannot trip a bulk ' +
 					'invalidation. A status-signal literal is a state, not slots, and is never ignored.\n' +
+					'  pageCheck.offersLimit  the most offers the origin’s structured data lists on one page, when it ' +
+					'caps them (default null: it lists every variant). A page listing exactly this many may leave out ' +
+					'the variant that carries the endpoint’s price, so a SINGLE endpoint price absent from it — the ' +
+					'claim pair’s, or a "priceSet" field on a scalar slot — is no claim rather than a disagreement, and ' +
+					'never proof the page is current either (no verification, no check, no caught-up: a page whose listed ' +
+					'prices are all stale misses the price the same way); a price it does list still agrees. Exactly, not ' +
+					'at least: the claim counts every Product offer on the page, and several products past the cap ' +
+					'between them were each listed in full. Without it such a product disagrees on every pass and its re-render ' +
+					'lists the same offers again (measured on one origin capped at 50: most single-price disagreements ' +
+					'were exactly this). List "priceSet" fields and "skus" compare what the page lists already. To find ' +
+					'the cap, count the Product offers on a product with many variants against the endpoint’s variant ' +
+					'list. A claim recorded by an older release carries no offer count and compares as before until ' +
+					'its page is re-rendered.\n' +
 					'  PER-SLOT STATS. Pass records decompose `changed` by slot (`slotChanges`) and page mismatches by ' +
 					'mapped field (`fieldMismatch`), in `GET /prerender_admin/change-probe` and the pass log line.\n' +
 					'  invalidateScope  optional invalidation scope ("all" or "route:<match>:<path>") the canary ' +
@@ -1709,7 +1722,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'large fraction changed in one pass. Cohort membership is deterministic — the `count` matched ' +
 					'URLs with the smallest hashes, a keyspace-uniform sample rebuilt by every sweep. (The ' +
 					'bootstrap build after a restart uses a cheaper key-order sample until the first sweep ' +
-					'replaces it.)',
+					'replaces it.) It acts on the origin changes it finds, exactly as the sweep does; a cached page ' +
+					'that disagrees with an UNCHANGED origin is counted (`pageMismatch`) and left to the sweep, which ' +
+					're-renders it once per pass — re-probed every interval, a page a re-render cannot fix would ' +
+					'otherwise re-render every interval. Its comparisons do not feed `mappingGuard`, which reads a ' +
+					'whole slice, not one cohort.',
 				{
 					interval: option(
 						30 * MINUTE,
@@ -1778,8 +1795,15 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'DISARMS the field when its disagreement rate reaches `threshold` over at least `minWitnessed` ' +
 					'comparisons: it stops triggering re-renders (and stops vouching for caught-up changes and ' +
 					'verifications), a warning names the rule and slot, and its mismatches are still counted ' +
-					'(`fieldMismatch` in the pass record; the guard’s own counts are `fieldGuard`). It stays disarmed ' +
-					'until that field’s mapping is edited or the process restarts. It never suppresses an individual ' +
+					'(`fieldMismatch` in the pass record; the guard’s own counts are `fieldGuard`). It RE-ARMS when the ' +
+					'rate since falls below `rearmBelow` (or the mapping is edited, or the process restarts): an ' +
+					'origin whose endpoint and page disagree for a few hours — a large reprice, the endpoint updated ' +
+					'and the page not yet — makes a correct mapping disagree on a cluster of pages, and those pages ' +
+					'are the ones most worth correcting once it passes. Each verdict is on at least `minWitnessed` ' +
+					'comparisons made since the last one, and each re-arm of the same field waits twice as long as the ' +
+					'one before, easing back with every full pass it spends armed (a mapping wrong on part of the slice ' +
+					'would otherwise disarm and re-arm every pass). Only ' +
+					'the sweep feeds it; the canary reads it. It never suppresses an individual ' +
 					'disagreement — a single one is exactly the round trip the page check exists to catch. Disarming ' +
 					'never hides an ORIGIN change: those trigger on the signature as always; a disarmed field only stops ' +
 					'correcting pages that are wrong while the origin is unchanged.\n\n' +
@@ -1804,6 +1828,18 @@ export const configSchema = group('Prerender plugin configuration.', {
 							'disagreements where ~2 are expected); small enough that a broken mapping is disarmed after ' +
 							'about this many spurious re-renders per node rather than a corpus of them.',
 						{ min: 1 }
+					),
+					rearmBelow: option(
+						0.05,
+						'Disagreement rate, over at least `minWitnessed` witnessed comparisons since the field was ' +
+							'disarmed, below which it is re-armed (logged RE-ARMED). Between a correct mapping’s steady ' +
+							'state (well under 1%; a few percent the day after a large reprice) and a broken one’s (nearly ' +
+							'every comparison). 0 never re-arms — a disarmed field then stays so until its mapping is ' +
+							'edited or the process restarts, the behavior before this option. At or above `threshold` there ' +
+							'is no gap between the two, and the fresh sample each verdict needs is the only damping. After k ' +
+							're-arms a field needs `minWitnessed` x 2^k comparisons since its disarm to re-arm again (k up ' +
+							'to 10), and each full pass it spends armed takes one off k.',
+						{ min: 0, max: 1 }
 					),
 				}
 			),

@@ -444,7 +444,12 @@ const runCheck = async (item, gen = generation) => {
 		// endpoint that fails on this URL every time), on every worker of every node, for as long as bots ask
 		// for the page. One ask per URL per window, whatever the answer; the nightly pass still probes it.
 		// Not a pushback (`throttled`): that one pauses the node and is asked again once the pause lifts.
-		await deps.writeCheck(item.url, item.lastCachedMs, { outcome: verdict.result });
+		// The canonical's own agreement rides along: an inconclusive check (an offer-capped page, say) may
+		// still have compared the canonical, and the entity serve takes exactly that as confirmation.
+		await deps.writeCheck(item.url, item.lastCachedMs, {
+			outcome: verdict.result,
+			canonicalAgreed: verdict.canonicalAgreed === true,
+		});
 		metrics.serveCheck(verdict.result, item.source);
 	} else {
 		metrics.serveCheck(verdict.result, item.source);
@@ -531,13 +536,22 @@ const evidenceOf = (value) => fnv1a32(JSON.stringify(value ?? null)).toString(16
  * canonical disagreed. Other fields may disagree: a mismatch elsewhere still says what the canonical did.
  */
 export const compareWithEndpoint = (rule, values, facts, { pageUrl = null, isArmed = () => true } = {}) => {
-	const ctx = { pageUrl, vocabulary: rule.pageCheck?.vocabulary ?? null };
+	const ctx = {
+		pageUrl,
+		vocabulary: rule.pageCheck?.vocabulary ?? null,
+		offersLimit: rule.pageCheck?.offersLimit ?? null,
+	};
 	let disagreed = null;
 	let agreed = 0;
 	let canonical = null;
+	// An armed field the page cannot show (`ctx.unshown`, an offer-capped page) leaves the page unproven:
+	// 'inconclusive', never 'agree', which would spare the page the pass's own comparison.
+	let unshown = false;
 	for (const field of rule.pageCheck?.fields ?? []) {
 		if (!isArmed(rule, field)) continue;
+		ctx.unshown = false;
 		const verdict = compareField(field, values[field.slot], facts, ctx);
+		if (ctx.unshown) unshown = true;
 		if (verdict === false) disagreed ??= field;
 		else if (verdict === true) agreed++;
 		if (field.fact === 'canonical' && verdict !== null) canonical = canonical !== false && verdict;
@@ -551,7 +565,7 @@ export const compareWithEndpoint = (rule, values, facts, { pageUrl = null, isArm
 			canonicalAgreed,
 		};
 	}
-	return { result: agreed > 0 ? 'agree' : 'inconclusive', canonicalAgreed };
+	return { result: agreed > 0 && !unshown ? 'agree' : 'inconclusive', canonicalAgreed };
 };
 
 const checkDocument = async (item) => {

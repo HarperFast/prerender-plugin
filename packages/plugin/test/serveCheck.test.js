@@ -243,6 +243,43 @@ test('compareWithEndpoint: the mapped fields, by the sweep’s comparators — a
 	assert.deepEqual(none, { result: 'inconclusive', canonicalAgreed: false });
 });
 
+test('compareWithEndpoint: a page at its offer cap missing the endpoint price is INCONCLUSIVE, never agree', async () => {
+	// 'agree' would spare the page the pass's own comparison; a capped page whose listed prices are all stale
+	// misses the price exactly as a current one misses an unlisted variant's.
+	const { compileProbeRules, canonicalPageFacts } = await import('../src/util/changeProbeSpec.js');
+	const capped = (offersLimit) =>
+		compileProbeRules([
+			{
+				label: 'pdp',
+				pathPattern: '^/product/prd-([^/]+)',
+				source: 'request',
+				request: { urlTemplate: 'https://api.example.com/p/$1' },
+				extract: ['title', 'lowest'],
+				pageCheck: {
+					enabled: true,
+					offersLimit,
+					fields: [
+						{ slot: 0, fact: 'title', compare: 'text' },
+						{ slot: 1, fact: 'product.offers', compare: 'priceSet' },
+					],
+				},
+			},
+		])[0];
+	const facts = canonicalPageFacts({
+		title: 'Red Shoe',
+		product: {
+			offers: [
+				['1', '19.99', 'USD', 'InStock'],
+				['2', '24.99', 'USD', 'InStock'],
+			],
+		},
+	});
+	const check = (rule, lowest) => serveCheck.compareWithEndpoint(rule, ['Red Shoe', lowest], facts, { pageUrl: URL_A });
+	assert.equal(check(capped(2), 9.99).result, 'inconclusive', 'the title agreeing proves nothing beside it');
+	assert.equal(check(capped(2), 19.99).result, 'agree', 'a listed price is an ordinary agreement');
+	assert.equal(check(capped(null), 9.99).result, 'mismatch', 'no cap configured: as before');
+});
+
 test('compareWithEndpoint: canonicalAgreed says the CANONICAL compared and agreed — not that the check did', async () => {
 	const { compileProbeRules, extractValues } = await import('../src/util/changeProbeSpec.js');
 	const { documentFactsOf } = await import('../src/util/documentFacts.js');
@@ -719,6 +756,11 @@ test('nothing comparable is recorded too, and any recorded verdict covers the co
 	await consider(served());
 	assert.deepEqual(outcomes(), ['queued', 'inconclusive']);
 	assert.equal(calls.writeCheck.at(-1).outcome, 'inconclusive', 'asking again in 5 minutes would get the same nothing');
+	assert.equal(
+		calls.writeCheck.at(-1).canonicalAgreed,
+		false,
+		'the canonical’s own verdict rides along: none compared'
+	);
 	// A page that states nothing at all: nothing to queue.
 	ops = [];
 	serveCheck.resetServeChecks();
