@@ -495,6 +495,20 @@ test('render.negative: a life shorter than the fresh window, and a life over a d
 	assert.ok(!findingKeys().includes('render.negative.lifeMs'));
 	applyOptions({ render: { negative: { enabled: false, freshMs: 2 * 3_600_000, lifeMs: 3_600_000 } } });
 	assert.ok(!findingKeys().includes('render.negative.lifeMs'), 'a disabled feature is not a finding');
+	applyOptions({
+		render: { negative: { enabled: true, expiry: 'midnight', freshMs: 2 * 3_600_000, lifeMs: 3_600_000 } },
+	});
+	assert.ok(!findingKeys().includes('render.negative.lifeMs'), 'midnight reads neither window');
+	applyOptions({});
+});
+
+test('render.negative: expiry midnight in a zone Intl cannot resolve is flagged — the cache would store nothing', () => {
+	applyOptions({ render: { negative: { enabled: true, expiry: 'midnight', expiryTimezone: 'America/Chicago' } } });
+	assert.ok(!findingKeys().includes('render.negative.expiryTimezone'));
+	applyOptions({ render: { negative: { enabled: true, expiry: 'midnight', expiryTimezone: 'Central' } } });
+	assert.ok(findingKeys().includes('render.negative.expiryTimezone'));
+	applyOptions({ render: { negative: { enabled: true, expiry: 'interval', expiryTimezone: 'Central' } } });
+	assert.ok(!findingKeys().includes('render.negative.expiryTimezone'), 'an interval expiry never reads the zone');
 	applyOptions({});
 });
 

@@ -22,7 +22,8 @@
 #                                                      every worker and SUBSCRIBED; isolated, see the type)
 #   raw_cache        RawPage, RawPageAnchor          — cached origin documents for URLs outside
 #                                                      the render rotation (expiring, isolated)
-#   negative_cache   NegativePage,                   — the origin's own 404/410 responses, node-local
+#   negative_cache   NegativePage,                   — the origin's own 404/410 responses, node-local,
+#                    SharedNegativePage,               or replicated under render.negative.replicate
 #                    NegativePageAnchor                (+ an empty replicated anchor, see the type)
 
 type SitemapEntry {
@@ -841,8 +842,36 @@ type NegativePage @table(database: "negative_cache", replicate: false, expiratio
 	expiresAt: Date @expiresAt
 }
 
+# THE SAME ROWS, ONE COPY FOR THE CLUSTER: where `render.negative.replicate` puts them instead of NegativePage.
+# Same fields, same writer, same reasons for each; only the residency differs. It replicates, so a 404 one node
+# stored answers on every node and a drop on one node (the origin said the page is live) clears it everywhere.
+#
+# WHEN THAT IS WORTH ITS COST. Node-local rows were the right default where one crawler's repeats were pinned
+# to one node. Once several crawlers ask for the same dead URLs on different nodes, each node asks the origin
+# for its own copy: replaying a week of one deployment's dead-URL requests, one copy for the cluster cut the
+# origin requests a further 5% at a 2h15m window and 17% under `expiry: 'midnight'`. The cost is every stored
+# body streamed to every node (~35 KB gzipped each there, ~270k a day under midnight expiry).
+#
+# A SEPARATE TABLE, NOT A FLAG ON NegativePage: residency is fixed per table, and two tables let the switch
+# take effect without a migration. Each mode reads only its own table; the other's rows age out.
+#
+# Its expiration fallback is 24h like NegativePage's, so the reclaim pass runs every 6h. Under
+# `expiry: 'midnight'` a row's `expiresAt` is its boundary plus a per-key spread of up to a day
+# (util/negativeCache.js `reclaimSpreadMs`), so each pass reclaims about a quarter of a day's rows rather
+# than all of them at once. `expiresAt` is authoritative over the fallback in both directions.
+type SharedNegativePage @table(database: "negative_cache", expiration: 86400) @sealed {
+	cacheKey: String @primaryKey
+	statusCode: Int!
+	headers: String
+	content: Blob
+	storedAt: Date
+	checkedAt: Date
+	expiresAt: Date @expiresAt
+}
+
 # Same anchor, same reason as CoordinationAnchor and ProbeStateAnchor: NegativePage is `replicate: false`,
 # and a database with zero replicable tables spins the replication subscription (harper-pro#685).
+# SharedNegativePage replicates now, so this is belt-and-braces, as RawPageAnchor is for raw_cache.
 type NegativePageAnchor @table(database: "negative_cache") @sealed {
 	id: Int @primaryKey
 }

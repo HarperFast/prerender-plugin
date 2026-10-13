@@ -2046,6 +2046,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'the entry, so the next request sees the live page; anything else (5xx, a timeout) keeps serving ' +
 				'until the life ends. This buys response time and fast recovery, not offload.\n' +
 				'  - past `lifeMs`: the request proxies as if nothing were stored, and a 404 stores again.\n\n' +
+				'Or ONE window, to the next midnight, with no re-checks (`expiry: midnight`).\n\n' +
 				'IT ONLY EVER REPLACES AN ORIGIN PROXY on a true miss, after the raw cache: a URL with a cached ' +
 				'page, stale or not, is never answered from here. It never answers a URL whose Target a sitemap ' +
 				'lists (`skipTargets`), checked on every read, so a relisted product answers live on every node as ' +
@@ -2091,7 +2092,8 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'`negative_gap`.\n\n' +
 						'The cost of a longer window is a URL that comes back answering 404 to a crawler for up to this ' +
 						'long. Recoveries were rare where measured (about 2 in 60 URLs that stopped 404ing), and the ' +
-						'sitemap check on every read covers the common case of a relisted product.',
+						'sitemap check on every read covers the common case of a relisted product. Ignored under ' +
+						'`expiry: midnight`.',
 					{ unit: 'ms', min: 1 }
 				),
 				lifeMs: option(
@@ -2102,8 +2104,40 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'check that goes to the origin anyway (a re-check, or an excluded bot’s proxied request) ' +
 						'replaces them instead of confirming them, so no body is served more than about twice this old. ' +
 						'Until then a re-check is a HEAD, which refreshes the ' +
-						'status, not the bytes. Must be at least `freshMs`.',
+						'status, not the bytes. Must be at least `freshMs`. Ignored under `expiry: midnight`.',
 					{ unit: 'ms', min: 1 }
+				),
+				expiry: option(
+					'interval',
+					'`interval` (the default): the `freshMs` / `lifeMs` windows above. `midnight`: a stored response ' +
+						'answers without asking the origin until the next midnight in `expiryTimezone` after the origin ' +
+						'last confirmed it, then the next request proxies and stores again. `freshMs` and `lifeMs` are ' +
+						'ignored, and nothing is re-checked in the background.\n\n' +
+						'FOR AN ORIGIN WHOSE 404s HOLD UNTIL A NIGHTLY CHANGE, or that would rather see each dead URL ' +
+						'once a day than be re-checked. The cost is recovery: a page that comes back during the day ' +
+						'answers 404 until midnight, where the interval windows notice it on the first request past ' +
+						'`freshMs`. Replaying a week of one deployment’s dead-URL requests: about 31% fewer origin ' +
+						'requests than a 2h15m window, and about three times the stale answers (a page that came back, ' +
+						'answered 404). A sitemap that lists the URL again still overrules the stored response on every ' +
+						'read, so a relisting the sitemap carries is answered live as soon as the walk attaches it.\n\n' +
+						'The boundary is read off each row’s last confirmation at read time, so switching applies to ' +
+						'rows already stored. A stored body is at most a day old.',
+					{ enum: ['interval', 'midnight'] }
+				),
+				expiryTimezone: option('UTC', 'IANA timezone `expiry: midnight` is resolved in.', { nonEmpty: true }),
+				replicate: option(
+					false,
+					'Keep ONE copy of each stored response for the cluster (`SharedNegativePage`, replicated) instead ' +
+						'of one per node (`NegativePage`). A 404 one node stored then answers on every node, and a page ' +
+						'the origin answers live for on one node is dropped everywhere.\n\n' +
+						'WORTH IT WHEN SEVERAL CRAWLERS ASK FOR THE SAME DEAD URLS ON DIFFERENT NODES. Node-local is the ' +
+						'default because one crawler’s repeats are usually pinned to one node by the traffic manager. ' +
+						'Replaying a week of one deployment’s dead-URL requests, one copy cut origin requests a further ' +
+						'5% at a 2h15m window and 17% under `expiry: midnight`, and answered about 30% more requests ' +
+						'with a stale 404 at the same window (one confirmation answers for every node).\n\n' +
+						'THE COST IS REPLICATION: every stored body is streamed to every node (gzipped; ~35 KB each on ' +
+						'that deployment, ~270k a day under midnight expiry). Switching takes effect without a ' +
+						'migration: each mode reads only its own table, and the other’s rows age out.'
 				),
 				deviceIndependent: option(
 					false,
