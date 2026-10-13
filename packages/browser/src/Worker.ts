@@ -13,6 +13,7 @@ import { JobDocumentCache } from './documentReuse.js';
 import { closePrefetchAgent, prefetchDocument, type PrefetchOutcome } from './documentPrefetch.js';
 import { BoundedAsyncQueue } from './util/asyncQueue.js';
 import { closeVariantSession, newVariantSession, resetForNextVariant, type VariantSession } from './variantContext.js';
+import { ReadinessDrift, driftMessage } from './readinessDrift.js';
 
 export type Renderer = (page: Page, job: RenderJob) => Promise<string | undefined>;
 
@@ -82,6 +83,9 @@ export default class RenderWorker {
 	// (what this worker did since the last line), not a monotonic total. `renderTimes` is bounded
 	// by throughput over one interval and cleared each tick.
 	private stats = RenderWorker.freshStats();
+	// Which readiness clauses have stopped holding on most renders (see readinessDrift.ts). Created on
+	// first use, so it reads the config the worker actually renders with. Null when turned off.
+	private drift: ReadinessDrift | null | undefined;
 
 	private statsSince = Date.now();
 
@@ -596,6 +600,9 @@ export default class RenderWorker {
 				failuresByType: s.failures,
 				resultPostFailures: s.resultPostFailures,
 			},
+			// Readiness clauses currently failing on most renders — the contract needs updating. Present only
+			// while something is failing; the transitions themselves are logged as warnings.
+			...(this.drift?.failing().length ? { readinessFailing: this.drift.failing() } : {}),
 			renderMs: summarize(s.renderTimes),
 			// Where the render time went: navTtfb/navTotal are origin/edge response time (network),
 			// settle/postProcess are in-browser work (CPU). Isolates a slow upstream from render cost.
@@ -1045,6 +1052,7 @@ export default class RenderWorker {
 				else this.stats.emptyContent++;
 			}
 		}
+		if (!error && content) this.noteReadiness(job);
 
 		try {
 			if (page) await browser.closePage(page);
@@ -1053,6 +1061,25 @@ export default class RenderWorker {
 			// refs hit zero, so dropping the ref before the page is closed let the reaper close the
 			// browser under an open page.
 			browser.jobRefs--;
+		}
+	}
+
+	/**
+	 * Feed this render's contract verdict to the drift tracker and log what it reports. Only a page
+	 * that actually rendered counts: an error page or a non-indexable one fails every clause and says
+	 * nothing about whether the contract still matches the template.
+	 */
+	private noteReadiness(job: RenderJob) {
+		if (!job.readiness || job.httpResponse?.statusCode !== 200 || job.isIndexable === false) return;
+		if (this.drift === undefined) {
+			const policy = settings.config.readiness?.drift;
+			this.drift = policy === false ? null : new ReadinessDrift(policy ?? {});
+		}
+		if (!this.drift) return;
+		for (const report of this.drift.record(job.readiness, job.url, job.deviceType)) {
+			const line = { workerId: settings.harper.workerId || undefined, ...report };
+			if (report.event === 'readiness-clause-recovered') logger.info(line, driftMessage(report));
+			else logger.warn(line, driftMessage(report));
 		}
 	}
 

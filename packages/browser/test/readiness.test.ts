@@ -209,6 +209,52 @@ before(async () => {
 				const cls = path === '/keep.js' ? 'keep' : 'junk';
 				return res.end(`document.body.insertAdjacentHTML('beforeend', '<div class="${cls}">x</div>');`);
 			}
+			// A block that is in the DOM from the start but CONCEALED by a reveal wrapper — the shape a
+			// reveal animation takes — and shown at 500ms; one that is never shown; and one only clipped
+			// (zero height, overflow hidden, fully opaque), which no class name and no opacity check sees.
+			case '/reveal-late':
+				return res.end(
+					page(
+						'<p>x</p><div id="wrap" style="opacity:0;max-height:0;overflow:hidden"><div id="block" data-widget="reviews">reviews</div></div>',
+						`<script>setTimeout(() => { const w = document.getElementById('wrap');
+							w.style.opacity = '1'; w.style.maxHeight = 'none'; }, 500);</script>`
+					)
+				);
+			case '/never-revealed':
+				return res.end(
+					page(
+						'<p>x</p><div style="opacity:0;max-height:0;overflow:hidden"><div id="block" data-widget="reviews">reviews</div></div>'
+					)
+				);
+			case '/clipped':
+				return res.end(
+					page(
+						'<p>x</p><div style="max-height:0;overflow:hidden"><div id="block" data-widget="reviews">reviews</div></div>'
+					)
+				);
+			// A guard's slot that mounts at 200ms and is never filled: the guarded clause turns on and then
+			// can never hold.
+			case '/slot-never-fills':
+				return res.end(
+					page(
+						'<p>x</p>',
+						`<script>setTimeout(() => document.body.insertAdjacentHTML('beforeend', '<div id="slot"></div>'), 200);</script>`
+					)
+				);
+			// A widget that renders its container and its summary slot together at 500ms, then fills the
+			// summary at 900ms. Before 500ms nothing says whether this page will have a summary.
+			case '/widget-late-slot':
+				return res.end(
+					page(
+						'<p>x</p>',
+						`<script>
+							setTimeout(() => document.body.insertAdjacentHTML('beforeend',
+								'<div id="widget"><div id="slot"></div></div>'), 500);
+							setTimeout(() => document.getElementById('slot').insertAdjacentHTML('beforeend',
+								'<p class="summary">summary text</p>'), 900);
+						</script>`
+					)
+				);
 			default:
 				return res.end(page('<p>ok</p>'));
 		}
@@ -918,4 +964,113 @@ test('the rot valve does not stand a clause aside while the page is still fetchi
 		`the contract must wait out its timeout while same-origin work is outstanding (waited ${readiness?.waitedMs}ms)`
 	);
 	assert.ok(Date.now() - started >= 1400);
+});
+
+test('a visible clause waits for a concealed block to be SHOWN, not merely present', async () => {
+	const result = await render('/reveal-late', {
+		name: 'reveal',
+		require: [{ name: 'shown', visible: '[data-widget="reviews"]' }],
+		timeoutMs: 5000,
+	});
+	assert.equal(result.job.readiness?.satisfied, true);
+	assert.equal(result.job.readiness?.exit, 'stopped');
+	// Present from the first byte; shown only at 500ms. A presence clause would hold at once.
+	assert.ok((result.job.readiness?.firstSatisfiedMs ?? 0) >= 400, 'held before the block was shown');
+});
+
+test('a visible clause never holds on a block that stays concealed or clipped', async () => {
+	for (const path of ['/never-revealed', '/clipped']) {
+		const result = await render(
+			path,
+			{ name: 'concealed', require: [{ name: 'shown', visible: '#block' }], timeoutMs: 5000 },
+			{ unmetGraceMs: 300 }
+		);
+		assert.equal(result.job.readiness?.satisfied, false, `${path} must not count as shown`);
+		assert.equal(result.job.readiness?.require[0].count, 0, path);
+	}
+});
+
+test('a guard-skipped clause that turns on and never holds is released by the rot valve', async () => {
+	// The guard's slot mounts at 200ms and is never filled. Counting the skipped ticks as "held" made the
+	// valve read the clause as in progress, and the render ran to its timeout every time.
+	const started = Date.now();
+	const result = await render(
+		'/slot-never-fills',
+		{
+			name: 'slot',
+			require: [
+				{ name: 'fine', selector: 'p' },
+				{ name: 'summary', selector: '#slot .summary', onlyIf: { present: '#slot' } },
+			],
+			timeoutMs: 20000,
+		},
+		{ unmetGraceMs: 300 }
+	);
+	const waited = Date.now() - started;
+	assert.equal(result.job.readiness?.exit, 'valve');
+	assert.equal(result.job.readiness?.require.find((r) => r.name === 'summary')?.firstTrueMs, undefined);
+	assert.ok(waited < 10000, `released in ${waited}ms rather than waiting out the 20s timeout`);
+});
+
+test('a present guard with `after` waits for the widget before deciding its slot is absent', async () => {
+	const clause = (after?: string) => ({
+		name: 'summary',
+		selector: '.summary',
+		nonEmptyText: true,
+		onlyIf: after ? { present: '#slot', after } : { present: '#slot' },
+	});
+	// Without `after` the guard reads "no slot yet" as "no slot", the contract holds at once and the
+	// render stops before the widget has even mounted.
+	const early = await render('/widget-late-slot', {
+		name: 'no-after',
+		require: [{ name: 'fine', selector: 'p' }, clause()],
+		timeoutMs: 5000,
+	});
+	assert.doesNotMatch(early.html ?? '', /summary text/, 'the race this option exists to close');
+
+	const held = await render('/widget-late-slot', {
+		name: 'after',
+		require: [{ name: 'fine', selector: 'p' }, clause('#widget')],
+		timeoutMs: 5000,
+	});
+	assert.equal(held.job.readiness?.satisfied, true);
+	assert.match(held.html ?? '', /summary text/);
+	assert.ok((held.job.readiness?.firstSatisfiedMs ?? 0) >= 800, 'held before the summary was filled');
+});
+
+test('a visible waitFor gate waits for the content to be shown', async () => {
+	const gate = async (visible: boolean) =>
+		renderOnce({
+			url: `${base}/reveal-late`,
+			config: {
+				navigation: { networkIdleMs: 50, networkIdleTimeoutMs: 200, domStableMs: 0, domStableTimeoutMs: 500 },
+				scroll: { enabled: false },
+				waitFor: [{ name: 'reviews', selector: '#block', visible, timeoutMs: 3000 }],
+			} as never,
+		});
+	const shown = await gate(true);
+	assert.equal(shown.waitForResults[0].satisfied, true);
+	assert.ok(shown.waitForResults[0].waitedMs >= 300, `gate passed after ${shown.waitForResults[0].waitedMs}ms`);
+	const present = await gate(false);
+	assert.equal(present.waitForResults[0].satisfied, true);
+	assert.ok(present.waitForResults[0].waitedMs < shown.waitForResults[0].waitedMs, 'presence alone passes at once');
+});
+
+test('visible and onlyIf.after are validated at config load', async () => {
+	const { validateReadiness } = await import('../dist/readiness.js');
+	const cfg = (assertion: Record<string, unknown>) => ({
+		onSatisfied: 'quiet',
+		contracts: [{ name: 'c', require: [assertion] }],
+	});
+	assert.doesNotThrow(() => validateReadiness(cfg({ name: 'v', visible: '#x' })));
+	assert.throws(() => validateReadiness(cfg({ name: 'v', visible: '' })), /visible must be a non-empty selector/);
+	assert.throws(() => validateReadiness(cfg({ name: 'v', visible: '#x', selector: '#x' })), /exactly one of/);
+	assert.throws(
+		() => validateReadiness(cfg({ name: 'g', selector: '#x', onlyIf: { jsonLdNumber: 'a', after: '#w' } })),
+		/only applies to a present guard/
+	);
+	assert.throws(
+		() => validateReadiness(cfg({ name: 'g', selector: '#x', onlyIf: { present: '#s', after: '' } })),
+		/after must be a non-empty selector/
+	);
 });

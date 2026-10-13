@@ -707,7 +707,7 @@ const renderer: Renderer = async (page, job) => {
 				}
 				let count: number;
 				try {
-					count = await page.evaluate(countMatchingElements, contentSelector);
+					count = await page.evaluate(countMatchingElements, contentSelector, rule.visible === true);
 				} catch {
 					// page closed / navigated — stop instead of looping to the deadline, but keep the
 					// partial telemetry rather than dropping the whole run's attribution.
@@ -810,7 +810,11 @@ const renderer: Renderer = async (page, job) => {
 				break; // page closed or navigated — report what we have
 			}
 			for (const clause of last.require) {
-				if (clause.ok && !firstTrue.has(clause.name)) firstTrue.set(clause.name, Date.now() - started);
+				// A clause its guard SKIPPED did not hold; it did not apply. Counting it as true made the rot
+				// valve read "was true, has gone false" — still in progress — once the guard turned on, so a
+				// clause that then never held could not be released and the render ran to `timeoutMs`.
+				if (clause.ok && !clause.skipped && !firstTrue.has(clause.name))
+					firstTrue.set(clause.name, Date.now() - started);
 				if (shedNames.has(clause.name)) {
 					const peak = Math.max(shedPeak.get(clause.name) ?? 0, clause.count);
 					shedPeak.set(clause.name, peak);
@@ -985,7 +989,8 @@ const renderer: Renderer = async (page, job) => {
 					break;
 				}
 				for (const clause of last.require) {
-					if (clause.ok && !firstTrue.has(clause.name)) firstTrue.set(clause.name, Date.now() - started);
+					if (clause.ok && !clause.skipped && !firstTrue.has(clause.name))
+						firstTrue.set(clause.name, Date.now() - started);
 				}
 				if (last.started && last.require.every((r) => r.ok)) {
 					firstSatisfiedMs = Date.now() - started;
@@ -1011,7 +1016,8 @@ const renderer: Renderer = async (page, job) => {
 		try {
 			last = (await page.evaluate(evaluateContract, payload)) ?? last;
 			for (const clause of last.require) {
-				if (clause.ok && !firstTrue.has(clause.name)) firstTrue.set(clause.name, Date.now() - started);
+				if (clause.ok && !clause.skipped && !firstTrue.has(clause.name))
+					firstTrue.set(clause.name, Date.now() - started);
 			}
 			if (last.started && last.require.every((r) => r.ok) && firstSatisfiedMs === null) {
 				firstSatisfiedMs = Date.now() - started;
@@ -1291,12 +1297,41 @@ function scrollSelectorIntoView(selector: string): boolean {
 // Allocation-free (matches the countDomElements walk): a manual firstChild/nextSibling traversal
 // testing each element with `matches(selector)` and recursing into open shadow roots, rather than
 // querySelectorAll('*') per root (which allocates a NodeList of every element on every poll tick).
-function countMatchingElements(selector: string): number {
+//
+// `visible`: count only matches that are actually shown. Same test as the readiness `visible` clause
+// (`shown` in readiness.ts's evaluateContract) — keep the two in step; both run in-page and
+// self-contained, so they cannot share a helper.
+function countMatchingElements(selector: string, visible = false): number {
+	const parentOf = (el: Element): Element | null => el.parentElement ?? ((el.getRootNode() as ShadowRoot).host || null);
+	const shown = (el: Element): boolean => {
+		const check = (el as Element & { checkVisibility?: (o: Record<string, boolean>) => boolean }).checkVisibility;
+		const opts = { opacityProperty: true, visibilityProperty: true, checkOpacity: true, checkVisibilityCSS: true };
+		if (typeof check === 'function') {
+			if (!check.call(el, opts)) return false;
+		} else {
+			for (let n: Element | null = el; n; n = parentOf(n)) {
+				const cs = getComputedStyle(n);
+				if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+			}
+		}
+		const box = el.getBoundingClientRect();
+		if (box.width <= 0 || box.height <= 0) return false;
+		let depth = 0;
+		for (let n = parentOf(el); n && depth < 64; n = parentOf(n), depth++) {
+			const cs = getComputedStyle(n);
+			if (cs.overflowX === 'visible' && cs.overflowY === 'visible') continue;
+			const clip = n.getBoundingClientRect();
+			if ((cs.overflowX !== 'visible' && clip.width <= 0) || (cs.overflowY !== 'visible' && clip.height <= 0)) {
+				return false;
+			}
+		}
+		return true;
+	};
 	let n = 0;
 	const walk = (node: Node) => {
 		if (node.nodeType === 1) {
 			const el = node as Element;
-			if (el.matches(selector)) n++;
+			if (el.matches(selector) && (!visible || shown(el))) n++;
 			const sr = el.shadowRoot;
 			if (sr) walk(sr);
 		}

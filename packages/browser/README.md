@@ -352,6 +352,9 @@ include what you change:
 			"devices": ["mobile", "tablet"], // desktop's tall viewport already has it in view
 			"pathPattern": "^/product/", // only product pages have this widget
 		},
+		// count only matches actually SHOWN (not hidden, transparent or clipped), for content a reveal
+		// animation keeps in the DOM while hiding it
+		{ "selector": "[data-widget=reviews]", "visible": true, "timeoutMs": 10000, "devices": ["desktop"] },
 	],
 	// optional: per-page-type statements of what a COMPLETE render contains. When one governs a
 	// render it REPLACES the timer-based settle — see "Readiness contracts" below. Absent → no-op.
@@ -359,6 +362,8 @@ include what you change:
 		"onSatisfied": "quiet", // stop once the contract holds AND the DOM has been still for quietMs
 		"quietMs": 250,
 		"unmetGraceMs": 1000, // stop waiting on a clause that has never been true once everything else holds
+		// log a warning when a clause fails on most renders: the contract needs updating (false = off)
+		"drift": { "window": 50, "minSamples": 20, "threshold": 0.5, "remindMs": 3600000 },
 		"contracts": [
 			{
 				"name": "product",
@@ -371,6 +376,15 @@ include what you change:
 					{ "name": "rails-filled", "every": ".rail", "contains": ".slide" },
 					// only required when the page's own JSON-LD says the content should exist
 					{ "name": "reviews", "selector": ".review", "onlyIf": { "jsonLdNumber": "aggregateRating.ratingCount" } },
+					// the block is on screen, wherever the template puts it and however it reveals it
+					{ "name": "reviews-shown", "visible": "[data-widget=reviews]" },
+					// a widget that mounts its own summary slot: decide "no slot" only once the widget exists
+					{
+						"name": "summary",
+						"selector": ".summary-text",
+						"nonEmptyText": true,
+						"onlyIf": { "present": "[data-slot=summary]", "after": "[data-widget=reviews]" },
+					},
 				],
 				"observe": [{ "name": "product-links", "selector": "a[href^=/product/]" }], // reported, never waited on
 			},
@@ -485,13 +499,14 @@ widget, or that serialized pre-hydration markup, reports 200, non-empty and inde
 downstream can tell. A contract states per page type what a complete render CONTAINS; the renderer
 holds until that is true **and** the DOM has gone quiet, and posts the per-clause result back.
 
-Seven assertion forms, each of which exists because something else could not express it:
+Eight assertion forms, each of which exists because something else could not express it:
 
 | form                                          | satisfied when                                                        | exists because                                                                                                              |
 | --------------------------------------------- | --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
 | `selector` + `minCount`                       | at least N match (shadow-piercing)                                    | the base case                                                                                                               |
 | `anyOf` (branch `textMatches` optional)       | any branch matches (a `textMatches` branch counts only matching text) | an empty-but-legitimate listing page is structurally identical to one whose grid has not arrived                            |
 | `absent`                                      | nothing matches                                                       | skeletons and spinners that a real render replaces                                                                          |
+| `visible` + `minCount`                        | at least N match and are actually shown                               | a reveal animation hides content already in the DOM; naming its classes breaks the day the template stops using them        |
 | `selector` + `shed`                           | no element still carries the attribute (`maxRemaining`, `allowNone`)  | frameworks drop a marker on hydrate; this is the check that catches a snapshot of pre-hydration markup                      |
 | `every` + `contains`                          | every container has content, and at least one exists                  | "at least 3 rails" is a constant someone measured once; "every rail is filled" survives the template changing               |
 | `selector` + `nonEmptyText` (+ `textMatches`) | some match has text / matching text                                   | presence is not the same as populated                                                                                       |
@@ -504,6 +519,11 @@ a presence gate cannot tell "none" from "not yet", and accepting _either_ review
 summary fires early on pages that do have reviews (measured: the summary lands 236–263 ms before the
 first review). Keyed on the page's declared `aggregateRating.ratingCount`, the document says what
 should exist and the rendered DOM is held to it.
+
+A `present` guard answers only "is the element there now?", which cannot tell "this page has none"
+from "not rendered yet". For a slot that a widget mounts late, add `after`: until an element matching
+it exists the clause is not yet satisfied, and only then does a missing slot mean "none here". Name
+the element the slot is rendered with (the widget's own container), not one that arrives earlier.
 
 When the page's data cannot say it but the widget does — a rating count that includes ratings with
 no review text, so there is nothing to list — give the `anyOf` branch for that state a
@@ -537,7 +557,20 @@ not the resource-timing buffer, which such a page overflows.
   holds and the DOM is quiet, is stood aside after `unmetGraceMs` and reported unsatisfied — the
   render falls back to the ordinary settle. Cost degrades to roughly today's behaviour instead of
   waiting out the timeout on every render forever; without that valve one unsatisfiable clause
-  measured +385% wall.
+  measured +385% wall. A clause its guard skipped is not "true", so a guarded clause that turns on
+  and then never holds is released the same way.
+- **A rotted contract is logged.** The valve protects content, not cost, and it is silent: measured
+  on a live product template, a redesign removed the element one clause named and that clause failed
+  on 235,993 of 235,995 renders over a day, every one paying the fallback settle, before anyone
+  noticed. Each worker therefore tracks, per clause, its last `drift.window` renders that produced a
+  page (a 200, indexable, with content), counting a clause failed when it does not hold on the page
+  as serialized and not at all when its guard skipped it. Once a clause has failed on at least
+  `drift.threshold` of at least `drift.minSamples` of them, the worker logs a warning,
+  `event: "readiness-clause-failing"`, naming the contract and clause, the share, how the failing
+  renders' windows ended, and the latest failing URLs. It repeats it as
+  `readiness-clause-still-failing` every `drift.remindMs`, lists the clause under `readinessFailing`
+  on the periodic stats line while it lasts, and logs `readiness-clause-recovered` once the share
+  falls to half the threshold. Nothing about any render changes. `drift: false` turns it off.
 
 - **Cap `timeoutMs` low.** A contract that does not satisfy pays its whole timeout **and then the
   full fallback settle on top**, and it costs CPU rather than only wall, because the page keeps
