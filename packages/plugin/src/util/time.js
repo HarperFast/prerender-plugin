@@ -66,13 +66,13 @@ const parseTimeOfDay = (timeStr) => {
 
 /**
  * Returns the next occurrence (epoch ms, floored to the minute) of `timeStr`
- * ("HH:MM") in the given IANA `timezone`. DST-aware: the offset is recomputed at
- * the target instant.
+ * ("HH:MM") in the given IANA `timezone`, after `nowMs`. DST-aware: the offset is
+ * recomputed at the target instant.
  */
-export const getNextTimeOfDay = (timeStr, timezone) => {
+export const getNextTimeOfDay = (timeStr, timezone, nowMs = Date.now()) => {
 	const { hours, minutes } = parseTimeOfDay(timeStr);
 
-	const now = new Date();
+	const now = new Date(nowMs);
 	const tzNow = new Date(now.toLocaleString('en-US', { timeZone: timezone }));
 	const offset = now.getTime() - tzNow.getTime();
 

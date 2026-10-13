@@ -62,6 +62,16 @@ export const config = defaultConfig();
 
 const isPlainObject = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
 
+/** Does `Intl` resolve this as a timezone? An unknown zone throws a RangeError. */
+const isTimeZone = (zone) => {
+	try {
+		new Intl.DateTimeFormat('en-US', { timeZone: zone });
+		return true;
+	} catch {
+		return false;
+	}
+};
+
 /**
  * Where merge/validation warnings go.
  *
@@ -852,7 +862,9 @@ export const collectConfigWarnings = (target = config, { prerenderRoutes } = {})
 	// A LIFE SHORTER THAN THE FRESH WINDOW has no revalidate window at all: every row expires while it is
 	// still answering without a re-check, so the background check this feature is built around never
 	// runs and a recovered page is only noticed once the row is gone. Almost certainly the two swapped.
-	if (target.render.negative.enabled && target.render.negative.lifeMs < target.render.negative.freshMs) {
+	// Both lifeMs checks are interval-only: under `expiry: midnight` neither window is read.
+	const negativeIntervals = target.render.negative.enabled && target.render.negative.expiry !== 'midnight';
+	if (negativeIntervals && target.render.negative.lifeMs < target.render.negative.freshMs) {
 		add(
 			'warn',
 			'render.negative.lifeMs',
@@ -865,13 +877,27 @@ export const collectConfigWarnings = (target = config, { prerenderRoutes } = {})
 	// `lifeMs` (until then it is a HEAD and confirms the status alone), so the body a crawler is handed can be
 	// up to about twice `lifeMs` old. For a 404 that is rarely content anyone reads, but an origin whose error
 	// page carries live data (a retired product's offer, say) serves that data from whenever it was stored.
-	if (target.render.negative.enabled && target.render.negative.lifeMs > 86400000) {
+	if (negativeIntervals && target.render.negative.lifeMs > 86400000) {
 		add(
 			'warn',
 			'render.negative.lifeMs',
 			`render.negative.lifeMs is ${target.render.negative.lifeMs}ms (over 24h). A re-check refreshes the ` +
 				`status and replaces the stored body only once it is older than this, so a crawler can be handed a ` +
 				`body up to about twice this old.`
+		);
+	}
+	// A MIDNIGHT THAT CANNOT BE RESOLVED stores and answers nothing: the cache fails closed (every request
+	// proxies, every store counts `write-failed`), which is safe and otherwise silent.
+	if (
+		target.render.negative.enabled &&
+		target.render.negative.expiry === 'midnight' &&
+		!isTimeZone(target.render.negative.expiryTimezone)
+	) {
+		add(
+			'warn',
+			'render.negative.expiryTimezone',
+			`render.negative.expiryTimezone "${target.render.negative.expiryTimezone}" is not an IANA timezone, so ` +
+				`expiry: midnight cannot find its boundary and the negative cache stores and answers nothing.`
 		);
 	}
 	// A CONSUMER WITH NO TRACKER is inert, not broken, and says nothing about it: the ladder rests every

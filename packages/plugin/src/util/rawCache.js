@@ -137,7 +137,7 @@ export const rawExpiresAt = (policy, nowMs = Date.now()) => {
 		// reads as "not servable" — a feature that silently stores everything and serves none of it.
 		if (Number.isFinite(ms) && ms > 0) return nowMs + ms;
 	}
-	return getNextTimeOfDay('00:00', policy.expiryTimezone);
+	return getNextTimeOfDay('00:00', policy.expiryTimezone, nowMs);
 };
 
 /** The leading media type of a `content-type` value, lowercased, parameters dropped. */

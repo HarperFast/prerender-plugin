@@ -24,14 +24,33 @@
  * of a HEAD, and a proxied 404 is stored whole instead of confirmed. No extra origin request, and no body
  * is ever served more than about twice `lifeMs` old.
  *
+ * ── OR ONE WINDOW, TO MIDNIGHT (`expiry: 'midnight'`) ────────────────────────────────────────
+ *
+ * A stored 404 answers without asking the origin until the next midnight in `expiryTimezone` after the
+ * origin last confirmed it, and then the next request proxies and stores again. No revalidate window, so
+ * no background re-checks: for an origin that says its 404s hold until a nightly change, that is the whole
+ * saving. The price is recovery: a page that comes back during the day answers 404 until midnight, where
+ * the interval windows would notice on the first request past `freshMs`. Measured on the deployment this
+ * was built for, replaying a week of dead-URL requests: about 31% fewer origin requests than a 2h15m
+ * window, and about three times the stale answers. The boundary is read off `checkedAt` at read time, not
+ * stored, so switching a deployment to it applies to the rows it already holds.
+ *
+ * ── NODE-LOCAL, OR ONE COPY FOR THE CLUSTER (`replicate`) ────────────────────────────────────
+ *
+ * Rows are node-local by default (`NegativePage`). Under `replicate` they live in `SharedNegativePage`,
+ * which replicates, so a 404 one node stored answers on every node and the origin is asked about a dead
+ * URL once per window for the cluster rather than once per node. The two tables are separate so the
+ * switch needs no migration: each mode reads only its own, and the other's rows age out.
+ *
  * ── WHAT IT MUST NEVER DO ────────────────────────────────────────────────────────────────────
  *
  * Answer for a URL that exists. So it only ever replaces an origin proxy on a TRUE miss (nothing in
  * `PrerenderedPage`, and the raw cache had nothing either); it never answers for a URL whose Target a
  * sitemap lists, checked on every read and not only at store time, because a sitemap listing is the
  * origin declaring the page exists and it outranks a stored 404; and it never answers a bot in
- * `excludeBots`. A wrong entry is corrected on the node that holds it — the rows are node-local — by the
- * proxied answer or the background re-check, so nothing ever has to reach across the cluster.
+ * `excludeBots`. A wrong entry is corrected by the proxied answer or the background re-check on the node
+ * that sees the page live. Node-local, that fixes that node; replicated, the drop replicates and fixes
+ * every node.
  *
  * Count honestly. A fresh answer is `bot_serve` source `negative`. An answer whose background re-check
  * went to the origin is source `origin`, cacheStatus `negative-revalidate`: the crawler did not wait,
@@ -43,7 +62,8 @@ import { config } from '../config.js';
 import { metrics } from '../metrics.js';
 import { Target } from '../resources/Target.js';
 import { materializeCachedBody } from './cachedBody.js';
-import { dateColumnMs } from './time.js';
+import { fnv1a32 } from './hash.js';
+import { DAY, dateColumnMs, getNextTimeOfDay } from './time.js';
 import { fetchOriginResource, releaseOriginBody } from './upstream.js';
 import {
 	collectBody,
@@ -54,7 +74,25 @@ import {
 	unsharedHint,
 } from './rawCache.js';
 
-const table = () => databases.negative_cache.NegativePage;
+// The table this policy's rows live in. A missing policy is the node-local default.
+const table = (policy) =>
+	policy?.replicate ? databases.negative_cache.SharedNegativePage : databases.negative_cache.NegativePage;
+
+const atMidnight = (policy) => policy?.expiry === 'midnight';
+
+/**
+ * The first `expiry: midnight` boundary after `fromMs`, or NaN when it cannot be resolved (an
+ * `expiryTimezone` that is not an IANA zone throws in `toLocaleString`). NaN fails closed everywhere it is
+ * compared: the row is expired, its body outlived, and a store refused — every request proxies. This runs on
+ * the request path, where a throw would turn a crawler's 404 into a 500. Config warns about the zone.
+ */
+const boundaryAfter = (policy, fromMs) => {
+	try {
+		return getNextTimeOfDay('00:00', policy.expiryTimezone, fromMs);
+	} catch {
+		return NaN;
+	}
+};
 
 /**
  * The route's negative-cache policy for this request, or null when nothing should happen. Both switches,
@@ -93,25 +131,58 @@ export const botMayReadNegative = (botName, policy) => {
 /**
  * Which window a stored row is in, for a request arriving at `nowMs`: 'fresh' | 'revalidate' | 'expired'.
  *
+ * Under `expiry: 'midnight'` there are two: 'fresh' until the first boundary after `checkedAt`, then
+ * 'expired'. Never 'revalidate', so nothing re-checks.
+ *
  * An unreadable `checkedAt`, or one in the future, is 'expired'. Fail closed: the cost is one proxied
  * request, and the alternative — a NaN age compares false against every bound — would be a row that
  * answers forever.
  */
 export const negativeFreshness = (row, policy, nowMs = Date.now()) => {
-	const age = nowMs - dateColumnMs(row?.checkedAt);
+	const checkedAtMs = dateColumnMs(row?.checkedAt);
+	const age = nowMs - checkedAtMs;
 	if (!(age >= 0)) return 'expired';
+	if (atMidnight(policy)) return nowMs < boundaryAfter(policy, checkedAtMs) ? 'fresh' : 'expired';
 	if (age < policy.freshMs) return 'fresh';
 	if (age < policy.lifeMs) return 'revalidate';
 	return 'expired';
 };
 
 /**
- * Have the stored BYTES outlived `lifeMs`? Then the next check that asks the origin replaces them rather
- * than confirming them. An unreadable `storedAt` counts as outlived, for the reason `negativeFreshness`
- * fails closed: the cost is one body rewrite.
+ * Have the stored BYTES outlived `lifeMs` (under `expiry: 'midnight'`, a boundary)? Then the next check that
+ * asks the origin replaces them rather than confirming them. An unreadable `storedAt` counts as outlived,
+ * for the reason `negativeFreshness` fails closed: the cost is one body rewrite.
  */
-export const negativeBodyExpired = (row, policy, nowMs = Date.now()) =>
-	!(nowMs - dateColumnMs(row?.storedAt) < policy.lifeMs);
+export const negativeBodyExpired = (row, policy, nowMs = Date.now()) => {
+	const storedAtMs = dateColumnMs(row?.storedAt);
+	if (atMidnight(policy)) return !(Number.isFinite(storedAtMs) && nowMs < boundaryAfter(policy, storedAtMs));
+	return !(nowMs - storedAtMs < policy.lifeMs);
+};
+
+/**
+ * How far past its boundary a midnight row is kept on disk: a per-key offset in [0, 1 day).
+ *
+ * WHY NOT DELETE AT THE BOUNDARY. Every row stored on one day shares one boundary, so stamping it as the
+ * record's expiry hands Harper's reclaim a whole day of rows (each with a blob) to delete in one pass just
+ * after midnight. On the deployment this was built for that is ~270k rows per node, and write and eviction
+ * bursts are where its nodes' memory ratchets up. Spread over a day, each reclaim pass (every quarter of the
+ * table expiration) takes about a quarter. Serving is unaffected: `negativeFreshness` stops answering at the
+ * boundary whatever this says. The cost is disk: a row is held up to a day longer.
+ */
+export const reclaimSpreadMs = (key) => fnv1a32(key) % DAY;
+
+/**
+ * The record's `@expiresAt` — when Harper hides and reclaims it — for a row the origin confirmed at `nowMs`.
+ * Interval: `lifeMs` past the confirmation. Midnight: the boundary plus `reclaimSpreadMs(key)`.
+ */
+export const negativeExpiresAt = (key, policy, nowMs = Date.now()) => {
+	if (!atMidnight(policy)) return nowMs + policy.lifeMs;
+	const boundary = boundaryAfter(policy, nowMs);
+	// Thrown, not stamped: the store's catch counts it as `write-failed`, where an Invalid Date would be a row
+	// with no usable expiry.
+	if (!Number.isFinite(boundary)) throw new Error(`expiryTimezone ${policy.expiryTimezone} does not resolve`);
+	return boundary + reclaimSpreadMs(key);
+};
 
 /**
  * A stored row for this key, or null when there is none, it has expired, or it is not a whole answer.
@@ -120,10 +191,10 @@ export const negativeBodyExpired = (row, policy, nowMs = Date.now()) =>
  * leave a row carrying only its timestamps. Answering that would hand a crawler a response with no
  * status; reading it as absent just proxies.
  */
-export const readNegativePage = async (key) => {
+export const readNegativePage = async (key, policy) => {
 	let row;
 	try {
-		row = await table().get(key);
+		row = await table(policy).get(key);
 	} catch (e) {
 		// A read failure is a miss, and a miss proxies. Never a 500 for a crawler over an optimisation.
 		logger.warn?.(`[prerender] negative-cache entry unreadable for ${key}: ${e?.message ?? String(e)}`);
@@ -177,13 +248,13 @@ export const storeNegativePage = async ({ key, resource, bytes, policy, nowMs = 
 		// An uncompressed 404 is gzipped before it is stored (see `storableBody`): the origin this was
 		// built for sends every 404 uncompressed, 79-699 KB, while its 200s arrive gzipped.
 		const stored = await storableBody(resource.headers, bytes);
-		await table().put(key, {
+		await table(policy).put(key, {
 			statusCode: resource.statusCode,
 			headers: JSON.stringify(stored.headers),
 			content: createBlob(stored.bytes),
 			storedAt: new Date(nowMs),
 			checkedAt: new Date(nowMs),
-			expiresAt: new Date(nowMs + policy.lifeMs),
+			expiresAt: new Date(negativeExpiresAt(key, policy, nowMs)),
 		});
 		metrics.negativeCache(unsharedHint(resource) ? 'stored-unshared' : 'stored');
 	} catch (e) {
@@ -199,7 +270,10 @@ export const storeNegativePage = async ({ key, resource, bytes, policy, nowMs = 
  */
 export const confirmNegativePage = async (key, policy, nowMs = Date.now()) => {
 	try {
-		await table().patch(key, { checkedAt: new Date(nowMs), expiresAt: new Date(nowMs + policy.lifeMs) });
+		await table(policy).patch(key, {
+			checkedAt: new Date(nowMs),
+			expiresAt: new Date(negativeExpiresAt(key, policy, nowMs)),
+		});
 	} catch (e) {
 		metrics.negativeCache('write-failed');
 		logger.warn?.(`[prerender] negative-cache entry not refreshed for ${key}: ${e?.message ?? String(e)}`);
@@ -207,9 +281,9 @@ export const confirmNegativePage = async (key, policy, nowMs = Date.now()) => {
 };
 
 /** The stored answer is wrong or unwanted. Best-effort: a row that survives is corrected by its next read. */
-export const dropNegativePage = async (key) => {
+export const dropNegativePage = async (key, policy) => {
 	try {
-		await table().delete(key);
+		await table(policy).delete(key);
 	} catch (e) {
 		logger.warn?.(`[prerender] negative-cache entry not dropped for ${key}: ${e?.message ?? String(e)}`);
 	}
@@ -333,7 +407,7 @@ export const settleNegativeRecheck = async ({
 		return 'gone';
 	}
 	if (statusCode >= 200 && statusCode < 300) {
-		await dropNegativePage(key);
+		await dropNegativePage(key, policy);
 		metrics.negativeCache('recheck-live');
 		// Served as a 404 since its last confirmation, at most: the request that asked for this re-check got it.
 		if (Number.isFinite(confirmedAtMs)) metrics.servedWrong(nowMs - confirmedAtMs, 'negative-recheck', '404');
@@ -347,7 +421,7 @@ export const settleNegativeRecheck = async ({
 		return 'live';
 	}
 	if (statusCode >= 300 && statusCode < 400) {
-		await dropNegativePage(key);
+		await dropNegativePage(key, policy);
 		metrics.negativeCache('recheck-moved');
 		return 'moved';
 	}
@@ -370,13 +444,13 @@ export const refreshNegativeBody = async ({ key, resource, policy, nowMs = Date.
 	if (refusal || typeof resource.content?.getReader !== 'function') {
 		releaseOriginBody(resource);
 		metrics.negativeCache(refusal ?? 'no-body');
-		await dropNegativePage(key);
+		await dropNegativePage(key, policy);
 		return 'dropped';
 	}
 	const result = await collectBody(resource.content, policy.maxBytes);
 	if (!result.bytes?.length) {
 		metrics.negativeCache(result.bytes ? 'empty' : result.outcome);
-		await dropNegativePage(key);
+		await dropNegativePage(key, policy);
 		return 'dropped';
 	}
 	await storeNegativePage({ key, resource, bytes: result.bytes, policy, nowMs });
@@ -470,7 +544,7 @@ export const answerFromNegativeCache = async ({
 	guard = targetGuard,
 	nowMs = Date.now(),
 }) => {
-	const row = await readNegativePage(key);
+	const row = await readNegativePage(key, policy);
 	if (!row) return { row: null, verdict: null };
 
 	const checkedAtMs = dateColumnMs(row.checkedAt);
@@ -506,7 +580,7 @@ export const answerFromNegativeCache = async ({
 	// before deciding whether to capture: this request's verdict is already in hand.
 	if (guarded) {
 		metrics.negativeCache(`guarded-${guarded}`);
-		void dropNegativePage(key);
+		void dropNegativePage(key, policy);
 		return { row: null, verdict: null, guarded };
 	}
 
@@ -600,9 +674,16 @@ export const afterNegativeProxy = (
 			// An ARMED cache was answering other crawlers with this 404 until now (a dry run answered nobody).
 			if (!policy.dryRun && status === 200) {
 				const confirmedAtMs = dateColumnMs(row.checkedAt);
-				if (Number.isFinite(confirmedAtMs)) metrics.servedWrong(nowMs - confirmedAtMs, 'negative-fetch', '404');
+				// Unless its window had already ended: then it had stopped answering, and whether any crawler was
+				// handed it after the page came back cannot be known, so it is counted and never timed. Read off
+				// the row's own clock, not the lookup's verdict, which also says 'expired' for a row refused by an
+				// invalidation or an unreadable body while it was still answering. Under `expiry: 'midnight'`, with
+				// nothing re-checked, this is how a page that came back during the day is found: by the first
+				// request after the boundary, while the row waits out its reclaim spread.
+				if (negativeFreshness(row, policy, nowMs) === 'expired') metrics.negativeCache('expired-live');
+				else if (Number.isFinite(confirmedAtMs)) metrics.servedWrong(nowMs - confirmedAtMs, 'negative-fetch', '404');
 			}
-			void dropNegativePage(key);
+			void dropNegativePage(key, policy);
 		}
 	}
 	return resource;

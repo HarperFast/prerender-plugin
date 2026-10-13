@@ -775,7 +775,10 @@ export const METRICS = Object.freeze({
 			'guarded-listed / guarded-target are stored 404s a Target overruled (the entry is dropped), bot-excluded ' +
 			'are requests from render.negative.excludeBots that found one. The re-checks are the recovery signal: ' +
 			'recheck-live counts stored 404s the origin now answers 200 for — each one dropped and its gone target ' +
-			'reopened — and recheck-busy is the per-worker cap shedding checks. IN A DRY RUN, would-serve is exactly ' +
+			'reopened — and recheck-busy is the per-worker cap shedding checks. Under render.negative.expiry midnight ' +
+			'nothing is re-checked, so the recovery signal is expired-live instead: a stored 404 whose window had ' +
+			'ended, found live by the next request (counted, never timed: it may have come back after it stopped ' +
+			'answering). IN A DRY RUN, would-serve is exactly ' +
 			'the origin requests arming would save, and would-serve-live is the risk: requests an armed cache would ' +
 			'have answered with a 404 while the origin, asked anyway, answered 200. Expect it near zero before arming. ' +
 			'negative_gap = milliseconds since the origin last confirmed a stored 404, sampled on every request that ' +
@@ -953,7 +956,8 @@ export const METRICS = Object.freeze({
 					'staging, no-body, empty, oversize, capture-failed, capture-busy, write-failed, skipped-listed, ' +
 					'skipped-target); a guard on read (guarded-listed, guarded-target, guard-error, invalidated, ' +
 					'bot-excluded, read-blob-failed); a background re-check (recheck-gone, recheck-live, recheck-moved, ' +
-					'recheck-error, recheck-busy, recheck-joined); or a dry-run verdict (would-serve, would-revalidate, ' +
+					'recheck-error, recheck-busy, recheck-joined); a row past its window found live by a proxied request ' +
+					'(expired-live); or a dry-run verdict (would-serve, would-revalidate, ' +
 					'would-serve-live). gone_reopen: the outcome (filed, would-file, deduped, capped, error). ' +
 					'suppression_lifted and suppression_held: the suppressedReason the render lifted or re-proved ' +
 					'(http-gone, noindex, canonical-mismatch, ...). due_now_forward: the outcome (forwarded, ' +

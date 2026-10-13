@@ -24,6 +24,7 @@ let nc;
 let config;
 let applyOptions;
 const rows = new Map();
+const sharedRows = new Map(); // SharedNegativePage, under render.negative.replicate
 const ops = [];
 const writes = [];
 const targets = new Map();
@@ -81,6 +82,23 @@ before(async () => {
 					rows.delete(id);
 				},
 			},
+			SharedNegativePage: {
+				async get(id) {
+					return sharedRows.has(id) ? { ...sharedRows.get(id) } : null;
+				},
+				async put(id, data) {
+					writes.push(['shared:put', id]);
+					sharedRows.set(id, { cacheKey: id, ...data });
+				},
+				async patch(id, data) {
+					writes.push(['shared:patch', id]);
+					sharedRows.set(id, { ...(sharedRows.get(id) ?? {}), ...data });
+				},
+				async delete(id) {
+					writes.push(['shared:delete', id]);
+					sharedRows.delete(id);
+				},
+			},
 		},
 	};
 	({ config, applyOptions } = await import('../src/config.js'));
@@ -89,6 +107,7 @@ before(async () => {
 
 beforeEach(() => {
 	rows.clear();
+	sharedRows.clear();
 	ops.length = 0;
 	writes.length = 0;
 	targets.clear();
@@ -972,4 +991,171 @@ test('a stored 404 found live is reported SERVED WRONG since its last confirmati
 		nowMs: NOW,
 	});
 	assert.deepEqual(wrongOps(), []);
+});
+
+// ── expiry: midnight ─────────────────────────────────────────────────────────────────────────
+
+// NOW is 2026-09-29 07:00 CDT; the first Chicago midnight after it is 2026-09-30 05:00Z.
+const MIDNIGHT_CT = Date.UTC(2026, 8, 30, 5);
+const midnight = (over = {}) => policy({ expiry: 'midnight', expiryTimezone: 'America/Chicago', ...over });
+
+test('midnight: fresh until the first boundary after the last confirmation, then expired — never revalidate', () => {
+	const p = midnight({ freshMs: HOUR, lifeMs: 2 * HOUR });
+	const at = (checkedAtMs, nowMs) => nc.negativeFreshness({ checkedAt: new Date(checkedAtMs) }, p, nowMs);
+	assert.equal(at(NOW - 6 * HOUR, NOW), 'fresh', 'confirmed 01:00, asked 07:00: same day, past freshMs AND lifeMs');
+	assert.equal(at(NOW, MIDNIGHT_CT - 1), 'fresh', 'up to the boundary');
+	assert.equal(at(NOW, MIDNIGHT_CT), 'expired', 'not at it');
+	assert.equal(
+		at(MIDNIGHT_CT - 60_000, MIDNIGHT_CT + 60_000),
+		'expired',
+		'a 23:59 confirmation does not carry past 00:00'
+	);
+	assert.equal(at(NOW - 8 * HOUR, NOW), 'expired', 'confirmed 23:00 the day before');
+	for (const checkedAt of [null, 'garbage', new Date(NOW + 60_000)]) {
+		assert.equal(nc.negativeFreshness({ checkedAt }, p, NOW), 'expired', String(checkedAt));
+	}
+});
+
+test('midnight: a body stored before the last boundary is outlived; one stored since is not', () => {
+	const p = midnight();
+	assert.equal(nc.negativeBodyExpired({ storedAt: new Date(NOW - 6 * HOUR) }, p, NOW), false);
+	assert.equal(nc.negativeBodyExpired({ storedAt: new Date(NOW - 8 * HOUR) }, p, NOW), true);
+	assert.equal(nc.negativeBodyExpired({ storedAt: null }, p, NOW), true, 'unreadable counts as outlived');
+});
+
+test('midnight: the record expires a per-key spread of up to a day past the boundary, so reclaim is not one wave', () => {
+	const p = midnight();
+	const at = nc.negativeExpiresAt(KEY_A, p, NOW);
+	assert.equal(at, MIDNIGHT_CT + nc.reclaimSpreadMs(KEY_A), 'deterministic per key');
+	assert.ok(at >= MIDNIGHT_CT && at < MIDNIGHT_CT + 24 * HOUR);
+	// A reclaim pass runs every 6h (a quarter of the 24h table expiration): keys must land in all four.
+	const passes = new Set(
+		Array.from({ length: 200 }, (_, i) => Math.floor(nc.reclaimSpreadMs(`${URL_A}?v=${i}`) / (6 * HOUR)))
+	);
+	assert.equal(passes.size, 4);
+	assert.equal(nc.negativeExpiresAt(KEY_A, policy({ lifeMs: 6 * HOUR }), NOW), NOW + 6 * HOUR, 'interval: the life');
+});
+
+test('midnight: a captured 404 is stored with the spread expiry, and a confirm keeps it', async () => {
+	const p = midnight();
+	const out = await nc.captureForNegativeCache(origin404(), { key: KEY_A, cacheUrl: URL_A, policy: p });
+	assert.equal(await drain(out.content), 'ITEM-GONE-1');
+	await settle();
+	const row = rows.get(KEY_A);
+	assert.equal(row.expiresAt.getTime(), nc.negativeExpiresAt(KEY_A, p, row.checkedAt.getTime()));
+	await nc.confirmNegativePage(KEY_A, p, NOW);
+	assert.equal(rows.get(KEY_A).expiresAt.getTime(), MIDNIGHT_CT + nc.reclaimSpreadMs(KEY_A));
+});
+
+test('midnight: a row confirmed earlier today answers hours past freshMs, nothing re-checks, and yesterday’s proxies', async () => {
+	rows.set(KEY_A, storedRow({ checkedAt: new Date(NOW - 5 * HOUR), storedAt: new Date(NOW - 5 * HOUR) }));
+	const got = await answer({ policy: midnight({ freshMs: HOUR }) });
+	assert.equal(got.answered, true);
+	assert.equal(got.cacheStatus, 'negative');
+	assert.equal(got.source, 'negative');
+
+	rows.set(KEY_A, storedRow({ checkedAt: new Date(NOW - 8 * HOUR) }));
+	const late = await answer({ policy: midnight() });
+	assert.equal(late.answered, undefined, 'proxied, so the 404 stores afresh');
+	assert.equal(late.verdict, 'expired');
+});
+
+test('midnight in a zone that does not resolve fails closed: nothing answers, nothing stores, nothing throws', async () => {
+	const p = midnight({ expiryTimezone: 'Not/AZone' });
+	assert.equal(nc.negativeFreshness({ checkedAt: new Date(NOW - HOUR) }, p, NOW), 'expired');
+	assert.equal(nc.negativeBodyExpired({ storedAt: new Date(NOW - HOUR) }, p, NOW), true);
+	const out = await nc.captureForNegativeCache(origin404(), { key: KEY_A, cacheUrl: URL_A, policy: p });
+	assert.equal(await drain(out.content), 'ITEM-GONE-1', 'the crawler still gets its 404');
+	await settle();
+	assert.equal(rows.has(KEY_A), false);
+	assert.deepEqual(opsOf('negative_cache'), ['write-failed']);
+});
+
+// ── replicate ────────────────────────────────────────────────────────────────────────────────
+
+test('replicate: every read and write goes to SharedNegativePage, and node-local rows are neither read nor touched', async () => {
+	const p = policy({ replicate: true });
+	rows.set(KEY_A, storedRow());
+	assert.equal(await nc.readNegativePage(KEY_A, p), null, 'a node-local row is not an answer under replicate');
+	const out = await nc.captureForNegativeCache(origin404(), { key: KEY_A, cacheUrl: URL_A, policy: p });
+	await drain(out.content);
+	await settle();
+	assert.equal((await nc.readNegativePage(KEY_A, p)).statusCode, 404);
+	await nc.confirmNegativePage(KEY_A, p, NOW);
+	await nc.dropNegativePage(KEY_A, p);
+	assert.deepEqual(writes, [
+		['shared:put', KEY_A],
+		['shared:patch', KEY_A],
+		['shared:delete', KEY_A],
+	]);
+	assert.ok(rows.has(KEY_A), 'the node-local row is untouched');
+});
+
+test('replicate: a proxied 200 drops the SHARED entry, which is what clears it on every node', async () => {
+	const p = policy({ replicate: true });
+	sharedRows.set(KEY_A, storedRow());
+	const lookup = await answer({ policy: p, botName: 'Googlebot', recheck: () => true });
+	assert.equal(lookup.answered, true);
+	nc.afterNegativeProxy(origin404({ statusCode: 200 }), {
+		key: KEY_A,
+		cacheUrl: URL_A,
+		policy: p,
+		lookup: { row: sharedRows.get(KEY_A), verdict: 'fresh', excluded: true },
+		nowMs: NOW,
+	});
+	await settle();
+	assert.equal(sharedRows.has(KEY_A), false);
+	assert.deepEqual(writes, [['shared:delete', KEY_A]]);
+});
+
+test('SharedNegativePage replicates, carries exactly NegativePage’s fields, expires by its own field, and has no REST', () => {
+	const schema = fs.readFileSync(fileURLToPath(new URL('../src/schemas/schema.graphql', import.meta.url)), 'utf8');
+	const shared = schema.match(/type SharedNegativePage @table\(([^)]*)\)[^{]*\{([^}]*)\}/);
+	const local = schema.match(/type NegativePage @table\(([^)]*)\)[^{]*\{([^}]*)\}/);
+	assert.ok(shared, 'SharedNegativePage is declared');
+	assert.match(shared[1], /database: "negative_cache"/);
+	assert.doesNotMatch(shared[1], /replicate: false/, 'one copy for the cluster');
+	assert.doesNotMatch(shared[0], /@export/, 'no REST write verb may put a 404 under a cache key');
+	const fields = (body) =>
+		body
+			.split('\n')
+			.map((line) => line.trim())
+			.filter((line) => line && !line.startsWith('#'));
+	assert.deepEqual(fields(shared[2]), fields(local[2]), 'same rows in either table');
+	assert.ok(fields(shared[2]).includes('expiresAt: Date @expiresAt'));
+});
+
+test('a row found live after its window ended is counted expired-live, never timed as served wrong', async () => {
+	// Midnight: confirmed yesterday 23:00 CDT, its boundary passed; the next request proxies and gets a 200.
+	const p = midnight();
+	const row = storedRow({ checkedAt: new Date(NOW - 8 * HOUR) });
+	rows.set(KEY_A, row);
+	nc.afterNegativeProxy(origin404({ statusCode: 200 }), {
+		key: KEY_A,
+		cacheUrl: URL_A,
+		policy: p,
+		lookup: { row, verdict: 'expired' },
+		nowMs: NOW,
+	});
+	await settle();
+	assert.deepEqual(opsOf('negative_cache'), ['expired-live']);
+	assert.equal(wrongOps().length, 0, 'no duration: it may have come back after it stopped answering');
+	assert.equal(rows.has(KEY_A), false, 'still dropped');
+
+	// A row refused by an invalidation was still answering by its own clock: timed as before.
+	ops.length = 0;
+	const answering = storedRow({ checkedAt: new Date(NOW - 2 * HOUR) });
+	rows.set(KEY_A, answering);
+	nc.afterNegativeProxy(origin404({ statusCode: 200 }), {
+		key: KEY_A,
+		cacheUrl: URL_A,
+		policy: p,
+		lookup: { row: answering, verdict: 'expired' },
+		nowMs: NOW,
+	});
+	await settle();
+	assert.deepEqual(opsOf('negative_cache'), []);
+	assert.equal(wrongOps().length, 1);
+	assert.equal(wrongOps()[0].method, 'negative-fetch');
+	assert.equal(wrongOps()[0].value, 2 * HOUR);
 });

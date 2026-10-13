@@ -27,6 +27,15 @@ test('getNextTimeOfDay returns a future, minute-aligned timestamp', () => {
 	assert.ok(next - Date.now() <= 25 * 60 * MINUTE);
 });
 
+test('getNextTimeOfDay counts from an explicit now, across a DST change', () => {
+	// 2026-03-07 12:00 CST (UTC-6); the next local midnight, 03-08 00:00, is still CST.
+	assert.equal(getNextTimeOfDay('00:00', 'America/Chicago', Date.UTC(2026, 2, 7, 18)), Date.UTC(2026, 2, 8, 6));
+	// 2026-03-08 12:00 CDT (UTC-5, DST began at 02:00); the next midnight is 03-09 00:00 CDT.
+	assert.equal(getNextTimeOfDay('00:00', 'America/Chicago', Date.UTC(2026, 2, 8, 17)), Date.UTC(2026, 2, 9, 5));
+	// Exactly AT the boundary is not "after" it: the next one is a day on.
+	assert.equal(getNextTimeOfDay('00:00', 'UTC', Date.UTC(2026, 0, 1)), Date.UTC(2026, 0, 2));
+});
+
 test('getNextTimeOfDay tolerates a missing minute component', () => {
 	const next = getNextTimeOfDay('12', 'UTC');
 	assert.equal(next % MINUTE, 0);
