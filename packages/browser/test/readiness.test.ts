@@ -255,6 +255,24 @@ before(async () => {
 						</script>`
 					)
 				);
+			// Painted content the clip walk must NOT call hidden (escapes its zero-height ancestor; an
+			// ancestor with no box), and concealed content it must (clipped by its containing block; slotted
+			// into a clipping wrapper inside a shadow root). Plus three plainly shown items.
+			case '/shown-cases':
+				return res.end(
+					page(
+						`<p>x</p>
+						<div style="max-height:0;overflow:hidden"><div id="abs" style="position:absolute;top:0;width:50px;height:20px">a</div></div>
+						<div style="display:contents;overflow:hidden"><div id="contents" style="height:20px">b</div></div>
+						<div style="position:relative;max-height:0;overflow:hidden"><div id="abs-clipped" style="position:absolute;top:0;width:50px;height:20px">c</div></div>
+						<div id="host"><span id="slotted">d</span></div>
+						<div class="many">1</div><div class="many">2</div><div class="many">3</div>`,
+						`<script>document.addEventListener('DOMContentLoaded', () => {
+							document.getElementById('host').attachShadow({ mode: 'open' }).innerHTML =
+								'<div style="max-height:0;overflow:hidden"><slot></slot></div>';
+						});</script>`
+					)
+				);
 			default:
 				return res.end(page('<p>ok</p>'));
 		}
@@ -1073,4 +1091,25 @@ test('visible and onlyIf.after are validated at config load', async () => {
 		() => validateReadiness(cfg({ name: 'g', selector: '#x', onlyIf: { present: '#s', after: '' } })),
 		/after must be a non-empty selector/
 	);
+});
+
+test('visible judges what is painted: escaping and boxless ancestors do not clip, a containing block and a slot do', async () => {
+	const result = await render('/shown-cases', {
+		name: 'shown',
+		require: [{ name: 'p', selector: 'p' }],
+		observe: [
+			{ name: 'abs', visible: '#abs' },
+			{ name: 'contents', visible: '#contents' },
+			{ name: 'abs-clipped', visible: '#abs-clipped' },
+			{ name: 'slotted', visible: '#slotted' },
+			{ name: 'many', visible: '.many' },
+		],
+		timeoutMs: 5000,
+	});
+	const count = (name: string) => result.job.readiness?.observe.find((o) => o.name === name)?.count;
+	assert.equal(count('abs'), 1, 'positioned content escapes a non-positioned clipping ancestor');
+	assert.equal(count('contents'), 1, 'an ancestor with no box cannot clip');
+	assert.equal(count('abs-clipped'), 0, 'its containing block does clip it');
+	assert.equal(count('slotted'), 0, 'slotted into a clipping wrapper is clipped (flat tree)');
+	assert.equal(count('many'), 3, 'an observation counts every shown match, uncapped');
 });

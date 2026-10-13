@@ -242,6 +242,11 @@ export type ReadinessGuard =
 			 * slot is rendered with (the widget's own container) and the guard waits for the widget to
 			 * have spoken before taking its silence as "none here". `jsonLdNumber` has the same three-way
 			 * answer built in, from the page's structured data.
+			 *
+			 * The anchor must exist on EVERY page the contract governs. On a page that never renders it the
+			 * clause never holds: the render pays the rot valve and the fallback settle, and the drift
+			 * report calls the contract broken. And it must not arrive before the slot it vouches for, or the
+			 * race it closes stays open.
 			 */
 			after?: string;
 	  };
@@ -510,48 +515,69 @@ export function evaluateContract(payload: {
 	};
 
 	// Whether an element is actually painted: shown by `display`, `visibility` and `opacity` all the way
-	// up the flat tree (checkVisibility walks shadow hosts too), with a box, and not clipped to nothing
-	// by an `overflow` ancestor of zero size — which is how `max-height: 0` reveal animations hide. Keep
-	// in step with `countMatchingElements` in renderer.ts, which needs the same answer for `waitFor`.
+	// up the flat tree, with a box, and not clipped to nothing by an `overflow` ancestor of zero size —
+	// which is how `max-height: 0` reveal animations hide. Keep in step with `countMatchingElements` in
+	// renderer.ts, which needs the same answer for `waitFor`; both run in-page and self-contained.
 	const shown = (el: Element): boolean => {
+		// Flat-tree parent: a slotted node's is its slot, a shadow root's top-level node's is the host.
+		const up = (n: Element): Element | null =>
+			(n as Element & { assignedSlot?: Element | null }).assignedSlot ??
+			n.parentElement ??
+			((n.getRootNode() as ShadowRoot).host || null);
 		const check = (el as Element & { checkVisibility?: (o: Record<string, boolean>) => boolean }).checkVisibility;
-		// Both spellings: Chrome 121 renamed checkOpacity/checkVisibilityCSS, and an unknown key is ignored.
+		// The options are necessary: plain checkVisibility() reports an opacity-0 element as visible. Both
+		// spellings, because Chrome 121 renamed checkOpacity/checkVisibilityCSS; current Chrome honours both.
 		const opts = { opacityProperty: true, visibilityProperty: true, checkOpacity: true, checkVisibilityCSS: true };
 		if (typeof check === 'function') {
 			if (!check.call(el, opts)) return false;
 		} else {
-			for (let n: Element | null = el; n; n = n.parentElement ?? ((n.getRootNode() as ShadowRoot).host || null)) {
+			for (let n: Element | null = el; n; n = up(n)) {
 				const cs = getComputedStyle(n);
 				if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
 			}
 		}
 		const box = el.getBoundingClientRect();
 		if (box.width <= 0 || box.height <= 0) return false;
+		// Clipped to nothing by an `overflow` ancestor. Only an ancestor that actually clips this element
+		// counts: one with no box (`display: contents`) cannot, and an absolutely or fixed positioned
+		// element escapes every ancestor below its containing block — judging those clipped would make a
+		// clause anchored on painted content never hold.
+		const contains = (cs: CSSStyleDeclaration, fixed: boolean): boolean =>
+			(!fixed && cs.position !== 'static') ||
+			cs.transform !== 'none' ||
+			cs.filter !== 'none' ||
+			cs.perspective !== 'none' ||
+			/paint|layout|strict|content/.test(cs.contain);
+		let escaping = getComputedStyle(el).position;
 		let depth = 0;
-		for (
-			let n: Element | null = el.parentElement ?? ((el.getRootNode() as ShadowRoot).host || null);
-			n && depth < 64;
-			n = n.parentElement ?? ((n.getRootNode() as ShadowRoot).host || null), depth++
-		) {
+		for (let n = up(el); n && depth < 64; n = up(n), depth++) {
 			const cs = getComputedStyle(n);
-			if (cs.overflowX === 'visible' && cs.overflowY === 'visible') continue;
-			const clip = n.getBoundingClientRect();
-			if ((cs.overflowX !== 'visible' && clip.width <= 0) || (cs.overflowY !== 'visible' && clip.height <= 0)) {
-				return false;
+			if (cs.display === 'contents') continue;
+			if (escaping === 'absolute' || escaping === 'fixed') {
+				if (!contains(cs, escaping === 'fixed')) continue;
+				escaping = 'static';
 			}
+			if (cs.overflowX !== 'visible' || cs.overflowY !== 'visible') {
+				const clip = n.getBoundingClientRect();
+				if ((cs.overflowX !== 'visible' && clip.width <= 0) || (cs.overflowY !== 'visible' && clip.height <= 0)) {
+					return false;
+				}
+			}
+			if (cs.position === 'absolute' || cs.position === 'fixed') escaping = cs.position;
 		}
 		return true;
 	};
 
-	// Shown matches of `selector`, stopping once `enough` are found: the layout reads are the cost here,
-	// and a clause needs only to know it has its minimum.
+	// Shown matches of `selector`. A required clause stops once it has `enough` (the layout reads are the
+	// cost, and it needs only its minimum), so its count is capped there; an observation counts them all,
+	// because its count is what a URL's history is compared against.
 	const countShown = (selector: string, enough: number): number => {
 		let n = 0;
 		for (const root of roots) {
 			try {
 				for (const el of root.querySelectorAll(selector)) {
 					if (shown(el)) n++;
-					if (n >= enough) return n;
+					if (enough > 0 && n >= enough) return n;
 				}
 			} catch {
 				return -1;
@@ -621,7 +647,7 @@ export function evaluateContract(payload: {
 		return null;
 	};
 
-	const run = (assertion: ReadinessAssertion): AssertionResult => {
+	const run = (assertion: ReadinessAssertion, required: boolean): AssertionResult => {
 		const a = assertion as unknown as Record<string, unknown>;
 		const guard = a.onlyIf as { jsonLdNumber?: string; present?: string; atLeast?: number; after?: string } | undefined;
 		if (guard && typeof guard.present === 'string') {
@@ -658,7 +684,7 @@ export function evaluateContract(payload: {
 		if (typeof a.visible === 'string') {
 			// At least one, whatever minCount says: "zero shown" is never evidence that something is shown.
 			const need = Math.max((a.minCount as number) ?? 1, 1);
-			const n = countShown(a.visible as string, need);
+			const n = countShown(a.visible as string, required ? need : 0);
 			return { name: assertion.name, ok: n >= need, count: Math.max(n, 0) };
 		}
 		if (Array.isArray(a.anyOf)) {
@@ -749,7 +775,13 @@ export function evaluateContract(payload: {
 	// Before that, "nothing is happening" is the wrong reading of a quiet page — see the rot valve.
 	const loaded = document.readyState === 'complete';
 
-	return { require: payload.require.map(run), observe: payload.observe.map(run), quietMs: quiet, started, loaded };
+	return {
+		require: payload.require.map((a) => run(a, true)),
+		observe: payload.observe.map((a) => run(a, false)),
+		quietMs: quiet,
+		started,
+		loaded,
+	};
 }
 
 /**

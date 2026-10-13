@@ -565,6 +565,7 @@ export default class RenderWorker {
 			s.failures.other;
 
 		const mem = process.memoryUsage();
+		const readinessFailing = this.drift?.failing();
 
 		logger.info({
 			workerId: settings.harper.workerId || undefined,
@@ -602,7 +603,7 @@ export default class RenderWorker {
 			},
 			// Readiness clauses currently failing on most renders — the contract needs updating. Present only
 			// while something is failing; the transitions themselves are logged as warnings.
-			...(this.drift?.failing().length ? { readinessFailing: this.drift.failing() } : {}),
+			...(readinessFailing?.length ? { readinessFailing } : {}),
 			renderMs: summarize(s.renderTimes),
 			// Where the render time went: navTtfb/navTotal are origin/edge response time (network),
 			// settle/postProcess are in-browser work (CPU). Isolates a slow upstream from render cost.
@@ -1052,7 +1053,14 @@ export default class RenderWorker {
 				else this.stats.emptyContent++;
 			}
 		}
-		if (!error && content) this.noteReadiness(job);
+		// Never allowed to fail a render, or to skip the page cleanup below.
+		if (!error && content) {
+			try {
+				this.noteReadiness(job);
+			} catch (e) {
+				logger.warn({ err: e }, 'readiness drift tracking failed');
+			}
+		}
 
 		try {
 			if (page) await browser.closePage(page);

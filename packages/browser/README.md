@@ -523,7 +523,8 @@ should exist and the rendered DOM is held to it.
 A `present` guard answers only "is the element there now?", which cannot tell "this page has none"
 from "not rendered yet". For a slot that a widget mounts late, add `after`: until an element matching
 it exists the clause is not yet satisfied, and only then does a missing slot mean "none here". Name
-the element the slot is rendered with (the widget's own container), not one that arrives earlier.
+the element the slot is rendered with (the widget's own container), not one that arrives earlier,
+and one that every page the contract governs renders: on a page without it the clause never holds.
 
 When the page's data cannot say it but the widget does — a rating count that includes ratings with
 no review text, so there is nothing to list — give the `anyOf` branch for that state a
@@ -563,7 +564,7 @@ not the resource-timing buffer, which such a page overflows.
   on a live product template, a redesign removed the element one clause named and that clause failed
   on 235,993 of 235,995 renders over a day, every one paying the fallback settle, before anyone
   noticed. Each worker therefore tracks, per clause, its last `drift.window` renders that produced a
-  page (a 200, indexable, with content), counting a clause failed when it does not hold on the page
+  page (a 200, indexable, with content; each device variant counts once), counting a clause failed when it does not hold on the page
   as serialized and not at all when its guard skipped it. Once a clause has failed on at least
   `drift.threshold` of at least `drift.minSamples` of them, the worker logs a warning,
   `event: "readiness-clause-failing"`, naming the contract and clause, the share, how the failing

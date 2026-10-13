@@ -707,7 +707,12 @@ const renderer: Renderer = async (page, job) => {
 				}
 				let count: number;
 				try {
-					count = await page.evaluate(countMatchingElements, contentSelector, rule.visible === true);
+					count = await page.evaluate(
+						countMatchingElements,
+						contentSelector,
+						rule.visible === true,
+						rule.visible === true ? minCount : 0
+					);
 				} catch {
 					// page closed / navigated — stop instead of looping to the deadline, but keep the
 					// partial telemetry rather than dropping the whole run's attribution.
@@ -1301,34 +1306,54 @@ function scrollSelectorIntoView(selector: string): boolean {
 // `visible`: count only matches that are actually shown. Same test as the readiness `visible` clause
 // (`shown` in readiness.ts's evaluateContract) — keep the two in step; both run in-page and
 // self-contained, so they cannot share a helper.
-function countMatchingElements(selector: string, visible = false): number {
-	const parentOf = (el: Element): Element | null => el.parentElement ?? ((el.getRootNode() as ShadowRoot).host || null);
+function countMatchingElements(selector: string, visible = false, enough = 0): number {
+	const up = (n: Element): Element | null =>
+		(n as Element & { assignedSlot?: Element | null }).assignedSlot ??
+		n.parentElement ??
+		((n.getRootNode() as ShadowRoot).host || null);
 	const shown = (el: Element): boolean => {
 		const check = (el as Element & { checkVisibility?: (o: Record<string, boolean>) => boolean }).checkVisibility;
 		const opts = { opacityProperty: true, visibilityProperty: true, checkOpacity: true, checkVisibilityCSS: true };
 		if (typeof check === 'function') {
 			if (!check.call(el, opts)) return false;
 		} else {
-			for (let n: Element | null = el; n; n = parentOf(n)) {
+			for (let n: Element | null = el; n; n = up(n)) {
 				const cs = getComputedStyle(n);
 				if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
 			}
 		}
 		const box = el.getBoundingClientRect();
 		if (box.width <= 0 || box.height <= 0) return false;
+		const contains = (cs: CSSStyleDeclaration, fixed: boolean): boolean =>
+			(!fixed && cs.position !== 'static') ||
+			cs.transform !== 'none' ||
+			cs.filter !== 'none' ||
+			cs.perspective !== 'none' ||
+			/paint|layout|strict|content/.test(cs.contain);
+		let escaping = getComputedStyle(el).position;
 		let depth = 0;
-		for (let n = parentOf(el); n && depth < 64; n = parentOf(n), depth++) {
+		for (let n = up(el); n && depth < 64; n = up(n), depth++) {
 			const cs = getComputedStyle(n);
-			if (cs.overflowX === 'visible' && cs.overflowY === 'visible') continue;
-			const clip = n.getBoundingClientRect();
-			if ((cs.overflowX !== 'visible' && clip.width <= 0) || (cs.overflowY !== 'visible' && clip.height <= 0)) {
-				return false;
+			if (cs.display === 'contents') continue;
+			if (escaping === 'absolute' || escaping === 'fixed') {
+				if (!contains(cs, escaping === 'fixed')) continue;
+				escaping = 'static';
 			}
+			if (cs.overflowX !== 'visible' || cs.overflowY !== 'visible') {
+				const clip = n.getBoundingClientRect();
+				if ((cs.overflowX !== 'visible' && clip.width <= 0) || (cs.overflowY !== 'visible' && clip.height <= 0)) {
+					return false;
+				}
+			}
+			if (cs.position === 'absolute' || cs.position === 'fixed') escaping = cs.position;
 		}
 		return true;
 	};
 	let n = 0;
+	// `enough` (> 0) stops the walk once that many have matched: with `visible` each match costs style
+	// and layout reads, and the gate needs only its minimum.
 	const walk = (node: Node) => {
+		if (enough > 0 && n >= enough) return;
 		if (node.nodeType === 1) {
 			const el = node as Element;
 			if (el.matches(selector) && (!visible || shown(el))) n++;
