@@ -1351,16 +1351,17 @@ function countMatchingElements(selector: string, visible = false, enough = 0): n
 	};
 	let n = 0;
 	// `enough` (> 0) stops the walk once that many have matched: with `visible` each match costs style
-	// and layout reads, and the gate needs only its minimum.
+	// and layout reads, and the gate needs only its minimum. Checked in the sibling loop too, so the
+	// rest of the tree is not visited at all — not merely visited and returned from.
+	const done = () => enough > 0 && n >= enough;
 	const walk = (node: Node) => {
-		if (enough > 0 && n >= enough) return;
 		if (node.nodeType === 1) {
 			const el = node as Element;
 			if (el.matches(selector) && (!visible || shown(el))) n++;
 			const sr = el.shadowRoot;
-			if (sr) walk(sr);
+			if (sr && !done()) walk(sr);
 		}
-		for (let child = node.firstChild; child; child = child.nextSibling) walk(child);
+		for (let child = node.firstChild; child && !done(); child = child.nextSibling) walk(child);
 	};
 	// A malformed/empty selector makes matches() throw a SyntaxError; return 0 so a bad rule just
 	// times out best-effort instead of throwing out of the wait loop and abandoning the remaining
