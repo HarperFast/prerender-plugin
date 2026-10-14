@@ -1,4 +1,6 @@
 import { XMLParser } from 'fast-xml-parser';
+import { gunzip } from 'node:zlib';
+import { promisify } from 'node:util';
 import { canonicalizeUrl } from './url.js';
 import { CacheKey, MAX_KEY_BYTES } from './cacheKey.js';
 import { classifyPath, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from './routeClass.js';
@@ -6,6 +8,50 @@ import { classifyPath, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from './routeClass
 const parser = new XMLParser({
 	isArray: (tagName) => tagName === 'sitemap' || tagName === 'url',
 });
+
+const gunzipAsync = promisify(gunzip);
+
+/**
+ * Ceiling on a decompressed sitemap. sitemaps.org caps a sitemap at 50 MB uncompressed; twice that
+ * leaves room for an origin that overshoots while still refusing a gzip bomb (a few KB that inflate
+ * to gigabytes) before it is held in memory.
+ */
+export const MAX_SITEMAP_DECOMPRESSED_BYTES = 100 * 1024 * 1024;
+
+/**
+ * Decode a fetched sitemap body to text, gunzipping it when it is a gzip FILE.
+ *
+ * `.xml.gz` is the sitemaps.org convention for large sitemaps, and an origin serves one as a file:
+ * `application/x-gzip` (or `application/octet-stream`) with NO `Content-Encoding`. undici decodes
+ * only a Content-Encoding, so the body reaches us still compressed, and parsing it as text failed
+ * every child of such an index with a parser error on binary. Transport-encoded bodies
+ * (`Content-Encoding: gzip`) are already decoded by undici and keep working unchanged.
+ *
+ * The decision is made on the gzip magic bytes (`1f 8b`), not the content-type or a `.gz` suffix:
+ * origins label these files inconsistently, a `.gz` URL can be served transport-decoded, and no
+ * XML document (UTF-8, or UTF-16 with a BOM) starts with those two bytes.
+ *
+ * Decompression is async (zlib's threadpool), so a multi-MB sitemap does not block the event loop,
+ * and bounded by `MAX_SITEMAP_DECOMPRESSED_BYTES`. A corrupt or truncated gzip file throws, and so
+ * fails the child loudly instead of parsing a prefix. Text is decoded with TextDecoder, which strips
+ * a UTF-8 BOM exactly as `Response.text()` does.
+ *
+ * @param {Uint8Array} bytes the raw response body
+ * @param {{ maxBytes?: number }} [options] decompressed-size ceiling (tests lower it)
+ * @returns {Promise<string>}
+ */
+export async function decodeSitemapBody(bytes, { maxBytes = MAX_SITEMAP_DECOMPRESSED_BYTES } = {}) {
+	if (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b) {
+		let inflated;
+		try {
+			inflated = await gunzipAsync(bytes, { maxOutputLength: maxBytes });
+		} catch (e) {
+			throw new Error(`gzip sitemap body could not be decompressed (${bytes.length} bytes): ${e.message}`);
+		}
+		return new TextDecoder().decode(inflated);
+	}
+	return new TextDecoder().decode(bytes);
+}
 
 /**
  * Parse sitemap XML into `{ isIndex, entries }`.

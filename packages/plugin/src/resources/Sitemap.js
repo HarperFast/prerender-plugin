@@ -11,7 +11,7 @@ import {
 	getNextSitemapRefreshTime,
 	numberOf,
 } from '../util/time.js';
-import { parseSitemap, partitionSitemapEntries, routeKey } from '../util/sitemap.js';
+import { decodeSitemapBody, parseSitemap, partitionSitemapEntries, routeKey } from '../util/sitemap.js';
 import { actionForExisting, canSkipLookup, createRefreshRun, TargetAction } from '../util/sitemapRun.js';
 import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
 import { setImmediate } from 'node:timers/promises';
@@ -1856,7 +1856,14 @@ async function fetchLatestSitemap(url, { ifModifiedSince = null, rootSitemapUrl 
 	// body — and nothing to write: the stored row is still current, validator included.
 	if (res.status === 304) return { url, notModified: true };
 
-	const xml = await res.text();
+	// Not `res.text()`: a `.xml.gz` child arrives as a gzip file (no Content-Encoding for undici to
+	// decode), so the raw bytes are sniffed and gunzipped first — see `decodeSitemapBody`.
+	let xml;
+	try {
+		xml = await decodeSitemapBody(new Uint8Array(await res.arrayBuffer()));
+	} catch (e) {
+		throw new Error(`Sitemap fetch for ${url}${via} (status ${res.status}): ${e.message}`);
+	}
 
 	// A blocked/errored fetch returns an HTML error page with a 4xx/5xx status. Guard the
 	// status AND the parsed shape so it fails loudly instead of being silently treated as an

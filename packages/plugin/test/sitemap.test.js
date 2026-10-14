@@ -1,6 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseSitemap, partitionSitemapEntries } from '../src/util/sitemap.js';
+import {
+	decodeSitemapBody,
+	MAX_SITEMAP_DECOMPRESSED_BYTES,
+	parseSitemap,
+	partitionSitemapEntries,
+} from '../src/util/sitemap.js';
 import { applyOptions } from '../src/config.js';
 import { PASSTHROUGH, UNCLASSIFIED } from '../src/util/routeClass.js';
 
@@ -114,6 +119,71 @@ test('a truncated GZIP body, which undici decodes leniently to a prefix with sta
 	} finally {
 		server.close();
 	}
+});
+
+// --- decodeSitemapBody: a `.xml.gz` sitemap arrives as a gzip FILE, not a transport encoding ---
+
+const gzUrlset = async (n) => {
+	const { gzipSync } = await import('node:zlib');
+	const locs = Array.from({ length: n }, (_, i) => `<url><loc>https://example.com/product/prd-${i}</loc></url>`);
+	return gzipSync(`${xmlDecl}<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${locs.join('')}</urlset>`);
+};
+
+test('a gzip FILE (application/x-gzip, no Content-Encoding) is gunzipped before parsing', async () => {
+	const { createServer } = await import('node:http');
+	const gz = await gzUrlset(5000);
+	const server = createServer((req, res) => {
+		res.writeHead(200, { 'content-type': 'application/x-gzip', 'content-length': gz.length });
+		res.end(gz);
+	});
+	await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+	try {
+		const res = await fetch(`http://127.0.0.1:${server.address().port}/sitemap_1.xml.gz`);
+		const bytes = new Uint8Array(await res.arrayBuffer());
+		assert.deepEqual([bytes[0], bytes[1]], [0x1f, 0x8b], 'undici leaves a gzip file compressed');
+		assert.throws(() => parseSitemap(new TextDecoder().decode(bytes)), 'the raw bytes are not a sitemap');
+		const { isIndex, entries } = parseSitemap(await decodeSitemapBody(bytes));
+		assert.equal(isIndex, false);
+		assert.equal(entries.length, 5000);
+		assert.equal(entries[4999].loc, 'https://example.com/product/prd-4999');
+	} finally {
+		server.close();
+	}
+});
+
+test('a transport-encoded body (Content-Encoding: gzip) is already decoded and passes through unchanged', async () => {
+	const { createServer } = await import('node:http');
+	const gz = await gzUrlset(10);
+	const server = createServer((req, res) => {
+		res.writeHead(200, { 'content-type': 'application/xml', 'content-encoding': 'gzip', 'content-length': gz.length });
+		res.end(gz);
+	});
+	await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+	try {
+		const res = await fetch(`http://127.0.0.1:${server.address().port}/sitemap.xml`);
+		const { entries } = parseSitemap(await decodeSitemapBody(new Uint8Array(await res.arrayBuffer())));
+		assert.equal(entries.length, 10);
+	} finally {
+		server.close();
+	}
+});
+
+test('plain XML bytes decode exactly as Response.text() would, UTF-8 BOM stripped', async () => {
+	const xml = `${xmlDecl}<urlset><url><loc>https://x/café</loc></url></urlset>`;
+	const bytes = new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode(xml)]);
+	assert.equal(await decodeSitemapBody(bytes), xml);
+	assert.equal(parseSitemap(await decodeSitemapBody(bytes)).entries[0].loc, 'https://x/café');
+});
+
+test('a truncated gzip FILE is refused, never parsed to a prefix', async () => {
+	const gz = await gzUrlset(5000);
+	await assert.rejects(decodeSitemapBody(gz.subarray(0, Math.floor(gz.length * 0.4))), /could not be decompressed/);
+});
+
+test('a gzip FILE that inflates past the ceiling is refused (gzip bomb guard)', async () => {
+	const gz = await gzUrlset(5000);
+	await assert.rejects(decodeSitemapBody(gz, { maxBytes: 64 * 1024 }), /could not be decompressed/);
+	assert.ok(MAX_SITEMAP_DECOMPRESSED_BYTES >= 50 * 1024 * 1024, 'the default admits a full sitemaps.org-size file');
 });
 
 // --- partitionSitemapEntries: only prerender routes become render targets ---
