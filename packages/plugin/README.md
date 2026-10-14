@@ -483,6 +483,16 @@ Still to come ([#166](https://github.com/HarperFast/prerender-plugin/issues/166)
 entities rather than every target, through a host-supplied entity source
 ([#242](https://github.com/HarperFast/prerender-plugin/issues/242)), and the entity gate does a point read.
 
+### Gzipped sitemaps (`.xml.gz`)
+
+A sitemap served as a gzip **file** (`application/x-gzip` or `application/octet-stream`, no
+`Content-Encoding`), the sitemaps.org convention for large sitemaps and how most big catalogs
+publish the children of their index, is gunzipped before parsing. The body is sniffed for the gzip
+magic bytes rather than trusting the content-type or a `.gz` suffix. A transport-encoded body
+(`Content-Encoding: gzip`) is decoded by the HTTP client as before. Decompression is capped at
+100 MB, twice the sitemaps.org 50 MB limit, so a gzip bomb fails the child rather than exhausting
+memory, and a truncated gzip file fails it too, rather than being read as a shorter sitemap.
+
 ### Sitemaps are filtered to prerender routes
 
 A sitemap is written for search engines: it lists every indexable URL on the site, which is routinely
