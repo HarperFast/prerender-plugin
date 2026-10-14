@@ -347,6 +347,14 @@ export type WaitForRule = {
 	waitForSelector?: string;
 	/** Minimum matches of `waitForSelector` required to proceed (default 1). */
 	minCount?: number;
+	/**
+	 * Count only matches that are actually SHOWN — the same test as the readiness `visible` clause
+	 * (display, visibility and opacity up the tree, a non-empty box, not clipped to nothing). For a
+	 * gate whose point is that content is on screen, not merely in the DOM: a reveal animation leaves
+	 * the content present while hiding it, and naming the animation's classes instead breaks the day
+	 * the template stops using them. Default false.
+	 */
+	visible?: boolean;
 	/** Require the match count to hold steady this long (ms) before proceeding (optional). */
 	stableMs?: number;
 	/** Max time to wait for this rule (ms). Default: the remaining render budget. */
@@ -857,6 +865,9 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 				(typeof rule.waitForSelector !== 'string' || rule.waitForSelector.trim() === '')
 			) {
 				throw new Error(`prerender config: waitFor[${i}].waitForSelector must be a non-empty string`);
+			}
+			if (rule.visible !== undefined && typeof rule.visible !== 'boolean') {
+				throw new Error(`prerender config: waitFor[${i}].visible must be a boolean`);
 			}
 			for (const field of ['minCount', 'stableMs', 'timeoutMs'] as const) {
 				const v = rule[field];

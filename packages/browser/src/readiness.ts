@@ -52,6 +52,7 @@
  */
 
 import type { ResponseLog } from './responseLog.js';
+import { validateDriftPolicy, type ReadinessDriftPolicy } from './readinessDrift.js';
 
 /** One thing a complete render of this page type contains. */
 export type ReadinessAssertion = { onlyIf?: ReadinessGuard } & (
@@ -91,6 +92,29 @@ export type ReadinessAssertion = { onlyIf?: ReadinessGuard } & (
 			name: string;
 			/** Satisfied when NOTHING matches — skeletons, spinners, unresolved placeholders. */
 			absent: string;
+	  }
+	| {
+			name: string;
+			/**
+			 * Satisfied when at least `minCount` (default 1) matching elements are actually SHOWN: not
+			 * `display: none`, `visibility: hidden` or `opacity: 0` (on the element or any ancestor, across
+			 * shadow boundaries), with a non-empty box, and not clipped to nothing by an `overflow`
+			 * ancestor of zero height or width.
+			 *
+			 * THE FORM THAT DOES NOT DEPEND ON THE SITE'S CLASS NAMES. Reveal animations hide content that
+			 * is already in the DOM, so presence cannot tell a revealed block from a concealed one, and the
+			 * only other way to ask is to name the classes the animation toggles. That fails in both
+			 * directions when the template changes: measured on a live product template, a reveal wrapper
+			 * named by its utility classes was REMOVED in a redesign, the clause never matched again, and
+			 * every product render paid its timeout plus the fallback settle for a day; and a class-based
+			 * predicate passes, silently, on any concealment it does not name. This asks the browser
+			 * instead, so it holds on any template that shows the element and on none that hides it.
+			 *
+			 * Anchor it on something the page cannot render without — a vendor widget's own mount
+			 * attribute, say — rather than on layout ids, which are the site's to rename.
+			 */
+			visible: string;
+			minCount?: number;
 	  }
 	| {
 			name: string;
@@ -207,6 +231,24 @@ export type ReadinessGuard =
 			 */
 			present: string;
 			atLeast?: number;
+			/**
+			 * Do not decide until an element matching this exists; until then the clause is NOT YET
+			 * satisfied (false), instead of skipped.
+			 *
+			 * Without it, "the guarded element is absent" means two opposite things — the page will never
+			 * have one, or it has not rendered it yet — and the guard can only answer the first. A widget
+			 * that mounts its own slot late is then skipped if every other clause happens to hold and the
+			 * page goes quiet before the slot exists, and the render stops without it. Name the element the
+			 * slot is rendered with (the widget's own container) and the guard waits for the widget to
+			 * have spoken before taking its silence as "none here". `jsonLdNumber` has the same three-way
+			 * answer built in, from the page's structured data.
+			 *
+			 * The anchor must exist on EVERY page the contract governs. On a page that never renders it the
+			 * clause never holds: the render pays the rot valve and the fallback settle, and the drift
+			 * report calls the contract broken. And it must not arrive before the slot it vouches for, or the
+			 * race it closes stays open.
+			 */
+			after?: string;
 	  };
 
 /** The contract for one page type. */
@@ -318,6 +360,18 @@ export type ReadinessConfig = {
 	 * so. Report mode is unaffected: it never gates, and the settle always runs.
 	 */
 	onGiveUp?: 'settle' | 'stop';
+	/**
+	 * Say so, loudly, when a clause stops holding on most renders — the signal that the contract no
+	 * longer matches the site and someone needs to update it. Logging only: no render behaves
+	 * differently. `false` turns it off; omitted fields take the defaults (see readinessDrift.ts).
+	 *
+	 * Why it exists: the rot valve keeps a rotted clause from costing a render its CONTENT, and it is
+	 * right that the render then waits out the fallback settle rather than guess. But the valve is
+	 * silent. Measured on a live product template: a redesign removed the element one clause named,
+	 * the clause failed on 235,993 of 235,995 product renders over a day, every one paid the slow path,
+	 * the render queue backed up behind it, and nothing said why until a person went looking.
+	 */
+	drift?: Partial<ReadinessDriftPolicy> | false;
 };
 
 /** Per-assertion outcome, posted with the render so an incomplete page is a fact, not a silence. */
@@ -460,6 +514,78 @@ export function evaluateContract(payload: {
 		return n;
 	};
 
+	// Whether an element is actually painted: shown by `display`, `visibility` and `opacity` all the way
+	// up the flat tree, with a box, and not clipped to nothing by an `overflow` ancestor of zero size —
+	// which is how `max-height: 0` reveal animations hide. Keep in step with `countMatchingElements` in
+	// renderer.ts, which needs the same answer for `waitFor`; both run in-page and self-contained.
+	const shown = (el: Element): boolean => {
+		// Flat-tree parent: a slotted node's is its slot, a shadow root's top-level node's is the host.
+		const up = (n: Element): Element | null =>
+			(n as Element & { assignedSlot?: Element | null }).assignedSlot ??
+			n.parentElement ??
+			((n.getRootNode() as ShadowRoot).host || null);
+		const check = (el as Element & { checkVisibility?: (o: Record<string, boolean>) => boolean }).checkVisibility;
+		// The options are necessary: plain checkVisibility() reports an opacity-0 element as visible. Both
+		// spellings, because Chrome 121 renamed checkOpacity/checkVisibilityCSS; current Chrome honours both.
+		const opts = { opacityProperty: true, visibilityProperty: true, checkOpacity: true, checkVisibilityCSS: true };
+		if (typeof check === 'function') {
+			if (!check.call(el, opts)) return false;
+		} else {
+			for (let n: Element | null = el; n; n = up(n)) {
+				const cs = getComputedStyle(n);
+				if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+			}
+		}
+		const box = el.getBoundingClientRect();
+		if (box.width <= 0 || box.height <= 0) return false;
+		// Clipped to nothing by an `overflow` ancestor. Only an ancestor that actually clips this element
+		// counts: one with no box (`display: contents`) cannot, and an absolutely or fixed positioned
+		// element escapes every ancestor below its containing block — judging those clipped would make a
+		// clause anchored on painted content never hold.
+		const contains = (cs: CSSStyleDeclaration, fixed: boolean): boolean =>
+			(!fixed && cs.position !== 'static') ||
+			cs.transform !== 'none' ||
+			cs.filter !== 'none' ||
+			cs.perspective !== 'none' ||
+			/paint|layout|strict|content/.test(cs.contain);
+		let escaping = getComputedStyle(el).position;
+		let depth = 0;
+		for (let n = up(el); n && depth < 64; n = up(n), depth++) {
+			const cs = getComputedStyle(n);
+			if (cs.display === 'contents') continue;
+			if (escaping === 'absolute' || escaping === 'fixed') {
+				if (!contains(cs, escaping === 'fixed')) continue;
+				escaping = 'static';
+			}
+			if (cs.overflowX !== 'visible' || cs.overflowY !== 'visible') {
+				const clip = n.getBoundingClientRect();
+				if ((cs.overflowX !== 'visible' && clip.width <= 0) || (cs.overflowY !== 'visible' && clip.height <= 0)) {
+					return false;
+				}
+			}
+			if (cs.position === 'absolute' || cs.position === 'fixed') escaping = cs.position;
+		}
+		return true;
+	};
+
+	// Shown matches of `selector`. A required clause stops once it has `enough` (the layout reads are the
+	// cost, and it needs only its minimum), so its count is capped there; an observation counts them all,
+	// because its count is what a URL's history is compared against.
+	const countShown = (selector: string, enough: number): number => {
+		let n = 0;
+		for (const root of roots) {
+			try {
+				for (const el of root.querySelectorAll(selector)) {
+					if (shown(el)) n++;
+					if (enough > 0 && n >= enough) return n;
+				}
+			} catch {
+				return -1;
+			}
+		}
+		return n;
+	};
+
 	// Numbers the page itself declares, read from its JSON-LD (including @graph and array entries).
 	// This is what lets a clause ask "does this page claim to have reviews?" instead of guessing.
 	// How many JSON-LD blocks have parsed at all. The guard needs this to tell "the page declares
@@ -521,10 +647,14 @@ export function evaluateContract(payload: {
 		return null;
 	};
 
-	const run = (assertion: ReadinessAssertion): AssertionResult => {
+	const run = (assertion: ReadinessAssertion, required: boolean): AssertionResult => {
 		const a = assertion as unknown as Record<string, unknown>;
-		const guard = a.onlyIf as { jsonLdNumber?: string; present?: string; atLeast?: number } | undefined;
+		const guard = a.onlyIf as { jsonLdNumber?: string; present?: string; atLeast?: number; after?: string } | undefined;
 		if (guard && typeof guard.present === 'string') {
+			// Not decidable yet: the element this guard's answer depends on has not rendered.
+			if (typeof guard.after === 'string' && countAll(guard.after) <= 0) {
+				return { name: assertion.name, ok: false, count: 0 };
+			}
 			const have = countAll(guard.present);
 			if (have < (guard.atLeast ?? 1)) return { name: assertion.name, ok: true, count: 0, skipped: true };
 		} else if (guard && typeof guard.jsonLdNumber === 'string') {
@@ -550,6 +680,12 @@ export function evaluateContract(payload: {
 		if (typeof a.absent === 'string') {
 			const n = countAll(a.absent);
 			return { name: assertion.name, ok: n === 0, count: Math.max(n, 0) };
+		}
+		if (typeof a.visible === 'string') {
+			// At least one, whatever minCount says: "zero shown" is never evidence that something is shown.
+			const need = Math.max((a.minCount as number) ?? 1, 1);
+			const n = countShown(a.visible as string, required ? need : 0);
+			return { name: assertion.name, ok: n >= need, count: Math.max(n, 0) };
 		}
 		if (Array.isArray(a.anyOf)) {
 			let best = 0;
@@ -639,7 +775,13 @@ export function evaluateContract(payload: {
 	// Before that, "nothing is happening" is the wrong reading of a quiet page — see the rot valve.
 	const loaded = document.readyState === 'complete';
 
-	return { require: payload.require.map(run), observe: payload.observe.map(run), quietMs: quiet, started, loaded };
+	return {
+		require: payload.require.map((a) => run(a, true)),
+		observe: payload.observe.map((a) => run(a, false)),
+		quietMs: quiet,
+		started,
+		loaded,
+	};
 }
 
 /**
@@ -700,6 +842,7 @@ export function validateReadiness(readiness: unknown): void {
 			throw new Error('prerender config: readiness.expectations.rebaselineAfter must be a positive integer');
 		}
 	}
+	validateDriftPolicy(cfg.drift);
 	if (!Array.isArray(cfg.contracts)) throw new Error('prerender config: readiness.contracts must be an array');
 	for (const contract of cfg.contracts) {
 		if (!contract.name) throw new Error('prerender config: every readiness contract needs a name');
@@ -786,10 +929,29 @@ export function validateReadiness(readiness: unknown): void {
 					throw new Error(`prerender config: readiness assertion "${assertion.name}" has an invalid responded pattern`);
 				}
 			}
+			if (a.visible !== undefined && (typeof a.visible !== 'string' || a.visible.trim() === '')) {
+				throw new Error(
+					`prerender config: readiness assertion "${assertion.name}" visible must be a non-empty selector`
+				);
+			}
+			const guard = a.onlyIf as Record<string, unknown> | undefined;
+			if (guard?.after !== undefined) {
+				if (typeof guard.present !== 'string') {
+					throw new Error(
+						`prerender config: readiness assertion "${assertion.name}" onlyIf.after only applies to a present guard`
+					);
+				}
+				if (typeof guard.after !== 'string' || guard.after.trim() === '') {
+					throw new Error(
+						`prerender config: readiness assertion "${assertion.name}" onlyIf.after must be a non-empty selector`
+					);
+				}
+			}
 			const forms = [
 				a.selector && !a.shed && !a.nonEmptyText,
 				a.anyOf,
 				a.absent,
+				a.visible,
 				a.shed,
 				a.every,
 				a.nonEmptyText,
@@ -798,7 +960,7 @@ export function validateReadiness(readiness: unknown): void {
 			if (!assertion.name || forms !== 1) {
 				throw new Error(
 					`prerender config: readiness assertion in "${contract.name}" must have a name and exactly one of ` +
-						'selector / anyOf / absent / (selector + shed) / (every + contains) / (selector + nonEmptyText) / responded'
+						'selector / anyOf / absent / visible / (selector + shed) / (every + contains) / (selector + nonEmptyText) / responded'
 				);
 			}
 		}
