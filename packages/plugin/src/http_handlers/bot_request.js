@@ -167,17 +167,22 @@ export async function handleBotRequest(request) {
  * its route's `renderInterval`, else `render.defaultInterval`: the cadence the route promises.
  */
 function countHealth(info, resource, status, ms, failed) {
-	const source = info?.source ?? null;
-	const snapshot = (source === 'cache' || source === 'entity') && resource?.lastCached;
-	countServe({
-		route: info?.route?.path ?? info?.routeClass ?? 'unrouted',
-		source,
-		status,
-		ms,
-		failed,
-		ageMs: snapshot ? Date.now() - new Date(resource.lastCached).getTime() : undefined,
-		intervalMs: info?.route?.renderInterval ?? config.render.defaultInterval,
-	});
+	// Called from a `finally`: a throw here would replace the response already built with an error.
+	try {
+		const source = info?.source ?? null;
+		const snapshot = (source === 'cache' || source === 'entity') && resource?.lastCached;
+		countServe({
+			route: info?.route?.path ?? info?.routeClass ?? 'unrouted',
+			source,
+			status,
+			ms,
+			failed,
+			ageMs: snapshot ? Date.now() - new Date(resource.lastCached).getTime() : undefined,
+			intervalMs: info?.route?.renderInterval ?? config.render.defaultInterval,
+		});
+	} catch {
+		// Counting must never cost a crawler its response.
+	}
 }
 
 // The cache statuses that served a rendered snapshot from this node's cache, and the raw-document one.
