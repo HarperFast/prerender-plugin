@@ -310,26 +310,34 @@ const withTimeout = (promise, ms) => {
 let stateProviders = {};
 
 /**
- * Build the line for the interval ending `nowMs`: drain the counters, then read each state section. A
+ * Build the line for the interval ending `nowMs`: drain the counters, then read every state section. A
  * section that throws or outruns STATE_TIMEOUT_MS is written as null and named in `err`, so a broken
  * reader cannot hold the line back or pass for healthy.
  */
 export const buildHealthLine = async (nowMs = Date.now()) => {
 	const { span, bot, routes } = drain(nowMs);
 	const line = { v: pluginVersion(), span, up: Math.round(process.uptime()), bot, routes };
+	// Read at once, so sections that hang cost one STATE_TIMEOUT_MS between them, not one each.
+	const sections = await Promise.all(
+		Object.entries(stateProviders).map(async ([name, read]) => {
+			try {
+				return [
+					name,
+					(await withTimeout(
+						Promise.resolve().then(() => read(nowMs)),
+						STATE_TIMEOUT_MS
+					)) ?? null,
+				];
+			} catch (e) {
+				getLogger().debug?.(`[prerender] health: the ${name} section failed: ${e?.message ?? String(e)}`);
+				return [name, null, true];
+			}
+		})
+	);
 	const errors = [];
-	for (const [name, read] of Object.entries(stateProviders)) {
-		try {
-			const section = withTimeout(
-				Promise.resolve().then(() => read(nowMs)),
-				STATE_TIMEOUT_MS
-			);
-			line[name] = (await section) ?? null;
-		} catch (e) {
-			line[name] = null;
-			errors.push(name);
-			getLogger().debug?.(`[prerender] health: the ${name} section failed: ${e?.message ?? String(e)}`);
-		}
+	for (const [name, value, failed] of sections) {
+		line[name] = value;
+		if (failed) errors.push(name);
 	}
 	if (errors.length > 0) line.err = errors;
 	return line;

@@ -183,17 +183,25 @@ test('state sections: a value, a null, and a throwing reader written as null and
 	assert.equal('err' in (await health.buildHealthLine()), false, 'err only when a section failed');
 });
 
-test('a section that never answers is cut off, and the line is still written', async (t) => {
+test('sections that never answer are cut off together, and the line is still written', async (t) => {
 	t.mock.timers.enable({ apis: ['setTimeout'] });
-	health.setHealthProvidersForTest({ probe: () => new Promise(() => {}) });
+	// Two that hang, read at once: one 5 s deadline cuts both, rather than one each in turn.
+	health.setHealthProvidersForTest({
+		keeper: () => ({ ok: 1 }),
+		probe: () => new Promise(() => {}),
+		sitemap: () => new Promise(() => {}),
+	});
 	const pending = health.buildHealthLine();
 	// Let the section start, then pass its deadline.
 	await Promise.resolve();
 	await Promise.resolve();
 	t.mock.timers.tick(5_000);
 	const line = await pending;
+	assert.deepEqual(line.keeper, { ok: 1 });
 	assert.equal(line.probe, null);
-	assert.deepEqual(line.err, ['probe']);
+	assert.equal(line.sitemap, null);
+	assert.deepEqual(line.err, ['probe', 'sitemap']);
+	assert.deepEqual(Object.keys(line).slice(-4), ['keeper', 'probe', 'sitemap', 'err'], 'sections keep their order');
 });
 
 test('a live route change re-lays the counters: new routes get their own fields, unknown ones go to other', async () => {
