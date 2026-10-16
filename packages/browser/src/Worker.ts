@@ -560,10 +560,8 @@ export default class RenderWorker {
 		// Every render-failure bucket except our own teardown (`shutdownAborted` is a rollout, not a render
 		// regression). Summed rather than listed: the listed sum went stale when navTimeout was split out of
 		// `timeout`, and `failures` read 0 while navigations were timing out.
-		const failuresTotal = Object.entries(s.failures).reduce(
-			(sum, [bucket, n]) => (bucket === 'shutdownAborted' ? sum : sum + n),
-			0
-		);
+		const { shutdownAborted, ...renderFailures } = s.failures;
+		const failuresTotal = Object.values(renderFailures).reduce((sum, n) => sum + n, 0);
 
 		const mem = process.memoryUsage();
 		const readinessFailing = this.drift?.failing();

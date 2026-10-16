@@ -8,13 +8,12 @@ import logger from '../dist/util/Logger.js';
  * render-failure bucket — navigation timeouts were split out of `timeout` and silently dropped from the sum,
  * so the line read 0 failures while navigations timed out — and leave out only our own teardown.
  */
-test('throughput.failures sums every render-failure bucket, navigation timeouts included, teardown excluded', async () => {
+test('throughput.failures sums every render-failure bucket, navigation timeouts included, teardown excluded', async (t) => {
 	const worker = new RenderWorker({ renderer: async () => undefined });
 	const logged: Record<string, unknown>[] = [];
-	const info = logger.info;
-	(logger as unknown as { info: (o: Record<string, unknown>) => void }).info = (o) => {
+	t.mock.method(logger, 'info', (o: Record<string, unknown>) => {
 		logged.push(o);
-	};
+	});
 	try {
 		const stats = (worker as unknown as { stats: { failures: Record<string, number> } }).stats;
 		Object.assign(stats.failures, {
@@ -28,7 +27,6 @@ test('throughput.failures sums every render-failure bucket, navigation timeouts 
 		});
 		worker.logStats();
 	} finally {
-		(logger as unknown as { info: typeof info }).info = info;
 		await worker.destroy();
 	}
 	const line = logged.find((o) => o.throughput) as {
