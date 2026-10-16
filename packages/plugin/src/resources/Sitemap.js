@@ -9,6 +9,7 @@ import {
 	epochMsOf,
 	getInitialRenderTime,
 	getNextSitemapRefreshTime,
+	HOUR,
 	numberOf,
 } from '../util/time.js';
 import { parseSitemap, partitionSitemapEntries, routeKey } from '../util/sitemap.js';
@@ -472,6 +473,69 @@ async function claimRefreshRun(rootUrl) {
 	return { ok: true };
 }
 
+/** The later of two stored dates (either may be null); null when neither is a date. */
+const laterDate = (a, b) => {
+	const am = dateColumnMs(a);
+	const bm = dateColumnMs(b);
+	if (!Number.isFinite(bm)) return Number.isFinite(am) ? a : null;
+	return !Number.isFinite(am) || bm > am ? b : a;
+};
+
+/** When `rootUrl`'s walk last completed, from its progress row; null if it never has or the row can't be read. */
+async function lastCompletedRefresh(rootUrl) {
+	try {
+		const row = await databases.sitemaps.SitemapRefresh.get({ id: rootUrl, select: ['lastRefreshed'] });
+		return row?.lastRefreshed ?? null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * The scheduled sitemap walk's state for the health line (util/health.js), or null when no node is pinned to
+ * run it (`sitemap.node`) — then nothing is expected to succeed on a schedule. Read from the replicated
+ * `SitemapRefresh` rows, so every node reports the same walk.
+ *
+ *   roots            root sitemaps that have a refresh row
+ *   lastSuccessAgeH  hours since the LEAST recently completed root last completed; null when none has
+ *   neverOk          roots with no completed walk on record
+ *   failing          roots whose latest walk failed (the root itself could not be fetched or parsed)
+ *   failedChildren   child sitemaps the latest walks skipped because they failed. A walk with failed children
+ *                    still COMPLETES — at index scale one 503 must not abandon the rest — so this, not
+ *                    `failing`, is where an index whose children all fail shows.
+ *
+ * A root whose very FIRST walk failed has no `Sitemap` row yet (the row is written once its document is
+ * read), so it is not counted at all; neither does the scheduled walk know it as a root.
+ */
+export async function sitemapHealth(nowMs = Date.now()) {
+	if (!config.sitemap.node) return null;
+	let roots = 0;
+	let neverOk = 0;
+	let failing = 0;
+	let failedChildren = 0;
+	let oldestMs = -Infinity;
+	const select = ['id', 'state', 'lastRefreshed', 'failed'];
+	for await (const row of databases.sitemaps.SitemapRefresh.search({ select })) {
+		if (row.id === 'all') continue;
+		// A refresh row outlives its sitemap, so only a root that still exists counts.
+		const sitemap = await SitemapTable.get({ id: row.id, select: ['url', 'parentUrl'] });
+		if (!sitemap || sitemap.parentUrl) continue;
+		roots++;
+		if (row.state === 'failed') failing++;
+		if (Array.isArray(row.failed)) failedChildren += row.failed.length;
+		const completedAt = dateColumnMs(row.lastRefreshed);
+		if (Number.isFinite(completedAt)) oldestMs = Math.max(oldestMs, nowMs - completedAt);
+		else neverOk++;
+	}
+	return {
+		roots,
+		lastSuccessAgeH: Number.isFinite(oldestMs) ? Math.round((oldestMs / HOUR) * 10) / 10 : null,
+		neverOk,
+		failing,
+		failedChildren,
+	};
+}
+
 /** The snapshot fields that are persisted as progress. */
 const progressFields = (snapshot) => ({
 	sitemapsProcessed: snapshot.sitemapsProcessed,
@@ -504,16 +568,25 @@ const progressFields = (snapshot) => ({
  */
 async function runTrackedRefresh(rootUrl, options) {
 	const startedAt = new Date();
+	let lastRefreshed = await lastCompletedRefresh(rootUrl);
 
-	// `put` replaces the record, so every write restates the identity fields. A progress write
-	// that fails must never take the walk down with it — it is telemetry, not the work.
-	const writeProgress = (fields) =>
-		databases.sitemaps.SitemapRefresh.put(rootUrl, {
+	// `put` replaces the record, so every write restates the identity fields — and `lastRefreshed`, the
+	// last walk of this root that COMPLETED. Without it a running or failed walk erased the only record of
+	// when the root last succeeded, which is what "the walk keeps failing" is judged on (the health line,
+	// util/health.js). Re-read before each write and the later one kept: a walk that took over from this
+	// one (`claimRefreshRun`) may have completed since it started, and restating the older time would undo
+	// that. A completed walk overrides it with its own finish. A progress write that fails must never take
+	// the walk down with it — it is telemetry, not the work.
+	const writeProgress = async (fields) => {
+		lastRefreshed = laterDate(lastRefreshed, await lastCompletedRefresh(rootUrl));
+		return databases.sitemaps.SitemapRefresh.put(rootUrl, {
 			node: server.hostname,
 			startedAt,
 			updatedAt: new Date(),
+			lastRefreshed,
 			...fields,
 		}).catch((e) => logger.warn(`[prerender] Could not record refresh progress for ${rootUrl}: ${describeError(e)}`));
+	};
 
 	await writeProgress({ state: 'running' });
 

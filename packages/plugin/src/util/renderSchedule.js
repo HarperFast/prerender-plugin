@@ -569,6 +569,21 @@ export const readKeeperSignal = (nowMs = Date.now()) => {
 	};
 };
 
+/**
+ * The keeper's state for the health line (util/health.js). `ok` is 1 while the keeper is live and its
+ * heartbeat fresh — the one field an alert needs; the parts and the ready set's depth are beside it for
+ * whoever reads the line.
+ */
+export const keeperHealth = (nowMs = Date.now()) => {
+	const signal = readKeeperSignal(nowMs);
+	return {
+		ok: signal.live && !signal.stale ? 1 : 0,
+		live: signal.live ? 1 : 0,
+		ageS: signal.ageMs === null ? null : Math.round(signal.ageMs / 1000),
+		ready: readyQueue().state().remaining,
+	};
+};
+
 // ---- lease lifecycle exposed to the result path ---------------------------------------------
 
 /** Release `cacheKey`'s lease; with `grantedAtMs` (from `leaseGrant`), only the lease granted then. */

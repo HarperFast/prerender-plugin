@@ -327,3 +327,15 @@ test('before anything reports, the status reads unready, and the first report of
 	assert.equal(QueueState.status, 'empty');
 	assert.equal(statuses.get('node-a')?.status, 'empty', 'the first report is a change, so it is written');
 });
+
+test('keeperHealth: ok only while the keeper is live AND its heartbeat fresh', () => {
+	const now = Date.now();
+	funnel.setKeeperSignal({ due: 0, nowMs: now });
+	assert.deepEqual(funnel.keeperHealth(now + 2_000), { ok: 1, live: 1, ageS: 2, ready: 0 });
+	const stale = funnel.keeperHealth(now + 10 * MINUTE);
+	assert.equal(stale.ok, 0, 'live but silent for ten minutes');
+	assert.equal(stale.live, 1);
+	funnel.clearKeeperSignal();
+	assert.equal(funnel.keeperHealth(now).ok, 0, 'stopped');
+	assert.equal(funnel.keeperHealth(now).live, 0);
+});

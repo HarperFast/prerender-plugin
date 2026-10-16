@@ -3282,6 +3282,30 @@ export const configSchema = group('Prerender plugin configuration.', {
 		}
 	),
 
+	health: group(
+		'The health line (util/health.js): one `[prerender] health {json}` log line per node per `interval` — the ' +
+			'bot requests answered since the last line (source, status class, slow responses, served snapshots older ' +
+			'than their route interval), node totals and per prerender route, plus the queue keeper, change probe and ' +
+			'scheduled sitemap walk state. Written whether or not anything is wrong, so a log pipeline can alert on ' +
+			'the numbers AND on the line going missing. Counted in shared memory, independent of `analytics` (which ' +
+			'it never reads); one worker per node writes each line.',
+		{
+			enabled: option(true, 'Count bot-path answers and write the health line.'),
+			interval: option(5 * MINUTE, 'How often each node writes the line. Lines land on multiples of it.', {
+				unit: 'ms',
+				min: 10 * SECOND,
+				max: HOUR,
+			}),
+			level: option(
+				'notify',
+				'Log level of the line. Some hosts forward only `warn` and above from components to their log ' +
+					'shipper — set `warn` there, or the line never leaves the node. The level says nothing about health; ' +
+					'the numbers do.',
+				{ enum: ['notify', 'info', 'warn'] }
+			),
+		}
+	),
+
 	entities: group(
 		'THE ENTITY REGISTRY (util/entity.js, issue #166): one `Entity` row per entity a route declares with ' +
 			'`ingress.routes[].entityPrefix` (a product), keyed by the entity prefix, holding the entity\u2019s ' +

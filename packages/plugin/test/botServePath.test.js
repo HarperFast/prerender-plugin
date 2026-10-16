@@ -780,3 +780,53 @@ test('a request the handler answers 500 is still offered to the samplers', async
 		rmSync(sampleDir, { recursive: true, force: true });
 	}
 });
+
+// ── the health line (util/health.js) counts what the crawler was sent ─────────────────────────────
+
+test('the health line counts each request once, by what answered it — analytics off, failures filed by cause', async () => {
+	const { buildHealthLine } = await import('../src/util/health.js');
+	await buildHealthLine(); // start from zero
+
+	// A miss proxied live to the origin.
+	await drain((await handleBotRequest(request('/desktop/p/miss'))).body);
+	// The origin failing: its 502 is relayed, not ours.
+	origin.respond = (_req, res) => {
+		res.writeHead(502, { 'content-type': 'text/html' });
+		res.end('bad gateway');
+	};
+	assert.equal((await handleBotRequest(request('/desktop/p/origin-down'))).status, 502);
+	// A stored snapshot three render intervals old.
+	pageGet = async () => cachedPage({ lastCached: new Date(Date.now() - 3 * config.render.defaultInterval) });
+	assert.equal((await handleBotRequest(request('/desktop/p/cached'))).status, 200);
+	// The origin hanging up before any status: the handler's 500, but the origin's outage, not ours.
+	pageGet = async () => null;
+	origin.respond = (req) => req.socket.destroy();
+	assert.equal((await handleBotRequest(request('/desktop/p/origin-gone'))).status, 500);
+	// The handler itself failing: a 500 that is ours.
+	pageGet = async () => {
+		throw new Error('storage fault');
+	};
+	assert.equal((await handleBotRequest(request('/desktop/p/broken'))).status, 500);
+
+	const { bot, routes } = await buildHealthLine();
+	assert.equal(config.analytics.enabled, false, 'counted although analytics are off');
+	assert.equal(bot.req, 5);
+	assert.equal(bot.origin, 3);
+	assert.equal(bot.cache, 1);
+	assert.equal(bot.s2xx, 2);
+	assert.equal(bot.s5xx, 3);
+	assert.equal(bot.own5xx, 1, 'the handler failure is ours; the relayed 502 is not');
+	assert.equal(bot.originUnreachable, 1, 'the origin hanging up is the origin’s');
+	assert.equal(bot.ageOver1x, 1);
+	assert.equal(bot.ageOver2x, 1);
+	assert.deepEqual(
+		{
+			req: routes['/p/'].req,
+			origin: routes['/p/'].origin,
+			s5xx: routes['/p/'].s5xx,
+			own5xx: routes['/p/'].own5xx,
+			originUnreachable: routes['/p/'].originUnreachable,
+		},
+		{ req: 5, origin: 3, s5xx: 3, own5xx: 1, originUnreachable: 1 }
+	);
+});

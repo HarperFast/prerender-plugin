@@ -21,6 +21,9 @@ import { setTimeout as sleep } from 'node:timers/promises';
 const targets = new Map(); // url -> Target row
 const pages = new Map(); // cacheKey -> PrerenderedPage row
 const sitemapRows = new Map();
+const refreshRows = new Map(); // root url -> SitemapRefresh row
+const refreshPuts = []; // every SitemapRefresh.put, in order
+let fetchGate = null; // { url, opened }: that document's fetch waits until `opened` resolves
 const scheduleRows = new Map();
 const patches = []; // every Target.patch, in order
 const pagePatches = [];
@@ -39,7 +42,7 @@ const project = (row, select) => {
 };
 const matches = (row, conditions = []) => conditions.every(({ attribute, value }) => row[attribute] === value);
 
-let applyOptions, sitemaps, cacheKeysOf, Target;
+let applyOptions, sitemaps, cacheKeysOf, Target, startSitemapRefreshInBackground, sitemapHealth;
 
 before(async () => {
 	globalThis.Resource = class {};
@@ -152,10 +155,20 @@ before(async () => {
 				}
 			},
 			SitemapRefresh: class {
-				static async get() {
-					return undefined;
+				static async get(arg) {
+					const row = refreshRows.get(typeof arg === 'object' ? arg.id : arg);
+					return row ? project(row, arg?.select) : undefined;
 				}
-				static async put() {}
+				static async put(id, row) {
+					refreshPuts.push({ id, ...row });
+					refreshRows.set(id, { ...row, id });
+				}
+				static search({ select } = {}) {
+					const rows = [...refreshRows.values()];
+					return (async function* () {
+						for (const row of rows) yield project(row, select);
+					})();
+				}
 			},
 		},
 		coordination: {
@@ -173,6 +186,7 @@ before(async () => {
 	};
 	globalThis.fetch = async (url, init = {}) => {
 		fetchLog.push({ url, headers: { ...init.headers }, redirect: init.redirect, store: request.getStore() });
+		if (fetchGate?.url === url) await fetchGate.opened;
 		if (redirects[url]) return new Response(null, { status: 301, headers: { location: redirects[url] } });
 		const xml = documents[url];
 		if (xml === undefined) return new Response('unavailable', { status: 503, statusText: 'Service Unavailable' });
@@ -182,7 +196,7 @@ before(async () => {
 	};
 
 	({ applyOptions } = await import('../src/config.js'));
-	({ sitemaps } = await import('../src/resources/Sitemap.js'));
+	({ sitemaps, startSitemapRefreshInBackground, sitemapHealth } = await import('../src/resources/Sitemap.js'));
 	({ cacheKeysOf, Target } = await import('../src/resources/Target.js'));
 });
 
@@ -232,8 +246,8 @@ const walk = (docs) => {
 };
 
 beforeEach(() => {
-	for (const map of [targets, pages, sitemapRows, scheduleRows]) map.clear();
-	for (const list of [patches, pagePatches, schedulePuts, fetchLog, searchStores]) list.length = 0;
+	for (const map of [targets, pages, sitemapRows, scheduleRows, refreshRows]) map.clear();
+	for (const list of [patches, pagePatches, schedulePuts, fetchLog, searchStores, refreshPuts]) list.length = 0;
 	for (const bag of [lastMod, redirects]) for (const key of Object.keys(bag)) delete bag[key];
 	documents = {};
 	configure();
@@ -1285,4 +1299,90 @@ test('POST /Target {action: revalidate} runs outside the request’s async conte
 	const result = await request.run({ request: 'POST /Target' }, () => new Target().post({ action: 'revalidate' }, {}));
 	assert.deepEqual(result, { revalidating: 1, examined: 1, truncated: false });
 	assert.deepEqual(searchStores, [undefined]);
+});
+
+// ---- the refresh row's last success, and the health line's read of it ----
+
+// A background walk of ROOT, run to its end (its progress row says how it ended).
+const trackedWalk = async (docs) => {
+	documents = { ...docs };
+	const from = refreshPuts.length;
+	await startSitemapRefreshInBackground(ROOT);
+	const ended = () => refreshPuts.slice(from).some((put) => put.state !== 'running');
+	for (let i = 0; i < 400 && !ended(); i++) await sleep(5);
+	assert.ok(ended(), 'the walk ended');
+	return refreshRows.get(ROOT);
+};
+
+test('a failed walk keeps the time its root last completed, on every progress write', async () => {
+	const ok = await trackedWalk({ [ROOT]: index(C1), [C1]: urlset(P(1)) });
+	assert.equal(ok.state, 'completed');
+	const completedAt = ok.lastRefreshed;
+	assert.ok(completedAt instanceof Date);
+
+	await sleep(5);
+	const from = refreshPuts.length;
+	const failed = await trackedWalk({}); // the root answers 503
+	assert.equal(failed.state, 'failed');
+	assert.equal(failed.lastRefreshed, completedAt, 'the failure did not erase the last success');
+	const writes = refreshPuts.slice(from);
+	assert.ok(writes.length >= 2, 'a running write and the failure');
+	for (const put of writes) assert.equal(put.lastRefreshed, completedAt, `the ${put.state} write kept it`);
+
+	await sleep(5);
+	const again = await trackedWalk({ [ROOT]: index(C1), [C1]: urlset(P(1)) });
+	assert.ok(again.lastRefreshed > completedAt, 'the next completed walk moves it');
+});
+
+test('sitemapHealth reports the oldest root success, roots that never completed, and failing ones', async () => {
+	configure({ sitemap: { node: 'node-1' } });
+	const now = Date.now();
+	const OTHER = `${HOST}/sitemap_other.xml`;
+	sitemapRows.set(ROOT, { url: ROOT });
+	sitemapRows.set(OTHER, { url: OTHER });
+	sitemapRows.set(C1, { url: C1, parentUrl: ROOT });
+	refreshRows.set(ROOT, { id: ROOT, state: 'failed', lastRefreshed: new Date(now - 30 * 3_600_000) });
+	// Completed, though two of its children failed: a walk at index scale carries on past them.
+	refreshRows.set(OTHER, { id: OTHER, state: 'completed', lastRefreshed: new Date(now), failed: [{}, {}] });
+	refreshRows.set(`${HOST}/removed.xml`, { id: `${HOST}/removed.xml`, state: 'failed', lastRefreshed: null });
+	refreshRows.set(C1, { id: C1, state: 'failed', lastRefreshed: null }); // not a root
+	refreshRows.set('all', { id: 'all', lastRefreshed: now - 1_000 });
+
+	assert.deepEqual(await sitemapHealth(now), {
+		roots: 2,
+		lastSuccessAgeH: 30,
+		neverOk: 0,
+		failing: 1,
+		failedChildren: 2,
+	});
+	refreshRows.set(OTHER, { id: OTHER, state: 'running', lastRefreshed: null });
+	assert.equal((await sitemapHealth(now)).neverOk, 1, 'a root with no completed walk on record');
+
+	configure({ sitemap: { node: '' } });
+	assert.equal(await sitemapHealth(now), null, 'no walk is scheduled, so none is expected to succeed');
+});
+
+test('a walk that another walk overtook keeps the newer completion, not the one it started with', async () => {
+	const first = await trackedWalk({ [ROOT]: index(C1, C2), [C1]: urlset(P(1)), [C2]: urlset(P(2)) });
+	let open;
+	fetchGate = { url: C2, opened: new Promise((resolve) => (open = resolve)) };
+	try {
+		const from = refreshPuts.length;
+		documents = { [ROOT]: index(C1, C2), [C1]: urlset(P(1)) }; // C2 now fails, so the walk ends as it began
+		await startSitemapRefreshInBackground(ROOT);
+		for (let i = 0; i < 200 && !fetchLog.some((f) => f.url === C2 && refreshPuts.length > from); i++) await sleep(5);
+		// Meanwhile a walk that took over this root completed.
+		const newer = new Date(first.lastRefreshed.getTime() + 60_000);
+		refreshRows.set(ROOT, { ...refreshRows.get(ROOT), lastRefreshed: newer });
+		open();
+		for (let i = 0; i < 400 && !refreshPuts.slice(from).some((put) => put.state !== 'running'); i++) await sleep(5);
+		const afterRelease = refreshPuts
+			.slice(from)
+			.filter((put) => put.state === 'running')
+			.at(-1);
+		assert.ok(afterRelease, 'a progress write after the gate opened');
+		assert.equal(afterRelease.lastRefreshed, newer, 'restated the newer completion, not its own stale copy');
+	} finally {
+		fetchGate = null;
+	}
 });
