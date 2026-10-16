@@ -558,8 +558,9 @@ export default class RenderWorker {
 			cpu.workerCores !== null && avgConcurrent > 0 ? Number((cpu.workerCores / avgConcurrent).toFixed(3)) : null;
 
 		// Every render-failure bucket except our own teardown (`shutdownAborted` is a rollout, not a render
-		// regression). Summed rather than listed: the listed sum went stale when navTimeout was split out of
-		// `timeout`, and `failures` read 0 while navigations were timing out.
+		// regression), so `failures` = `completed` − `succeeded` − `shutdownAborted`. Summed rather than
+		// listed: the listed sum went stale when navTimeout was split out of `timeout`, and `failures` read 0
+		// while navigations were timing out.
 		const { shutdownAborted, ...renderFailures } = s.failures;
 		const failuresTotal = Object.values(renderFailures).reduce((sum, n) => sum + n, 0);
 
@@ -876,8 +877,13 @@ export default class RenderWorker {
 				await this.renderVariant(variant, session);
 				attempted.push(variant);
 			} catch (e) {
+				// A failed render like any other: in `completed` as well as its failure bucket, so a pod
+				// whose Chrome will not start shows up in the failure share instead of reading as idle
+				// (`completed` = `succeeded` + every failure bucket + `shutdownAborted`). Only the variants
+				// after it go unattempted.
+				this.stats.completed++;
 				this.stats.failures.getPageFailed++;
-				const skipped = variants.length - attempted.length;
+				const skipped = variants.length - attempted.length - 1;
 				this.stats.variantsSkipped += skipped;
 				logger.error(
 					{ id: job.id, deviceType: variant.deviceType, skipped, err: e },

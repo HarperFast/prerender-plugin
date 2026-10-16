@@ -6,6 +6,8 @@ import RenderWorker from '../dist/Worker.js';
 import RenderJob from '../dist/RenderJob.js';
 import { resolveSettings } from '../dist/settings.js';
 
+type StatsView = { completed: number; succeeded: number; variantsSkipped: number; failures: Record<string, number> };
+
 // The worker's render loop over a multi-device job (plugin >= 0.66.0): every device rendered in
 // turn on the job's one slot, each on a page of its own, then ONE result posted — partial when
 // the lease runs short between variants. Driven with a stub browser and a fake queue endpoint, so
@@ -211,6 +213,12 @@ test('a browser that cannot be relaunched between variants still posts what alre
 		await worker.destroy();
 	}
 
+	// The variant that could not start is a failed render: counted, not skipped.
+	const stats = (worker as unknown as { stats: StatsView }).stats;
+	assert.deepEqual(
+		[stats.completed, stats.succeeded, stats.failures.getPageFailed, stats.variantsSkipped],
+		[2, 1, 1, 0]
+	);
 	assert.deepEqual(seen, ['desktop'], 'only the first variant ran');
 	assert.equal(posted.length, 1, 'the completed render was posted rather than discarded');
 	assert.deepEqual(posted[0].deviceTypes, ['desktop', 'mobile'], 'the job still reports what it was asked for');
@@ -236,4 +244,7 @@ test('a first variant that cannot start still rejects, exactly as a single-devic
 		await worker.destroy();
 	}
 	assert.equal(posted.length, 0);
+	// Counted as a failed render, so a pod whose Chrome will not start reads as failing, not idle.
+	const stats = (worker as unknown as { stats: StatsView }).stats;
+	assert.deepEqual([stats.completed, stats.failures.getPageFailed, stats.variantsSkipped], [1, 1, 1]);
 });
