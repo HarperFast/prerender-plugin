@@ -69,8 +69,10 @@ const TICK_DELAY_MS = 250;
  *   req                          bot requests that reached the handler
  *   cache … entity               what answered it (`bot_serve` source)
  *   s2xx … s5xx                  the status class sent
- *   own5xx                       5xx this plugin produced itself: the handler failed, or a stored answer was a 5xx.
- *                                The rest of s5xx is the origin's own error, relayed live.
+ *   own5xx                       5xx this plugin produced itself: the handler failed, or a stored answer was a 5xx
+ *   originUnreachable            the origin could not be reached at all (refused, reset, timed out before a status),
+ *                                so the handler answered 500. Not own5xx: the origin is down, or this node's way to it.
+ *                                s5xx − own5xx − originUnreachable is the origin's own 5xx, relayed live.
  *   truncated                    a committed 200 whose cached body failed while streaming
  *   over1s, over3s               response headers took longer than 1s / 3s
  *   ageOver1x, ageOver2x         a served snapshot older than 1× / 2× its route's render interval
@@ -88,6 +90,7 @@ export const NODE_FIELDS = Object.freeze([
 	's4xx',
 	's5xx',
 	'own5xx',
+	'originUnreachable',
 	'truncated',
 	'over1s',
 	'over3s',
@@ -102,6 +105,7 @@ export const ROUTE_FIELDS = Object.freeze([
 	's4xx',
 	's5xx',
 	'own5xx',
+	'originUnreachable',
 	'over3s',
 	'ageOver1x',
 	'ageOver2x',
@@ -152,10 +156,20 @@ const routeBase = (slot) => NODE_FIELDS.length + slot * ROUTE_FIELDS.length;
  * @param {number} serve.status       the status sent
  * @param {number} serve.ms           handler time to the response
  * @param {boolean} serve.failed      the handler itself failed (its 500)
+ * @param {boolean} [serve.originUnreachable] …because the origin fetch failed before any status arrived
  * @param {number} [serve.ageMs]      a served snapshot's age
  * @param {number} [serve.intervalMs] that snapshot's route render interval
  */
-export const countServe = ({ route, source, status, ms, failed = false, ageMs, intervalMs }) => {
+export const countServe = ({
+	route,
+	source,
+	status,
+	ms,
+	failed = false,
+	originUnreachable = false,
+	ageMs,
+	intervalMs,
+}) => {
 	if (!config.health.enabled) return;
 	try {
 		const { view, slots, names } = currentLayout();
@@ -172,9 +186,13 @@ export const countServe = ({ route, source, status, ms, failed = false, ageMs, i
 		if (statusClass === 4) add(base + R.s4xx);
 		if (statusClass === 5) {
 			add(base + R.s5xx);
-			// Relayed means the live origin answered this 5xx. Everything else is ours: a handler failure,
-			// or a stored or rendered answer that carried one.
-			if (failed || source !== 'origin') {
+			// Three causes, kept apart because they have different owners: the origin never answered (its
+			// outage, or this node's path to it); the live origin answered a 5xx, relayed; or ours — a handler
+			// failure, or a stored or rendered answer that carried one.
+			if (failed && originUnreachable) {
+				add(N.originUnreachable);
+				add(base + R.originUnreachable);
+			} else if (failed || source !== 'origin') {
 				add(N.own5xx);
 				add(base + R.own5xx);
 			}

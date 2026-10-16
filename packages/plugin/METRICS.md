@@ -563,21 +563,22 @@ node, has stopped. The counts are kept in shared memory, not read from analytics
 window; never average them. A process restart loses up to one interval of counts; a worker restart
 loses nothing.
 
-| Field                                                     | Meaning                                                                                                                                                           |
-| --------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `v`, `span`, `up`                                         | Plugin version, seconds this line covers, process uptime in seconds.                                                                                              |
-| `bot.req`                                                 | Bot requests that reached the handler.                                                                                                                            |
-| `bot.cache` `rendered` `origin` `raw` `negative` `entity` | What answered (`bot_serve` source). `origin` is the live origin; everything else spared it.                                                                       |
-| `bot.s2xx` … `bot.s5xx`                                   | Status class sent.                                                                                                                                                |
-| `bot.own5xx`                                              | 5xx this plugin produced: the handler failed, or a stored or rendered answer carried one. The rest of `s5xx` is the origin's own error, relayed live.             |
-| `bot.truncated`                                           | A committed 200 whose cached body failed while streaming (the `blob delivery error` log line).                                                                    |
-| `bot.over1s`, `bot.over3s`                                | Response headers took longer than 1 s / 3 s.                                                                                                                      |
-| `bot.ageOver1x`, `bot.ageOver2x`                          | A served snapshot older than 1× / 2× its route's `renderInterval` (else `render.defaultInterval`).                                                                |
-| `routes["<path>"]`                                        | `req`, `origin`, `s4xx`, `s5xx`, `own5xx`, `over3s`, `ageOver1x`, `ageOver2x` per prerender route path; `other` holds passthrough, unclassified and unrouted.     |
-| `keeper.*`                                                | `ok` (1 while the queue keeper is live and its heartbeat fresh), `live`, `ageS` (heartbeat age), `ready` (ready-set depth).                                       |
-| `probe.*`                                                 | Null while the change probe is off. `lastPassAgeH` (hours since the last completed sweep began), `running`, `lastFailed`, `disarmed` (fields the guard disarmed). |
-| `sitemap.*`                                               | Null unless `sitemap.node` pins the scheduled walk. `roots`, `lastSuccessAgeH` (the least recently completed root), `neverOk`, `failing`.                         |
-| `err` (on failure)                                        | Present only when a state section failed or took over 5 s; that section is null.                                                                                  |
+| Field                                                     | Meaning                                                                                                                                                                                                                                    |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `v`, `span`, `up`                                         | Plugin version, seconds this line covers, process uptime in seconds.                                                                                                                                                                       |
+| `bot.req`                                                 | Bot requests that reached the handler.                                                                                                                                                                                                     |
+| `bot.cache` `rendered` `origin` `raw` `negative` `entity` | What answered (`bot_serve` source). `origin` is the live origin; everything else spared it.                                                                                                                                                |
+| `bot.s2xx` … `bot.s5xx`                                   | Status class sent.                                                                                                                                                                                                                         |
+| `bot.own5xx`                                              | 5xx this plugin produced: the handler failed, or a stored or rendered answer carried one.                                                                                                                                                  |
+| `bot.originUnreachable`                                   | The origin could not be reached at all (refused, reset, timed out before a status), so the handler answered 500: the origin is down, or this node's path to it. `s5xx − own5xx − originUnreachable` is the origin's own 5xx, relayed live. |
+| `bot.truncated`                                           | A committed 200 whose cached body failed while streaming (the `blob delivery error` log line).                                                                                                                                             |
+| `bot.over1s`, `bot.over3s`                                | Response headers took longer than 1 s / 3 s.                                                                                                                                                                                               |
+| `bot.ageOver1x`, `bot.ageOver2x`                          | A served snapshot older than 1× / 2× its route's `renderInterval` (else `render.defaultInterval`).                                                                                                                                         |
+| `routes["<path>"]`                                        | `req`, `origin`, `s4xx`, `s5xx`, `own5xx`, `originUnreachable`, `over3s`, `ageOver1x`, `ageOver2x` per prerender route path; `other` holds passthrough, unclassified and unrouted.                                                         |
+| `keeper.*`                                                | `ok` (1 while the queue keeper is live and its heartbeat fresh), `live`, `ageS` (heartbeat age), `ready` (ready-set depth).                                                                                                                |
+| `probe.*`                                                 | Null while the change probe is off. `lastPassAgeH` (hours since the last completed sweep began), `running`, `lastFailed`, `disarmed` (fields the guard disarmed).                                                                          |
+| `sitemap.*`                                               | Null unless `sitemap.node` pins the scheduled walk. `roots`, `lastSuccessAgeH` (the least recently completed root), `neverOk`, `failing`.                                                                                                  |
+| `err` (on failure)                                        | Present only when a state section failed or took over 5 s; that section is null.                                                                                                                                                           |
 
 **Level.** `health.level` (default `notify`). Some hosts forward only `warn` and above from components to
 their log shipper; set `warn` there, or the line never leaves the node.
@@ -594,7 +595,7 @@ sum by (node) (sum_over_time({service="harperdb"} |= "[prerender] health {"
 **What to alert on** (thresholds from a week of your own lines, per node unless noted):
 
 - the share of `bot.req` not answered by `origin` falling well below the same window a week earlier;
-- `own5xx` above zero for a sustained window, and the `s5xx` share (the relayed part is the origin's);
+- `own5xx` above zero for a sustained window, and the `s5xx` share; `originUnreachable` and the relayed part are the origin's;
 - `keeper.ok` 0 for 15 minutes;
 - cluster-wide `bot.req` collapsing against a week earlier (the CDN stopped sending crawlers);
 - the `over3s`, 4xx and `ageOver2x` shares rising;

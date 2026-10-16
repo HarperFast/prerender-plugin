@@ -369,6 +369,16 @@ const publicLocation = (location, base) => {
 	}
 };
 
+// The errors `fetchOriginResource` threw because the origin could not be reached at all (refused, reset,
+// timed out before a status). The bot handler answers those with a 500 of its own, and the health line
+// (util/health.js) must not file the origin being down as this plugin failing. Held weakly: an error is
+// looked up once, by the handler that caught it, and then forgotten.
+const originFetchFailures = new WeakSet();
+
+/** Did `error` come from the origin fetch itself failing — no status ever arrived? */
+export const isOriginFetchFailure = (error) =>
+	error !== null && typeof error === 'object' && originFetchFailures.has(error);
+
 export const fetchOriginResource = async (request) => {
 	const { url, deviceType, method = 'GET', body, stripValidators = false, reason = 'other', userAgent } = request;
 	const headers = request.headers.asObject;
@@ -396,6 +406,7 @@ export const fetchOriginResource = async (request) => {
 		});
 	} catch (e) {
 		metrics.originFetch(performance.now() - fetchStarted, 0, reason);
+		if (e !== null && typeof e === 'object') originFetchFailures.add(e);
 		throw e;
 	}
 	metrics.originFetch(performance.now() - fetchStarted, response.statusCode, reason);

@@ -15,7 +15,7 @@ import {
 } from '../util/routeClass.js';
 import { Target } from '../resources/Target.js';
 import { QueueState } from '../resources/QueueState.js';
-import { fetchOriginResource } from '../util/upstream.js';
+import { fetchOriginResource, isOriginFetchFailure } from '../util/upstream.js';
 import { PrerenderedPage } from '../resources/PrerenderedPage.js';
 import { resolveServingPolicy, pollForFreshRender } from '../util/renderNow.js';
 import { resolveServeStatus } from '../util/pageFreshness.js';
@@ -60,6 +60,7 @@ export async function handleBotRequest(request) {
 	let resolved = null;
 	let sent = null;
 	let failed = false;
+	let originUnreachable = false;
 
 	try {
 		const target = resolveBotTarget(request);
@@ -148,6 +149,7 @@ export async function handleBotRequest(request) {
 		return response;
 	} catch (e) {
 		failed = true;
+		originUnreachable = isOriginFetchFailure(e);
 		logger.error(e);
 		// A 500 this handler answered is a visit like any other: a URL-stable sample that skipped it would
 		// read as a longer gap between visits.
@@ -157,7 +159,12 @@ export async function handleBotRequest(request) {
 			status: 500,
 		};
 	} finally {
-		countHealth(sampleInfo, resolved, failed ? 500 : sent?.status, performance.now() - startedAt, failed);
+		countHealth(sampleInfo, resolved, {
+			status: failed ? 500 : sent?.status,
+			ms: performance.now() - startedAt,
+			failed,
+			originUnreachable,
+		});
 	}
 }
 
@@ -166,7 +173,7 @@ export async function handleBotRequest(request) {
  * `analytics.enabled` gates. The route label is `route_serve`'s. A served snapshot's age is judged against
  * its route's `renderInterval`, else `render.defaultInterval`: the cadence the route promises.
  */
-function countHealth(info, resource, status, ms, failed) {
+function countHealth(info, resource, { status, ms, failed, originUnreachable }) {
 	// Called from a `finally`: a throw here would replace the response already built with an error.
 	try {
 		const source = info?.source ?? null;
@@ -177,6 +184,7 @@ function countHealth(info, resource, status, ms, failed) {
 			status,
 			ms,
 			failed,
+			originUnreachable,
 			ageMs: snapshot ? Date.now() - new Date(resource.lastCached).getTime() : undefined,
 			intervalMs: info?.route?.renderInterval ?? config.render.defaultInterval,
 		});

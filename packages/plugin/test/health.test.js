@@ -6,8 +6,8 @@ import { Worker } from 'node:worker_threads';
  * The health line (util/health.js): one `[prerender] health {json}` line per node per interval.
  *
  * Pinned here:
- *   - each answered request lands in the right node and route fields, and a 5xx is "own" unless the live
- *     origin answered it;
+ *   - each answered request lands in the right node and route fields, and a 5xx is filed by cause: the live
+ *     origin's (relayed), the origin unreachable, or ours;
  *   - a line drains what it reports, so consecutive lines never count a request twice;
  *   - exactly one worker writes each boundary, and the counts stay exact when real threads add and drain
  *     the same shared memory at once;
@@ -76,20 +76,23 @@ test('each answered request lands in its node and route fields', async () => {
 	countServe({ route: '/search/', source: 'origin', status: 404, ms: 1200 }); // passthrough → other
 	countServe({ route: 'unrouted', source: null, status: 500, ms: 2, failed: true }); // the handler failed
 	countServe({ route: '/a/', source: 'negative', status: 404, ms: 3 });
+	// The origin never answered and the handler failed on it: neither ours nor relayed.
+	countServe({ route: '/b/', source: 'origin', status: 500, ms: 9, failed: true, originUnreachable: true });
 
 	const { bot, routes } = await health.buildHealthLine();
 	assert.deepEqual(bot, {
 		...zeros(health.NODE_FIELDS),
-		req: 8,
+		req: 9,
 		cache: 2,
 		rendered: 1,
-		origin: 2 + 1,
+		origin: 2 + 1 + 1,
 		negative: 1,
 		s2xx: 2,
 		s3xx: 1,
 		s4xx: 2,
-		s5xx: 3,
+		s5xx: 4,
 		own5xx: 2,
+		originUnreachable: 1,
 		over1s: 3,
 		over3s: 1,
 		ageOver1x: 2,
@@ -104,7 +107,15 @@ test('each answered request lands in its node and route fields', async () => {
 		ageOver1x: 2,
 		ageOver2x: 1,
 	});
-	assert.deepEqual(routes['/b/'], { ...zeros(health.ROUTE_FIELDS), req: 2, origin: 1, s5xx: 2, own5xx: 1, over3s: 1 });
+	assert.deepEqual(routes['/b/'], {
+		...zeros(health.ROUTE_FIELDS),
+		req: 3,
+		origin: 2,
+		s5xx: 3,
+		own5xx: 1,
+		originUnreachable: 1,
+		over3s: 1,
+	});
 	assert.deepEqual(routes.other, { ...zeros(health.ROUTE_FIELDS), req: 2, origin: 1, s4xx: 1, s5xx: 1, own5xx: 1 });
 });
 
