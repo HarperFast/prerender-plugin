@@ -43,6 +43,16 @@ import {
 
 const mutex = getMutex('render_queue');
 
+// A thread Harper has just started can take a claim or a result before its `coordination` database is
+// loaded, and every lease lives there. Answered 503 with a short Retry-After, which the fleet backs off
+// from and retries, rather than a TypeError's 500, which it logs as an error.
+const coordinationLoaded = () => !!databases.coordination?.SharedBuffer;
+const notLoadedYet = () =>
+	new Response(JSON.stringify({ error: 'the coordination database is not loaded on this thread yet' }), {
+		status: 503,
+		headers: { 'content-type': 'application/json; charset=utf-8', 'retry-after': '2' },
+	});
+
 // Browsers ≥ v1.16.0 post `outcome` — the single field result handling keys on: 'rendered'
 // (content present; a rendered-through client-side redirect is still a rendered page),
 // 'redirected' (ended at navigation, no content), 'non-indexable' (the page said don't), or
@@ -594,6 +604,9 @@ export class RenderQueue extends Resource {
 				headers: { 'content-type': 'application/json; charset=utf-8' },
 			});
 		}
+
+		// Before the lease is read, so nothing is released and the fleet's retry finds it as it was.
+		if (!coordinationLoaded()) return notLoadedYet();
 
 		// THE key the lease was granted under. Everything below is keyed off the job description built
 		// from it rather than off this string, so nothing can re-point it (the redirect refile used to
@@ -1618,7 +1631,8 @@ export class RenderQueue extends Resource {
 	 * THE RESPONSE SHAPE IS A CONTRACT: HTTP 200 with a bare JSON array, `[]` when there is
 	 * nothing to grant. The render fleet's consumer treats only 200 as success and immediately
 	 * `.map`s the body — a 204, an object wrapper, or a new status code circuit-breaks a
-	 * perfectly healthy node.
+	 * perfectly healthy node. The one other answer is a 503 with Retry-After while this thread has
+	 * not loaded the `coordination` database (just started), which the fleet backs off from briefly.
 	 *
 	 * Jobs come from the ready set the queue keeper publishes, each checked against its durable row
 	 * and leased exclusively (`claimSchedules`). No mutex: nothing here needs serializing, so claims on
@@ -1633,6 +1647,7 @@ export class RenderQueue extends Resource {
 		if (QueueState.status === 'paused') {
 			return [];
 		}
+		if (!coordinationLoaded()) return notLoadedYet();
 
 		// Bound the batch server-side so no consumer can over-claim a burst other renderers should share.
 		limit = Math.min(Math.max(1, limit | 0), config.queue.maxClaimLimit);
