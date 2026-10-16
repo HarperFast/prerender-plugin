@@ -9,6 +9,7 @@ import { Worker } from 'node:worker_threads';
  *   - each answered request lands in the right node and route fields, and a 5xx is filed by cause: the live
  *     origin's (relayed), the origin unreachable, or ours;
  *   - a line drains what it reports, so consecutive lines never count a request twice;
+ *   - the first line on a new buffer spans from when the first worker started, not from process start;
  *   - exactly one worker writes each boundary, and the counts stay exact when real threads add and drain
  *     the same shared memory at once;
  *   - a state section that throws or hangs is written as null and named in `err`, never holding the line;
@@ -131,6 +132,20 @@ test('a line drains what it reports: the next one starts from zero, and span cov
 	const second = await health.buildHealthLine(Date.now() + 60_000);
 	assert.deepEqual(second.bot, zeros(health.NODE_FIELDS));
 	assert.ok(second.span >= 59 && second.span <= 61, `span ${second.span}s`);
+});
+
+test('on a new buffer, span counts from the first worker to start, not from process start', async (t) => {
+	// A worker restart days into the process's life, onto a buffer no worker held through it.
+	const startedAt = Date.now() + 10 * 24 * H;
+	t.mock.timers.enable({ apis: ['Date'], now: startedAt });
+	t.after(() => health.resetHealthForTest());
+	health.resetHealthClockForTest();
+	health.startHealthLine({});
+	// A second worker, starting a minute later, leaves the first one's mark.
+	health.resetHealthForTest();
+	t.mock.timers.tick(60_000);
+	health.startHealthLine({});
+	assert.equal((await health.buildHealthLine(startedAt + 120_000)).span, 120);
 });
 
 test('nothing is counted while the line is disabled', async () => {

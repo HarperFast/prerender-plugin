@@ -36,10 +36,11 @@
  * LEVEL. `health.level` (default `notify`). Some hosts forward only `warn` and above from components to
  * their log shipper; set `warn` there, or the line never leaves the node.
  *
- * Process restarts zero the buffer, so up to one interval of counts is lost on a restart; `span` on the
- * first line after one says how long it covers. A worker restart loses nothing — the other workers hold
- * the buffer — unless it also changes the route table: the new workers never knew the old layout, so
- * nothing folds it in (a live change does, see `buildLayout`).
+ * Process restarts zero the buffer, so up to one interval of counts is lost on a restart. The first worker
+ * to start on a new buffer — after a process restart, or a worker restart no worker held it through —
+ * stamps it, so the first line's `span` covers what was counted, not the process's uptime. A worker
+ * restart loses nothing — the other workers hold the buffer — unless it also changes the route table: the
+ * new workers never knew the old layout, so nothing folds it in (a live change does, see `buildLayout`).
  */
 
 import { createHash } from 'node:crypto';
@@ -265,11 +266,12 @@ export const countTruncated = () => {
 // ---- the line ------------------------------------------------------------------------------------------
 
 let clock = null;
-// [0] the last boundary a worker claimed, [1] when the counters were last drained (both epoch ms).
+// [0] the last boundary a worker claimed, [1] when the counters were last drained, or first started
+// (both epoch ms).
 const clockView = () => (clock ??= new BigInt64Array(getSab(CLOCK_KEY, 2 * BigInt64Array.BYTES_PER_ELEMENT)));
 
-// When this process started, for the `span` of its first line.
-const PROCESS_STARTED_AT = Date.now() - Math.round(process.uptime() * 1000);
+// The `span` mark when no worker stamped one (tests): when this module loaded.
+const LOADED_AT = Date.now();
 
 /** Claim `boundaryMs` for this worker. True for exactly one worker per boundary across the node. */
 const claimBoundary = (boundaryMs) => {
@@ -287,7 +289,7 @@ const drain = (nowMs) => {
 	const { view, names } = currentLayout();
 	const counts = Array.from(view, (_, i) => Atomics.exchange(view, i, 0));
 	const last = Number(Atomics.exchange(clockView(), 1, BigInt(nowMs)));
-	const span = Math.max(0, Math.round((nowMs - (last > 0 ? last : PROCESS_STARTED_AT)) / 1000));
+	const span = Math.max(0, Math.round((nowMs - (last > 0 ? last : LOADED_AT)) / 1000));
 
 	const bot = Object.fromEntries(NODE_FIELDS.map((field, i) => [field, counts[i]]));
 	const routes = {};
@@ -362,7 +364,7 @@ let timer = null;
 const arm = () => {
 	if (timer) clearTimeout(timer);
 	timer = null;
-	if (!config.health.enabled) return;
+	if (!started || !config.health.enabled) return;
 	const interval = config.health.interval;
 	const now = Date.now();
 	const boundary = (Math.floor(now / interval) + 1) * interval;
@@ -390,6 +392,12 @@ export const startHealthLine = (providers = {}) => {
 	if (started) return;
 	started = true;
 	stateProviders = providers;
+	// The first line's `span` starts here: the first worker on a new buffer stamps it, later ones leave it.
+	try {
+		Atomics.compareExchange(clockView(), 1, 0n, BigInt(Date.now()));
+	} catch {
+		// Not worth failing the worker's start over: `span` falls back to LOADED_AT.
+	}
 	arm();
 	onConfigApplied(arm);
 };
