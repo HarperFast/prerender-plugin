@@ -557,12 +557,13 @@ export default class RenderWorker {
 		const coresPerRender =
 			cpu.workerCores !== null && avgConcurrent > 0 ? Number((cpu.workerCores / avgConcurrent).toFixed(3)) : null;
 
-		const failuresTotal =
-			s.failures.timeout +
-			s.failures.protocol +
-			s.failures.tooManyRedirects +
-			s.failures.getPageFailed +
-			s.failures.other;
+		// Every render-failure bucket except our own teardown (`shutdownAborted` is a rollout, not a render
+		// regression). Summed rather than listed: the listed sum went stale when navTimeout was split out of
+		// `timeout`, and `failures` read 0 while navigations were timing out.
+		const failuresTotal = Object.entries(s.failures).reduce(
+			(sum, [bucket, n]) => (bucket === 'shutdownAborted' ? sum : sum + n),
+			0
+		);
 
 		const mem = process.memoryUsage();
 		const readinessFailing = this.drift?.failing();
