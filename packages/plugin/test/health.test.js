@@ -59,6 +59,7 @@ before(async () => {
 
 beforeEach(async () => {
 	applyOptions(OPTIONS);
+	health.resetHealthClockForTest();
 	health.setHealthProvidersForTest({});
 	await health.buildHealthLine(); // drain whatever an earlier test left
 	logged.length = 0;
@@ -78,20 +79,22 @@ test('each answered request lands in its node and route fields', async () => {
 	countServe({ route: '/a/', source: 'negative', status: 404, ms: 3 });
 	// The origin never answered and the handler failed on it: neither ours nor relayed.
 	countServe({ route: '/b/', source: 'origin', status: 500, ms: 9, failed: true, originUnreachable: true });
+	// An answer this plugin made up (render-now's timeout 504) is ours, although its source reads origin.
+	countServe({ route: '/a/', source: 'origin', status: 504, ms: 2, madeHere: true });
 
 	const { bot, routes } = await health.buildHealthLine();
 	assert.deepEqual(bot, {
 		...zeros(health.NODE_FIELDS),
-		req: 9,
+		req: 10,
 		cache: 2,
 		rendered: 1,
-		origin: 2 + 1 + 1,
+		origin: 2 + 1 + 1 + 1,
 		negative: 1,
 		s2xx: 2,
 		s3xx: 1,
 		s4xx: 2,
-		s5xx: 4,
-		own5xx: 2,
+		s5xx: 5,
+		own5xx: 3,
 		originUnreachable: 1,
 		over1s: 3,
 		over3s: 1,
@@ -101,9 +104,11 @@ test('each answered request lands in its node and route fields', async () => {
 	assert.deepEqual(Object.keys(routes), ['/a/', '/b/', health.OTHER_ROUTE], 'prerender routes, then other');
 	assert.deepEqual(routes['/a/'], {
 		...zeros(health.ROUTE_FIELDS),
-		req: 4,
-		origin: 1,
+		req: 5,
+		origin: 2,
 		s4xx: 1,
+		s5xx: 1,
+		own5xx: 1,
 		ageOver1x: 2,
 		ageOver2x: 1,
 	});
@@ -202,6 +207,24 @@ test('a live route change re-lays the counters: new routes get their own fields,
 	assert.deepEqual(Object.keys(routes), ['/a/', '/b/', '/c/', 'other']);
 	assert.equal(routes['/c/'].req, 1);
 	assert.equal(routes.other.req, 1);
+});
+
+test('a live route change carries the counts made before it, and a change back finds nothing stale', async () => {
+	for (let i = 0; i < 100; i++)
+		health.countServe({ route: i % 2 ? '/a/' : '/b/', source: 'cache', status: 200, ms: 1 });
+	// `/b/` goes, `/c/` arrives.
+	const changed = [ROUTES[0], { match: 'prefix', path: '/c/', mode: 'prerender' }, ROUTES[2]];
+	applyOptions({ ...OPTIONS, ingress: { ...OPTIONS.ingress, routes: changed } });
+	health.countServe({ route: '/c/', source: 'cache', status: 200, ms: 1 });
+
+	const { bot, routes } = await health.buildHealthLine();
+	assert.equal(bot.req, 101, 'nothing counted before the change is lost');
+	assert.equal(routes['/a/'].req, 50, 'a route that stayed keeps its counts');
+	assert.equal(routes.other.req, 50, 'a route that went is folded into other');
+	assert.equal(routes['/c/'].req, 1);
+
+	applyOptions(OPTIONS);
+	assert.equal((await health.buildHealthLine()).bot.req, 0, 'the old layout comes back empty');
 });
 
 test('a long route table folds its tail into other instead of growing the line without bound', async () => {

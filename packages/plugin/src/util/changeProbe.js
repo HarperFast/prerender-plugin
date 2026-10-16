@@ -3416,8 +3416,11 @@ export const probeHealth = async (nowMs = Date.now()) => {
 	const last = sweep?.lastRun ?? null;
 	const completed = [epochMsOf(sweep?.completedArmedOrigin)];
 	if (config.changeProbe.dryRun === true) completed.push(epochMsOf(sweep?.completedDryOrigin));
-	// A row written before those fields existed: the last pass, if it ended cleanly.
-	if (!completed.some(Number.isFinite) && last && !last.error && !last.aborted) {
+	// A row written before those fields existed: the last pass, if it ended cleanly — and, like
+	// `anchorServedSince`, a dry one only while dry runs serve.
+	const lastServes =
+		last && !last.error && !last.aborted && (last.dryRun !== true || config.changeProbe.dryRun === true);
+	if (!completed.some(Number.isFinite) && lastServes) {
 		completed.push(epochMsOf(last.resumedFrom ?? last.startedAt));
 	}
 	const origin = Math.max(...completed.filter(Number.isFinite));

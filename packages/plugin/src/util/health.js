@@ -69,7 +69,8 @@ const TICK_DELAY_MS = 250;
  *   req                          bot requests that reached the handler
  *   cache … entity               what answered it (`bot_serve` source)
  *   s2xx … s5xx                  the status class sent
- *   own5xx                       5xx this plugin produced itself: the handler failed, or a stored answer was a 5xx
+ *   own5xx                       5xx this plugin produced itself: the handler failed, it made the answer up (render-now's
+ *                                timeout 504), or a stored or rendered answer carried a 5xx
  *   originUnreachable            the origin could not be reached at all (refused, reset, timed out before a status),
  *                                so the handler answered 500. Not own5xx: the origin is down, or this node's way to it.
  *                                s5xx − own5xx − originUnreachable is the origin's own 5xx, relayed live.
@@ -114,15 +115,27 @@ export const ROUTE_FIELDS = Object.freeze([
 const N = Object.fromEntries(NODE_FIELDS.map((field, i) => [field, i]));
 const R = Object.fromEntries(ROUTE_FIELDS.map((field, i) => [field, i]));
 const SOURCES = new Set(['cache', 'rendered', 'origin', 'raw', 'negative', 'entity']);
+// The node field for each status class, by `Math.floor(status / 100)`.
+const STATUS_FIELD = [undefined, undefined, N.s2xx, N.s3xx, N.s4xx, N.s5xx];
 
 // ---- the counters --------------------------------------------------------------------------------------
 
 let layout = null;
+// The layout a config apply replaced, until this worker builds the next one and folds it in.
+let retired = null;
 
 /**
  * The buffer layout for the current route table: node fields, then one block per prerender route, then
  * `other`. Keyed by a fingerprint of the layout, so a live route change starts a fresh buffer instead of
- * reading counts into the wrong routes; the old one is released once this worker stops using it.
+ * reading counts into the wrong routes.
+ *
+ * THE OLD BUFFER IS FOLDED IN, NOT ABANDONED. Each worker moves to the new key on its own next use, and
+ * when it does it drains the old buffer into the new one — node fields as they are, each route block into
+ * the route of the same name, else `other`. Abandoned, the old buffer would lose everything counted since
+ * the last line while `span` still claimed the whole interval, and a route table changed back would find
+ * it again, stale counts and all. Draining it is exact however the workers interleave: the first to switch
+ * moves every count so far, each later one moves what it added since, and the last leaves it empty before
+ * releasing it.
  */
 const buildLayout = () => {
 	const paths = prerenderRoutePaths().slice(0, MAX_ROUTES);
@@ -134,14 +147,33 @@ const buildLayout = () => {
 		.slice(0, 16);
 	const key = `${COUNTS_PREFIX}${fingerprint}`;
 	const view = new Int32Array(getSab(key, cells * Int32Array.BYTES_PER_ELEMENT));
+	const next = { key, names, slots: new Map(paths.map((path, slot) => [path, slot])), view };
+	if (retired && retired.key !== key) foldInto(retired, next);
+	retired = null;
 	releaseSabs((held) => held.startsWith(COUNTS_PREFIX) && held !== key);
-	return { key, names, slots: new Map(paths.map((path, slot) => [path, slot])), view };
+	return next;
+};
+
+/** Drain every count in `from` into `to`, route blocks by route name (`other` when `to` has no such route). */
+const foldInto = (from, to) => {
+	const move = (fromIndex, toIndex) => {
+		const count = Atomics.exchange(from.view, fromIndex, 0);
+		if (count !== 0) Atomics.add(to.view, toIndex, count);
+	};
+	for (let i = 0; i < NODE_FIELDS.length; i++) move(i, i);
+	from.names.forEach((name, slot) => {
+		const target = routeBase(to.slots.get(name) ?? to.names.length - 1);
+		const source = routeBase(slot);
+		for (let i = 0; i < ROUTE_FIELDS.length; i++) move(source + i, target + i);
+	});
 };
 
 const currentLayout = () => (layout ??= buildLayout());
 
-// The route table, and so the layout, can change on any config apply.
+// The route table, and so the layout, can change on any config apply. Rebuilt on next use; a layout
+// replaced before this worker used the one after it is still the one holding its counts.
 onConfigApplied(() => {
+	if (layout) retired = layout;
 	layout = null;
 });
 
@@ -157,6 +189,7 @@ const routeBase = (slot) => NODE_FIELDS.length + slot * ROUTE_FIELDS.length;
  * @param {number} serve.ms           handler time to the response
  * @param {boolean} serve.failed      the handler itself failed (its 500)
  * @param {boolean} [serve.originUnreachable] …because the origin fetch failed before any status arrived
+ * @param {boolean} [serve.madeHere]  the answer is one this plugin made up (render-now's timeout 504), whatever its source
  * @param {number} [serve.ageMs]      a served snapshot's age
  * @param {number} [serve.intervalMs] that snapshot's route render interval
  */
@@ -167,6 +200,7 @@ export const countServe = ({
 	ms,
 	failed = false,
 	originUnreachable = false,
+	madeHere = false,
 	ageMs,
 	intervalMs,
 }) => {
@@ -174,42 +208,42 @@ export const countServe = ({
 	try {
 		const { view, slots, names } = currentLayout();
 		const base = routeBase(slots.get(route) ?? names.length - 1);
-		const add = (index) => Atomics.add(view, index, 1);
 
-		add(N.req);
-		add(base + R.req);
-		if (SOURCES.has(source)) add(N[source]);
-		if (source === 'origin') add(base + R.origin);
+		Atomics.add(view, N.req, 1);
+		Atomics.add(view, base + R.req, 1);
+		if (SOURCES.has(source)) Atomics.add(view, N[source], 1);
+		if (source === 'origin') Atomics.add(view, base + R.origin, 1);
 
 		const statusClass = Math.floor(Number(status) / 100);
-		if (statusClass >= 2 && statusClass <= 5) add(N[`s${statusClass}xx`]);
-		if (statusClass === 4) add(base + R.s4xx);
+		const statusField = STATUS_FIELD[statusClass];
+		if (statusField !== undefined) Atomics.add(view, statusField, 1);
+		if (statusClass === 4) Atomics.add(view, base + R.s4xx, 1);
 		if (statusClass === 5) {
-			add(base + R.s5xx);
+			Atomics.add(view, base + R.s5xx, 1);
 			// Three causes, kept apart because they have different owners: the origin never answered (its
 			// outage, or this node's path to it); the live origin answered a 5xx, relayed; or ours — a handler
-			// failure, or a stored or rendered answer that carried one.
+			// failure, an answer this plugin made up, or a stored or rendered one that carried a 5xx.
 			if (failed && originUnreachable) {
-				add(N.originUnreachable);
-				add(base + R.originUnreachable);
-			} else if (failed || source !== 'origin') {
-				add(N.own5xx);
-				add(base + R.own5xx);
+				Atomics.add(view, N.originUnreachable, 1);
+				Atomics.add(view, base + R.originUnreachable, 1);
+			} else if (failed || madeHere || source !== 'origin') {
+				Atomics.add(view, N.own5xx, 1);
+				Atomics.add(view, base + R.own5xx, 1);
 			}
 		}
 
-		if (ms > 1_000) add(N.over1s);
+		if (ms > 1_000) Atomics.add(view, N.over1s, 1);
 		if (ms > 3_000) {
-			add(N.over3s);
-			add(base + R.over3s);
+			Atomics.add(view, N.over3s, 1);
+			Atomics.add(view, base + R.over3s, 1);
 		}
 
 		if (ageMs >= 0 && intervalMs > 0 && ageMs > intervalMs) {
-			add(N.ageOver1x);
-			add(base + R.ageOver1x);
+			Atomics.add(view, N.ageOver1x, 1);
+			Atomics.add(view, base + R.ageOver1x, 1);
 			if (ageMs > 2 * intervalMs) {
-				add(N.ageOver2x);
-				add(base + R.ageOver2x);
+				Atomics.add(view, N.ageOver2x, 1);
+				Atomics.add(view, base + R.ageOver2x, 1);
 			}
 		}
 	} catch {
@@ -361,9 +395,16 @@ export const setHealthProvidersForTest = (providers) => {
 	stateProviders = providers;
 };
 
+/** Tests only: zero the shared clock, so a test's boundaries need not exceed an earlier test's. */
+export const resetHealthClockForTest = () => {
+	Atomics.store(clockView(), 0, 0n);
+	Atomics.store(clockView(), 1, 0n);
+};
+
 /** Tests only: forget the layout and clock, as a new process would. */
 export const resetHealthForTest = () => {
 	layout = null;
+	retired = null;
 	clock = null;
 	stateProviders = {};
 	if (timer) clearTimeout(timer);

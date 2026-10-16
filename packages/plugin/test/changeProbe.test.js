@@ -4568,7 +4568,7 @@ test('the sweep reports a page SERVED WRONG: since its render, or — when the o
 
 test('probeHealth: hours since the last completed pass began, a failed last pass, and the fields disarmed', async () => {
 	const { applyOptions } = await import('../src/config.js');
-	applyOptions({ changeProbe: { enabled: true, rules: [MAPPED_RULE] } });
+	applyOptions({ changeProbe: { enabled: true, dryRun: false, rules: [MAPPED_RULE] } });
 	const now = Date.now();
 	const guard = { pdp: { '0:title': { witnessed: 50, disagreed: 50, armed: false } } };
 	changeProbe.resetChangeProbeState();
@@ -4597,6 +4597,14 @@ test('probeHealth: hours since the last completed pass began, a failed last pass
 	changeProbe.resetChangeProbeState();
 	await changeProbe.publishProbeStateForTest({ sweep: { running: false, lastRun: { aborted: true, startedAt: 1 } } });
 	assert.equal((await changeProbe.probeHealth(now)).lastPassAgeH, null, 'no completed pass on record');
+	sharedRows.clear();
+	changeProbe.resetChangeProbeState();
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: false, lastRun: { dryRun: true, startedAt: now - HOUR, finishedAt: now } },
+	});
+	assert.equal((await changeProbe.probeHealth(now)).lastPassAgeH, null, 'an armed probe is not served by a dry run');
+	applyOptions({ changeProbe: { enabled: true, dryRun: true, rules: [MAPPED_RULE] } });
+	assert.equal((await changeProbe.probeHealth(now)).lastPassAgeH, 1, 'a dry probe is');
 
 	applyOptions({ changeProbe: { enabled: false } });
 	assert.equal(await changeProbe.probeHealth(now), null, 'nothing to report while the probe is off');

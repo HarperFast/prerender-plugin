@@ -185,6 +185,7 @@ function countHealth(info, resource, { status, ms, failed, originUnreachable }) 
 			ms,
 			failed,
 			originUnreachable,
+			madeHere: resource?.madeHere === true,
 			ageMs: snapshot ? Date.now() - new Date(resource.lastCached).getTime() : undefined,
 			intervalMs: info?.route?.renderInterval ?? config.render.defaultInterval,
 		});
@@ -921,7 +922,16 @@ async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeSc
 
 	if (fallback === 'error') {
 		return {
-			resource: { miss: true, statusCode: 504, url: String(url), deviceType, headers: {}, content: null },
+			// `madeHere`: the health line counts this 504 as the plugin's own, not a relayed origin error.
+			resource: {
+				miss: true,
+				statusCode: 504,
+				url: String(url),
+				deviceType,
+				headers: {},
+				content: null,
+				madeHere: true,
+			},
 			renderNowStatus: 'timeout',
 		};
 	}

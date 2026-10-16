@@ -23,6 +23,7 @@ const pages = new Map(); // cacheKey -> PrerenderedPage row
 const sitemapRows = new Map();
 const refreshRows = new Map(); // root url -> SitemapRefresh row
 const refreshPuts = []; // every SitemapRefresh.put, in order
+let fetchGate = null; // { url, opened }: that document's fetch waits until `opened` resolves
 const scheduleRows = new Map();
 const patches = []; // every Target.patch, in order
 const pagePatches = [];
@@ -185,6 +186,7 @@ before(async () => {
 	};
 	globalThis.fetch = async (url, init = {}) => {
 		fetchLog.push({ url, headers: { ...init.headers }, redirect: init.redirect, store: request.getStore() });
+		if (fetchGate?.url === url) await fetchGate.opened;
 		if (redirects[url]) return new Response(null, { status: 301, headers: { location: redirects[url] } });
 		const xml = documents[url];
 		if (xml === undefined) return new Response('unavailable', { status: 503, statusText: 'Service Unavailable' });
@@ -1340,13 +1342,47 @@ test('sitemapHealth reports the oldest root success, roots that never completed,
 	sitemapRows.set(OTHER, { url: OTHER });
 	sitemapRows.set(C1, { url: C1, parentUrl: ROOT });
 	refreshRows.set(ROOT, { id: ROOT, state: 'failed', lastRefreshed: new Date(now - 30 * 3_600_000) });
-	refreshRows.set(OTHER, { id: OTHER, state: 'running', lastRefreshed: null });
+	// Completed, though two of its children failed: a walk at index scale carries on past them.
+	refreshRows.set(OTHER, { id: OTHER, state: 'completed', lastRefreshed: new Date(now), failed: [{}, {}] });
 	refreshRows.set(`${HOST}/removed.xml`, { id: `${HOST}/removed.xml`, state: 'failed', lastRefreshed: null });
 	refreshRows.set(C1, { id: C1, state: 'failed', lastRefreshed: null }); // not a root
 	refreshRows.set('all', { id: 'all', lastRefreshed: now - 1_000 });
 
-	assert.deepEqual(await sitemapHealth(now), { roots: 2, lastSuccessAgeH: 30, neverOk: 1, failing: 1 });
+	assert.deepEqual(await sitemapHealth(now), {
+		roots: 2,
+		lastSuccessAgeH: 30,
+		neverOk: 0,
+		failing: 1,
+		failedChildren: 2,
+	});
+	refreshRows.set(OTHER, { id: OTHER, state: 'running', lastRefreshed: null });
+	assert.equal((await sitemapHealth(now)).neverOk, 1, 'a root with no completed walk on record');
 
 	configure({ sitemap: { node: '' } });
 	assert.equal(await sitemapHealth(now), null, 'no walk is scheduled, so none is expected to succeed');
+});
+
+test('a walk that another walk overtook keeps the newer completion, not the one it started with', async () => {
+	const first = await trackedWalk({ [ROOT]: index(C1, C2), [C1]: urlset(P(1)), [C2]: urlset(P(2)) });
+	let open;
+	fetchGate = { url: C2, opened: new Promise((resolve) => (open = resolve)) };
+	try {
+		const from = refreshPuts.length;
+		documents = { [ROOT]: index(C1, C2), [C1]: urlset(P(1)) }; // C2 now fails, so the walk ends as it began
+		await startSitemapRefreshInBackground(ROOT);
+		for (let i = 0; i < 200 && !fetchLog.some((f) => f.url === C2 && refreshPuts.length > from); i++) await sleep(5);
+		// Meanwhile a walk that took over this root completed.
+		const newer = new Date(first.lastRefreshed.getTime() + 60_000);
+		refreshRows.set(ROOT, { ...refreshRows.get(ROOT), lastRefreshed: newer });
+		open();
+		for (let i = 0; i < 400 && !refreshPuts.slice(from).some((put) => put.state !== 'running'); i++) await sleep(5);
+		const afterRelease = refreshPuts
+			.slice(from)
+			.filter((put) => put.state === 'running')
+			.at(-1);
+		assert.ok(afterRelease, 'a progress write after the gate opened');
+		assert.equal(afterRelease.lastRefreshed, newer, 'restated the newer completion, not its own stale copy');
+	} finally {
+		fetchGate = null;
+	}
 });
