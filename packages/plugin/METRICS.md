@@ -562,8 +562,9 @@ node, has stopped. The counts are kept in shared memory, not read from analytics
 **Every count covers the requests since the previous line** (`span` seconds), so sum them over a
 window; never average them. Sums over a window are exact, but a request counted while a line is being
 drained can land its fields in two consecutive lines, so `req` need not equal the status classes within
-one line. A process restart loses up to one interval of counts; a worker restart and a live route change
-lose nothing.
+one line. A process restart loses up to one interval of counts, and so does a worker restart that also changes
+the route table (the new workers never knew the old layout); a plain worker restart and a live route
+change lose nothing.
 
 | Field                                                     | Meaning                                                                                                                                                                                                                                                                                                                                                                                                          |
 | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

@@ -37,8 +37,9 @@
  * their log shipper; set `warn` there, or the line never leaves the node.
  *
  * Process restarts zero the buffer, so up to one interval of counts is lost on a restart; `span` on the
- * first line after one says how long it covers. A worker restart loses nothing: the other workers hold
- * the buffer.
+ * first line after one says how long it covers. A worker restart loses nothing — the other workers hold
+ * the buffer — unless it also changes the route table: the new workers never knew the old layout, so
+ * nothing folds it in (a live change does, see `buildLayout`).
  */
 
 import { createHash } from 'node:crypto';
