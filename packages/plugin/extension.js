@@ -24,6 +24,10 @@ import { startBacklogSnapshotter } from './src/util/backlogSnapshot.js';
 import { startQueueKeeper } from './src/util/queueKeeperService.js';
 import { startInvalidationWatch } from './src/util/invalidation.js';
 import { startRequestSampling } from './src/util/sampling.js';
+import { startHealthLine } from './src/util/health.js';
+import { keeperHealth } from './src/util/renderSchedule.js';
+import { probeHealth } from './src/util/changeProbe.js';
+import { sitemapHealth } from './src/resources/Sitemap.js';
 
 export async function handleApplication(scope) {
 	await scope.ready;
@@ -130,4 +134,8 @@ export async function handleApplication(scope) {
 	// EVERY worker: each samples the requests it serves into its own ring and writes its own batches
 	// (util/sampling.js). Compiles now and on every config apply, so samplers are live.
 	startRequestSampling();
+	// EVERY worker arms the health line's timer, and whichever claims an interval boundary writes that
+	// node's line (util/health.js) — so a busy or restarting worker cannot hold it back. The sections are
+	// read by the writer, from state each module already keeps.
+	startHealthLine({ keeper: keeperHealth, probe: probeHealth, sitemap: sitemapHealth });
 }

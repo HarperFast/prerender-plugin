@@ -50,7 +50,7 @@ import { gunzipSync } from 'node:zlib';
 import { config, onConfigApplied } from '../config.js';
 import { metrics } from '../metrics.js';
 import { fnv1a32 } from './hash.js';
-import { epochMsOf, dateColumnMs, getNextTimeOfDay, DAY, MINUTE, SECOND } from './time.js';
+import { epochMsOf, dateColumnMs, getNextTimeOfDay, DAY, HOUR, MINUTE, SECOND } from './time.js';
 import { getResidencyByUrl } from './residency.js';
 import { matchRoute, resolveEffectiveInterval, routeScopeForUrl } from './routeClass.js';
 import { fileDueNow } from './renderSchedule.js';
@@ -3397,6 +3397,37 @@ export const changeProbeStatus = async () => {
 						: null,
 			cohortSizes: scheduler?.cohortSizes ?? {},
 		},
+	};
+};
+
+/**
+ * The change probe's state on this node for the health line (util/health.js), or null while the probe is off.
+ *
+ *   lastPassAgeH  hours since the last sweep that RAN TO COMPLETION began (`anchorServedSince`'s fields: an
+ *                 armed pass, or a dry one while `dryRun` serves); null when none is on record
+ *   running       1 while a sweep holds the row and beats
+ *   lastFailed    1 when the last sweep to end threw or was aborted
+ *   disarmed      mapped fields the mapping-defect guard has disarmed, across every rule
+ */
+export const probeHealth = async (nowMs = Date.now()) => {
+	if (!config.changeProbe.enabled) return null;
+	const row = await readProbeState();
+	const sweep = row?.sweep ?? null;
+	const last = sweep?.lastRun ?? null;
+	const completed = [epochMsOf(sweep?.completedArmedOrigin)];
+	if (config.changeProbe.dryRun === true) completed.push(epochMsOf(sweep?.completedDryOrigin));
+	// A row written before those fields existed: the last pass, if it ended cleanly.
+	if (!completed.some(Number.isFinite) && last && !last.error && !last.aborted) {
+		completed.push(epochMsOf(last.resumedFrom ?? last.startedAt));
+	}
+	const origin = Math.max(...completed.filter(Number.isFinite));
+	let disarmed = 0;
+	for (const rule of probeRules()) disarmed += (await disarmedFieldsOnNode(rule)).size;
+	return {
+		lastPassAgeH: Number.isFinite(origin) ? Math.round(((nowMs - origin) / HOUR) * 10) / 10 : null,
+		running: isPassRunning(row, 'sweep', PASS_STALE_MS) ? 1 : 0,
+		lastFailed: last && (last.error || last.aborted) ? 1 : 0,
+		disarmed,
 	};
 };
 

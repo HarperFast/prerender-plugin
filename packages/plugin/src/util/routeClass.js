@@ -610,6 +610,15 @@ export const routeScopes = () => {
 	return scopes;
 };
 
+/**
+ * The distinct paths of the prerender routes, in match order — the route labels the serve path records
+ * (`route_serve`, the health line). A passthrough route is left out: nothing it serves is prerendered, so
+ * it has no share of anything to watch.
+ */
+export const prerenderRoutePaths = () => [
+	...new Set(getRoutes().flatMap((entry) => (entry.mode === PRERENDER ? [entry.path] : []))),
+];
+
 /** The compiled prerender route a scope literal names, or null when nothing matches it. */
 export const routeForScope = (scope) => {
 	for (const entry of getRoutes()) if (entry.mode === PRERENDER && routeScopeOf(entry) === scope) return entry;

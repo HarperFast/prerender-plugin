@@ -14,6 +14,7 @@ import { CacheKey } from '../util/cacheKey.js';
 import { headersToObject } from '../util/headers.js';
 import { getAcceptedEncodings, getBestEncoding, reencode } from '../util/contentEncoding.js';
 import { metrics } from '../metrics.js';
+import { countTruncated } from '../util/health.js';
 import { releaseOriginBody } from '../util/upstream.js';
 
 // Headers preserved on a 304 response; everything else is dropped.
@@ -304,6 +305,7 @@ export function deliverResource(resource, request, info = {}) {
 				// The 200 and the bot_serve cache-hit row were committed before the body streamed, so
 				// without this counter a truncated serve is recorded as a SUCCESS everywhere.
 				metrics.serveError('blob-stream');
+				countTruncated();
 				getLogger().error('blob delivery error', e);
 			});
 		}

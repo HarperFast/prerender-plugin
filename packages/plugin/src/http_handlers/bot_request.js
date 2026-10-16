@@ -46,18 +46,26 @@ import { rescueFromOwner } from '../util/peerRescue.js';
 import { evaluateEntityGate } from '../util/entityGate.js';
 import { entityServeApplies, resolveEntityServe } from '../util/entityServe.js';
 import { sampleRequest } from '../util/sampling.js';
+import { countServe } from '../util/health.js';
 import { deliverResource } from './response.js';
 
 export async function handleBotRequest(request) {
 	request.handlerPath = 'p';
+	const startedAt = performance.now();
 	// Set once the request is resolved, so a failure past that point is still offered to the samplers.
 	let sampleInfo = null;
 	let sampleUrl = null;
+	// What the health line counts (util/health.js), whichever way the request ends: the resource it
+	// resolved to, the response sent, and whether this handler failed.
+	let resolved = null;
+	let sent = null;
+	let failed = false;
 
 	try {
 		const target = resolveBotTarget(request);
 		if (!target) {
-			return { headers: {}, status: 400 };
+			sent = { headers: {}, status: 400 };
+			return sent;
 		}
 		const { url, cacheUrl, deviceType, routeClass, route } = target;
 
@@ -85,13 +93,16 @@ export async function handleBotRequest(request) {
 		// discovery would throw on the same key a moment later.
 		if (!CacheKey.fitsKeyLimit(cacheUrl)) {
 			const resource = await proxyUnkeyable({ request, url, cacheUrl, deviceType, info });
+			resolved = resource;
 			if (recordBots) recordServeOutcome(resource, request, info, deviceType);
 			const response = deliverResource(resource, request, info);
+			sent = response;
 			sampleRequest(request, info, resource, response.status, cacheUrl);
 			return response;
 		}
 
 		const resource = await resolveResource({ request, url, cacheUrl, deviceType, routeClass, info });
+		resolved = resource;
 		// WHY THIS MISS HAPPENED (`bot_miss`), for exactly the requests bot_serve counts as origin|miss.
 		// Decided by the scheduling path below, because that is where the reasons are: the gates, and —
 		// detached, after its Target read — whether the URL is new, waiting for a render, or suppressed.
@@ -130,11 +141,13 @@ export async function handleBotRequest(request) {
 		maybeServeCheck(resource, request, info, cacheUrl);
 
 		const response = deliverResource(resource, request, info);
+		sent = response;
 		// REQUEST SAMPLING (util/sampling.js), after delivery so a sampler sees the status actually sent — a
 		// conditional 304 included. A null check when sampling is off; it never awaits and never throws.
 		sampleRequest(request, info, resource, response.status, cacheUrl);
 		return response;
 	} catch (e) {
+		failed = true;
 		logger.error(e);
 		// A 500 this handler answered is a visit like any other: a URL-stable sample that skipped it would
 		// read as a longer gap between visits.
@@ -143,7 +156,28 @@ export async function handleBotRequest(request) {
 			headers: {},
 			status: 500,
 		};
+	} finally {
+		countHealth(sampleInfo, resolved, failed ? 500 : sent?.status, performance.now() - startedAt, failed);
 	}
+}
+
+/**
+ * Count this request for the health line (util/health.js) — always, unlike the analytics above, which
+ * `analytics.enabled` gates. The route label is `route_serve`'s. A served snapshot's age is judged against
+ * its route's `renderInterval`, else `render.defaultInterval`: the cadence the route promises.
+ */
+function countHealth(info, resource, status, ms, failed) {
+	const source = info?.source ?? null;
+	const snapshot = (source === 'cache' || source === 'entity') && resource?.lastCached;
+	countServe({
+		route: info?.route?.path ?? info?.routeClass ?? 'unrouted',
+		source,
+		status,
+		ms,
+		failed,
+		ageMs: snapshot ? Date.now() - new Date(resource.lastCached).getTime() : undefined,
+		intervalMs: info?.route?.renderInterval ?? config.render.defaultInterval,
+	});
 }
 
 // The cache statuses that served a rendered snapshot from this node's cache, and the raw-document one.

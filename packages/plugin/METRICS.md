@@ -545,6 +545,63 @@ reenqueue window clamped up to the lease time, an invalidation row present while
 warnings list after a deploy is the cheapest misconfiguration alert there is** — poll it once per
 config change, not on a cadence.
 
+### 4f. The health line: numbers for a log pipeline
+
+Every `health.interval` (default 5 minutes) one worker on each node logs one line:
+
+```
+[prerender] health {"v":"0.108.0","span":300,"up":86400,"bot":{…},"routes":{…},"keeper":{…},"probe":{…},"sitemap":{…}}
+```
+
+It exists for alerting from logs. Analytics stay in each node's `hdb_analytics` until something reads
+them; this line rides whatever already ships the node's log, and because it is written whether or not
+anything is wrong, **a node with no line is itself the signal**: the plugin, or every worker on the
+node, has stopped. The counts are kept in shared memory, not read from analytics, and do not depend on
+`analytics.enabled`.
+
+**Every count covers the requests since the previous line** (`span` seconds), so sum them over a
+window; never average them. A process restart loses up to one interval of counts; a worker restart
+loses nothing.
+
+| Field                                                     | Meaning                                                                                                                                                           |
+| --------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `v`, `span`, `up`                                         | Plugin version, seconds this line covers, process uptime in seconds.                                                                                              |
+| `bot.req`                                                 | Bot requests that reached the handler.                                                                                                                            |
+| `bot.cache` `rendered` `origin` `raw` `negative` `entity` | What answered (`bot_serve` source). `origin` is the live origin; everything else spared it.                                                                       |
+| `bot.s2xx` … `bot.s5xx`                                   | Status class sent.                                                                                                                                                |
+| `bot.own5xx`                                              | 5xx this plugin produced: the handler failed, or a stored or rendered answer carried one. The rest of `s5xx` is the origin's own error, relayed live.             |
+| `bot.truncated`                                           | A committed 200 whose cached body failed while streaming (the `blob delivery error` log line).                                                                    |
+| `bot.over1s`, `bot.over3s`                                | Response headers took longer than 1 s / 3 s.                                                                                                                      |
+| `bot.ageOver1x`, `bot.ageOver2x`                          | A served snapshot older than 1× / 2× its route's `renderInterval` (else `render.defaultInterval`).                                                                |
+| `routes["<path>"]`                                        | `req`, `origin`, `s4xx`, `s5xx`, `own5xx`, `over3s`, `ageOver1x`, `ageOver2x` per prerender route path; `other` holds passthrough, unclassified and unrouted.     |
+| `keeper.*`                                                | `ok` (1 while the queue keeper is live and its heartbeat fresh), `live`, `ageS` (heartbeat age), `ready` (ready-set depth).                                       |
+| `probe.*`                                                 | Null while the change probe is off. `lastPassAgeH` (hours since the last completed sweep began), `running`, `lastFailed`, `disarmed` (fields the guard disarmed). |
+| `sitemap.*`                                               | Null unless `sitemap.node` pins the scheduled walk. `roots`, `lastSuccessAgeH` (the least recently completed root), `neverOk`, `failing`.                         |
+| `err` (on failure)                                        | Present only when a state section failed or took over 5 s; that section is null.                                                                                  |
+
+**Level.** `health.level` (default `notify`). Some hosts forward only `warn` and above from components to
+their log shipper; set `warn` there, or the line never leaves the node.
+
+**Reading it in Loki.** The JSON follows Harper's log prefix, so cut it out before parsing. Bracket
+lookups reach a route whose path contains slashes:
+
+```logql
+sum by (node) (sum_over_time({service="harperdb"} |= "[prerender] health {"
+  | regexp `\[prerender\] health (?P<h>\{.*\})$` | line_format `{{.h}}`
+  | json x="routes[\"/product/\"].origin" | __error__="" | unwrap x [15m]))
+```
+
+**What to alert on** (thresholds from a week of your own lines, per node unless noted):
+
+- the share of `bot.req` not answered by `origin` falling well below the same window a week earlier;
+- `own5xx` above zero for a sustained window, and the `s5xx` share (the relayed part is the origin's);
+- `keeper.ok` 0 for 15 minutes;
+- cluster-wide `bot.req` collapsing against a week earlier (the CDN stopped sending crawlers);
+- the `over3s`, 4xx and `ageOver2x` shares rising;
+- `probe.lastPassAgeH` past the schedule plus a margin, `probe.disarmed` above zero, `sitemap.lastSuccessAgeH`
+  past a few walk intervals;
+- no line from a node for twice `health.interval` while the node still logs.
+
 ---
 
 ## 5. Alerting: what to watch
@@ -587,11 +644,12 @@ The catalog above is reference; this is the short list. "Sum across nodes" is im
 
 **Absence is a signal — alert when a series stops:**
 
-| Condition                                                 | Meaning                                                                                                                            |
-| --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| No `bot_request` rows at all                              | Ingress broken, the CDN stopped forwarding, or `analytics.enabled` was turned off — all three look identical from the dashboard.   |
-| No `queue_health` rows for > 2× `backlogSnapshotInterval` | The snapshotter died or `management.enabled`/the interval was zeroed — the queue is now unmonitored, which is itself the incident. |
-| No `render` rows while `overdue` is non-zero              | Workers are not posting results: fleet down, or claim/callback path broken.                                                        |
+| Condition                                                                                     | Meaning                                                                                                                            |
+| --------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| No `bot_request` rows at all                                                                  | Ingress broken, the CDN stopped forwarding, or `analytics.enabled` was turned off — all three look identical from the dashboard.   |
+| No `queue_health` rows for > 2× `backlogSnapshotInterval`                                     | The snapshotter died or `management.enabled`/the interval was zeroed — the queue is now unmonitored, which is itself the incident. |
+| No `render` rows while `overdue` is non-zero                                                  | Workers are not posting results: fleet down, or claim/callback path broken.                                                        |
+| No `[prerender] health` line from a node for > 2× `health.interval` while the node still logs | The plugin, or every worker on the node, stopped — or the line's level is below what the host ships (4f).                          |
 
 ---
 

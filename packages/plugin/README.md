@@ -167,6 +167,11 @@ rest: true # required for the @export-ed table REST endpoints
     # route_page_age. What each one means, its dimensions, and what to chart it against are in
     # METRICS.md (and served live by GET /prerender_admin/metrics).
 
+  health: # one `[prerender] health {json}` line per node per interval, for log-based alerting (METRICS.md, 4f)
+    enabled: true # counted in shared memory; independent of analytics, which it never reads
+    interval: 300000 # 5m — lines land on multiples of it; one worker per node writes each
+    level: notify # set warn where the host forwards only warn and above to its log shipper
+
   crawlStats: # crawl breadth: distinct URLs crawled per bot per UTC day (HyperLogLog, ~0.8% error)
     enabled: true # also gated by analytics.enabled above; read via GET /prerender_admin/crawl-breadth?days=7
     flushInterval: 300000 # ms between sketch persists (max observation loss if a worker dies)

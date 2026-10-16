@@ -90,6 +90,8 @@ type SitemapFailure {
 # whether any child failed, and whether it is still alive (`updatedAt`).
 type SitemapRefresh @table(database: "sitemaps") @export(name: "sitemap_refresh") {
 	id: Any @primaryKey
+	# When this root's walk last COMPLETED. Restated on every progress write, so a running or failed walk
+	# keeps it (plugin >= 0.108.0; before, only a completed row carried it).
 	lastRefreshed: Date
 	# running | completed | failed
 	state: String

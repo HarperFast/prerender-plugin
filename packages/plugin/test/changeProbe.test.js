@@ -4565,3 +4565,39 @@ test('the sweep reports a page SERVED WRONG: since its render, or — when the o
 	);
 	assert.equal(SRC.match(/onServedWrong: \(/g)?.length, 1, 'wired once: the sweep');
 });
+
+test('probeHealth: hours since the last completed pass began, a failed last pass, and the fields disarmed', async () => {
+	const { applyOptions } = await import('../src/config.js');
+	applyOptions({ changeProbe: { enabled: true, rules: [MAPPED_RULE] } });
+	const now = Date.now();
+	const guard = { pdp: { '0:title': { witnessed: 50, disagreed: 50, armed: false } } };
+	changeProbe.resetChangeProbeState();
+	await changeProbe.publishProbeStateForTest({
+		sweep: {
+			running: false,
+			startedAt: 1,
+			heartbeatAt: 1,
+			progress: null,
+			completedArmedOrigin: now - 30 * HOUR,
+			// The pass that ended last threw: the one that completed is older, and that is what the age reads.
+			lastRun: { startedAt: now - 2 * HOUR, finishedAt: now, error: 'origin down', fieldGuard: guard },
+		},
+	});
+	assert.deepEqual(await changeProbe.probeHealth(now), { lastPassAgeH: 30, running: 0, lastFailed: 1, disarmed: 1 });
+
+	// A row from before the completed-pass fields: the last pass counts only if it ended cleanly. (Publishes
+	// merge into the stored row, so it is cleared first.)
+	sharedRows.clear();
+	changeProbe.resetChangeProbeState();
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: false, lastRun: { startedAt: now - 6 * HOUR, finishedAt: now - 5 * HOUR } },
+	});
+	assert.equal((await changeProbe.probeHealth(now)).lastPassAgeH, 6);
+	sharedRows.clear();
+	changeProbe.resetChangeProbeState();
+	await changeProbe.publishProbeStateForTest({ sweep: { running: false, lastRun: { aborted: true, startedAt: 1 } } });
+	assert.equal((await changeProbe.probeHealth(now)).lastPassAgeH, null, 'no completed pass on record');
+
+	applyOptions({ changeProbe: { enabled: false } });
+	assert.equal(await changeProbe.probeHealth(now), null, 'nothing to report while the probe is off');
+});
