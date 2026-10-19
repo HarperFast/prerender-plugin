@@ -1,0 +1,14 @@
+# The benchmark's copy of RenderSchedule: same fields, same single index, and — like production — alone
+# in its own database, so a subscription on it taxes only its own commits.
+type Sched @table(database: "bench_sched") @export {
+	cacheKey: String @primaryKey
+	nextRenderTime: Long @indexed
+	fromSitemap: Boolean
+	effectiveInterval: Long
+}
+
+# Holds the named shared buffer the two worker threads coordinate through. Its own non-replicated
+# database, so coordination never touches the database being measured.
+type Ctl @table(database: "bench_ctl", replicate: false) {
+	id: ID @primaryKey
+}
