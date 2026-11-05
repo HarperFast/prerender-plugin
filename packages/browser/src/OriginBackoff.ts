@@ -41,12 +41,14 @@ const distressStatus = (statusCode: number) => statusCode === 408 || statusCode 
  * never got as far as the origin.
  */
 export function originVerdict(error: unknown, statusCode: number | undefined): OriginVerdict | null {
+	// A status the document arrived with decides, whatever was thrown after it: the renderer aborts its own
+	// navigation signal on a document of 400 or more, and that abort must not read as the origin failing.
+	if (typeof statusCode === 'number' && statusCode > 0) return distressStatus(statusCode) ? 'failed' : 'answered';
 	if (error && renderPhaseOf(error) === 'navigation') {
 		// A redirect loop is the origin answering, over and over: a page's verdict, not distress.
 		if (error instanceof Error && error.message.startsWith('net::ERR_TOO_MANY_REDIRECTS')) return 'answered';
 		return 'failed';
 	}
-	if (typeof statusCode === 'number' && statusCode > 0) return distressStatus(statusCode) ? 'failed' : 'answered';
 	return null;
 }
 

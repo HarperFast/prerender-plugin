@@ -46,6 +46,10 @@ test('a failed navigation is one the document never arrived for, or arrived 408,
 	for (const status of [200, 301, 404, 410, 403]) assert.equal(originVerdict(undefined, status), 'answered');
 	// A settle-phase timeout on a page whose document arrived 200: the origin answered.
 	assert.equal(originVerdict(new Error('Waiting failed: 8000ms exceeded'), 200), 'answered');
+	// A navigation that threw AFTER its document arrived with a status: the status decides. The renderer
+	// aborts its own navigation signal on a 4xx document, and a 404 is not the origin failing.
+	assert.equal(originVerdict(markRenderPhase(new Error('aborted'), 'navigation'), 404), 'answered');
+	assert.equal(originVerdict(markRenderPhase(new Error('aborted'), 'navigation'), 503), 'failed');
 	// No navigation result at all (no page, a protocol fault): nothing to say about the origin.
 	assert.equal(originVerdict(new Error('Target closed'), undefined), null);
 });
