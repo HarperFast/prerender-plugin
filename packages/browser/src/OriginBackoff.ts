@@ -97,7 +97,14 @@ export class OriginBackoff {
 	/** Judge every window that has closed since the last call, then start counting the current one. */
 	private roll(): void {
 		const { windowMs } = settings.originBackoff;
-		const elapsed = this.now() - this.windowStart;
+		const now = this.now();
+		const elapsed = now - this.windowStart;
+		// A clock reading that is not a number would make `windowStart` NaN for good, and every later call would
+		// judge a window of one navigation. Start the window over at this reading instead; the share stays.
+		if (!Number.isFinite(elapsed)) {
+			this.windowStart = now;
+			return;
+		}
 		if (elapsed < windowMs) return;
 		const windows = Math.floor(elapsed / windowMs);
 		this.judge(this.answered, this.failed);

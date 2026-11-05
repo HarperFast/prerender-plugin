@@ -104,6 +104,18 @@ test('windows that pass with nothing in them count as healthy, so an idle worker
 	assert.equal(backoff.slots(8), 8, 'two quiet windows after the last judged one');
 });
 
+test('a clock reading that is not a number restarts the window instead of poisoning it', () => {
+	let now: number = 1_000_000;
+	const backoff = new OriginBackoff(() => now);
+	navigations(backoff, { failed: 12 });
+	now = Number.NaN;
+	assert.equal(backoff.slots(8), 8, 'nothing judged on a NaN reading');
+	now = 2_000_000;
+	navigations(backoff, { failed: 12 }); // restarts the window at this reading
+	now += WINDOW;
+	assert.equal(backoff.slots(8), 4, 'the next whole window is judged as usual');
+});
+
 test('off: the configured concurrency and claim size, whatever the origin does', () => {
 	configure({ enabled: false });
 	const { backoff, advance } = clocked();

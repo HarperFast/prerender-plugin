@@ -182,7 +182,9 @@ const judge = (current, slot, nowMs) => {
 	}
 
 	if (Atomics.load(view, state + 1) === 1) return { broad: false, capped: true, results, failed, route };
-	if ((minute - brokeAt) * MINUTE_MS >= maxDuration) {
+	// Written so that a reading that is not a number caps the spell: capped is the strike behavior that existed
+	// before this module, and a spell that could never end would excuse every failure on the route for good.
+	if (!((minute - brokeAt) * MINUTE_MS < maxDuration)) {
 		if (Atomics.compareExchange(view, state + 1, 0, 1) === 0) {
 			getLogger().warn?.(
 				`[prerender] broad render failure on route ${route} has lasted ${minute - brokeAt} min, past ` +
