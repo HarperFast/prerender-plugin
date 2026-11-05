@@ -566,6 +566,45 @@ export const configSchema = group('Prerender plugin configuration.', {
 				),
 			}
 		),
+		passthroughDeadline: group(
+			'How long a crawler request that goes to the origin (a miss, a stale or invalidated page, a renderNow ' +
+				'timeout’s fallback, a non-GET) may wait for the origin’s response headers before Harper answers it ' +
+				'itself. Without one, the wait is bounded only by the HTTP client’s own 300-second header timeout, so ' +
+				'an origin that hangs before answering holds every such request, and the connection to the CDN in ' +
+				'front, for as long as the origin takes to give up.\n\n' +
+				'The clock starts when Harper begins the fetch (connecting included) and stops when the headers ' +
+				'arrive; a body that is already streaming is never cut off by it. The answer on expiry is `status` ' +
+				'with an empty body and `cache-control: no-store`. The health line counts these as ' +
+				'`originUnreachable`, and separately as `originDeadline`.\n\n' +
+				'CHECK WHAT THE CDN DOES WITH A 5XX FROM HARPER BEFORE TURNING THIS ON. If it fails over to the ' +
+				'origin, the crawler waits the deadline AND the origin’s own time, and a page the origin would have ' +
+				'answered just after the deadline is fetched from it twice. The deadline then protects this node ' +
+				'(connections and memory held per request) but not the crawler or the origin. Set it at or below the ' +
+				'CDN’s own timeout for its requests to Harper, since anything Harper holds past that is wasted. ' +
+				'Off by default for that reason.',
+			{
+				timeout: option(
+					0,
+					'Milliseconds to wait for the origin’s response headers before answering `status`. 0 turns the ' +
+						'deadline off (the HTTP client’s 300-second header timeout still applies).',
+					{ unit: 'ms', min: 0, max: 5 * MINUTE }
+				),
+				status: option(
+					504,
+					'What a crawler is answered when the deadline passes: 504 (Gateway Timeout, an honest report that ' +
+						'the origin did not answer in time) or 503 (Service Unavailable, with `retryAfter`, which asks a ' +
+						'crawler to come back later and is the status crawlers slow down on). Which one a CDN fails over ' +
+						'on is the CDN’s configuration; check it before choosing.',
+					{ enum: [504, 503] }
+				),
+				retryAfter: option(
+					2 * MINUTE,
+					'Sent as `Retry-After` (in whole seconds, rounded up) with a 503 answer. Not sent with a 504, where ' +
+						'it has no defined meaning. 0 omits the header.',
+					{ unit: 'ms', min: 0, max: DAY }
+				),
+			}
+		),
 		ignoredHeaders: option(
 			[],
 			'Additional downstream request header names never forwarded to the origin, on top of the ' +
@@ -2391,8 +2430,8 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'render clears it.\n\n' +
 				'Two consequences of the lease being node-local shared-buffer state rather than a stored due ' +
 				'time: a worker restart collapses the fast-lane wait to zero (the job is simply re-granted), ' +
-				'and during a broad origin failure every job takes this lane, so no lease is released at all ' +
-				'for that window.',
+				'and during a broad origin failure every job would take this lane, so no lease would be released at ' +
+				'all for that window. `broadFailure` takes those failures out of these lanes.',
 			{
 				fastRetries: option(
 					2,
@@ -2425,6 +2464,54 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'Priority is expressed purely as a due time — `claim` orders by nextRenderTime alone — ' +
 						'so this needs no priority field and no second index. 1 treats both alike.',
 					{ min: 1 }
+				),
+				broadFailure: group(
+					'A failure that is everybody’s is not the page’s. When most renders of a ROUTE are failing on this ' +
+						'node at once (an origin outage, a backend behind one kind of page, a renderer-wide fault), a failed ' +
+						'render on that route counts NO strike and retries after a flat `retryAfter` instead of taking the ' +
+						'lanes above. Without this, an outage of a couple of hours strikes every page that came due during ' +
+						'it past `fastRetries`, and those pages then wait out a full cadence (or longer) after the origin is ' +
+						'back, while their stored copies stop serving at `page.swrTtl`.\n\n' +
+						'Judged per prerender route (everything else shares one slot) from the render results this node ' +
+						'processed in the last `window`: broad when at least `minResults` landed and at least ' +
+						'`failureShare` of them failed. Strikes already counted are left as they are, and any successful ' +
+						'render clears them as always. The health line’s `failures` section names the routes that are broad ' +
+						'now, and `queue_health` series `broad_failure_retry` counts the retries filed this way.\n\n' +
+						'`maxDuration` bounds how long a route stays broad: failing pages retried every `retryAfter` come back ' +
+						'more often than healthy ones on their cadence, so pages that are broken for good could otherwise keep ' +
+						'the share up by themselves. Past it, strikes count again until the share drops.',
+					{
+						enabled: option(true, 'Judge failures against their route’s failure share before counting a strike.'),
+						window: option(10 * MINUTE, 'How far back the failure share looks. Rounded to whole minutes.', {
+							unit: 'ms',
+							min: 2 * MINUTE,
+							max: HOUR,
+						}),
+						minResults: option(
+							20,
+							'Results a route must have in the window before its share means anything. Below it, failures ' +
+								'count strikes as usual.',
+							{ min: 1 }
+						),
+						failureShare: option(
+							0.5,
+							'Share of the window’s results that failed (0 to 1) at which failures on the route are broad.',
+							{ min: 0.01, max: 1 }
+						),
+						retryAfter: option(
+							30 * MINUTE,
+							'When a broad failure retries. Never later than the page’s own cadence, and rounded down to whole ' +
+								'minutes. It releases the claim lease, unlike the fast lane, so a broad failure does not hold ' +
+								'lease slots for the length of an outage.',
+							{ unit: 'ms', min: MINUTE, max: DAY }
+						),
+						maxDuration: option(
+							6 * HOUR,
+							'Longest a route stays broad. Past it, failures on the route count strikes again until its ' +
+								'failure share falls below `failureShare`.',
+							{ unit: 'ms', min: 10 * MINUTE, max: 7 * DAY }
+						),
+					}
 				),
 			}
 		),

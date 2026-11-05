@@ -15,7 +15,7 @@ import {
 } from '../util/routeClass.js';
 import { Target } from '../resources/Target.js';
 import { QueueState } from '../resources/QueueState.js';
-import { fetchOriginResource, isOriginFetchFailure } from '../util/upstream.js';
+import { fetchOriginResource, isOriginDeadline, isOriginFetchFailure } from '../util/upstream.js';
 import { PrerenderedPage } from '../resources/PrerenderedPage.js';
 import { resolveServingPolicy, pollForFreshRender } from '../util/renderNow.js';
 import { resolveServeStatus } from '../util/pageFreshness.js';
@@ -61,6 +61,7 @@ export async function handleBotRequest(request) {
 	let sent = null;
 	let failed = false;
 	let originUnreachable = false;
+	let originDeadline = false;
 
 	try {
 		const target = resolveBotTarget(request);
@@ -150,22 +151,53 @@ export async function handleBotRequest(request) {
 	} catch (e) {
 		failed = true;
 		originUnreachable = isOriginFetchFailure(e);
-		logger.error(e);
-		// A 500 this handler answered is a visit like any other: a URL-stable sample that skipped it would
+		originDeadline = isOriginDeadline(e);
+		// The pass-through deadline is an answer this handler chose, not a fault in it: one summary line a
+		// minute rather than an error per request, which during an origin outage is one per crawler miss.
+		if (originDeadline) noteDeadline(e);
+		else logger.error(e);
+		sent = originDeadline ? deadlineAnswer() : { headers: {}, status: 500 };
+		// An answer this handler made is a visit like any other: a URL-stable sample that skipped it would
 		// read as a longer gap between visits.
-		if (sampleInfo !== null) sampleRequest(request, sampleInfo, null, 500, sampleUrl);
-		return {
-			headers: {},
-			status: 500,
-		};
+		if (sampleInfo !== null) sampleRequest(request, sampleInfo, null, sent.status, sampleUrl);
+		return sent;
 	} finally {
 		countHealth(sampleInfo, resolved, {
-			status: failed ? 500 : sent?.status,
+			status: failed ? (sent?.status ?? 500) : sent?.status,
 			ms: performance.now() - startedAt,
 			failed,
 			originUnreachable,
+			originDeadline,
 		});
 	}
+}
+
+/**
+ * What a crawler is answered when the origin sent no headers within `origin.passthroughDeadline.timeout`:
+ * the configured status, empty, never to be cached by anything in front. A 503 carries `Retry-After`.
+ */
+function deadlineAnswer() {
+	const { status, retryAfter } = config.origin.passthroughDeadline;
+	const headers = { 'cache-control': 'no-store' };
+	if (status === 503 && retryAfter > 0) headers['retry-after'] = String(Math.ceil(retryAfter / 1000));
+	return { status, headers };
+}
+
+// Per worker: how many deadline answers since the last summary line, and when that line was written.
+const DEADLINE_LOG_INTERVAL_MS = 60_000;
+let deadlinesUnlogged = 0;
+let deadlineLoggedAt = 0;
+
+function noteDeadline(error) {
+	deadlinesUnlogged++;
+	const now = Date.now();
+	if (now - deadlineLoggedAt < DEADLINE_LOG_INTERVAL_MS) return;
+	logger.warn(
+		`[prerender] ${deadlinesUnlogged} crawler request(s) on this worker answered ` +
+			`${config.origin.passthroughDeadline.status} since the last such line: ${error.message}`
+	);
+	deadlinesUnlogged = 0;
+	deadlineLoggedAt = now;
 }
 
 /**
@@ -173,7 +205,7 @@ export async function handleBotRequest(request) {
  * `analytics.enabled` gates. The route label is `route_serve`'s. A served snapshot's age is judged against
  * its route's `renderInterval`, else `render.defaultInterval`: the cadence the route promises.
  */
-function countHealth(info, resource, { status, ms, failed, originUnreachable }) {
+function countHealth(info, resource, { status, ms, failed, originUnreachable, originDeadline }) {
 	// Called from a `finally`: a throw here would replace the response already built with an error.
 	try {
 		const source = info?.source ?? null;
@@ -185,6 +217,7 @@ function countHealth(info, resource, { status, ms, failed, originUnreachable }) 
 			ms,
 			failed,
 			originUnreachable,
+			originDeadline,
 			madeHere: resource?.madeHere === true,
 			ageMs: snapshot ? Date.now() - new Date(resource.lastCached).getTime() : undefined,
 			intervalMs: info?.route?.renderInterval ?? config.render.defaultInterval,

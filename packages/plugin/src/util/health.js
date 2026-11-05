@@ -74,8 +74,11 @@ const TICK_DELAY_MS = 250;
  *   own5xx                       5xx this plugin produced itself: the handler failed, it made the answer up (render-now's
  *                                timeout 504), or a stored or rendered answer carried a 5xx
  *   originUnreachable            the origin could not be reached at all (refused, reset, timed out before a status),
- *                                so the handler answered 500. Not own5xx: the origin is down, or this node's way to it.
+ *                                so the handler answered 500, or `origin.passthroughDeadline.status` when that deadline
+ *                                ended the wait. Not own5xx: the origin is down, or this node's way to it.
  *                                s5xx − own5xx − originUnreachable is the origin's own 5xx, relayed live.
+ *   originDeadline               of originUnreachable, the ones `origin.passthroughDeadline` ended: the origin sent no
+ *                                headers in time and the crawler got the configured 504 or 503 instead of a wait.
  *   truncated                    a committed 200 whose cached body failed while streaming
  *   over1s, over3s               response headers took longer than 1s / 3s
  *   ageOver1x, ageOver2x         a served snapshot older than 1× / 2× its route's render interval
@@ -94,6 +97,7 @@ export const NODE_FIELDS = Object.freeze([
 	's5xx',
 	'own5xx',
 	'originUnreachable',
+	'originDeadline',
 	'truncated',
 	'over1s',
 	'over3s',
@@ -109,6 +113,7 @@ export const ROUTE_FIELDS = Object.freeze([
 	's5xx',
 	'own5xx',
 	'originUnreachable',
+	'originDeadline',
 	'over3s',
 	'ageOver1x',
 	'ageOver2x',
@@ -191,6 +196,7 @@ const routeBase = (slot) => NODE_FIELDS.length + slot * ROUTE_FIELDS.length;
  * @param {number} serve.ms           handler time to the response
  * @param {boolean} serve.failed      the handler itself failed (its 500)
  * @param {boolean} [serve.originUnreachable] …because the origin fetch failed before any status arrived
+ * @param {boolean} [serve.originDeadline] …because `origin.passthroughDeadline` ended it (implies originUnreachable)
  * @param {boolean} [serve.madeHere]  the answer is one this plugin made up (render-now's timeout 504), whatever its source
  * @param {number} [serve.ageMs]      a served snapshot's age
  * @param {number} [serve.intervalMs] that snapshot's route render interval
@@ -202,6 +208,7 @@ export const countServe = ({
 	ms,
 	failed = false,
 	originUnreachable = false,
+	originDeadline = false,
 	madeHere = false,
 	ageMs,
 	intervalMs,
@@ -228,6 +235,10 @@ export const countServe = ({
 			if (failed && originUnreachable) {
 				Atomics.add(view, N.originUnreachable, 1);
 				Atomics.add(view, base + R.originUnreachable, 1);
+				if (originDeadline) {
+					Atomics.add(view, N.originDeadline, 1);
+					Atomics.add(view, base + R.originDeadline, 1);
+				}
 			} else if (failed || madeHere || source !== 'origin') {
 				Atomics.add(view, N.own5xx, 1);
 				Atomics.add(view, base + R.own5xx, 1);
