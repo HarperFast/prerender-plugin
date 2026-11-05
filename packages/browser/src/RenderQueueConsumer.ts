@@ -4,6 +4,7 @@ import { request } from './external/http.js';
 import { connectMqtt } from './external/mqtt.js';
 import { settings } from './settings.js';
 import { getHostHealth, parseRetryAfter } from './HostHealth.js';
+import { getOriginBackoff } from './OriginBackoff.js';
 
 export const Topic = {
 	// Matches the plugin's QueueStatus export name (@export(name: "queue_status")).
@@ -96,7 +97,10 @@ export async function* RenderQueueConsumer(signal?: AbortSignal) {
 				continue;
 			}
 
-			const { jobs, outcome, retryAfterMs } = await claimJobs(host, settings.jobClaimLimit);
+			// Scaled with the render slots while the origin is failing (OriginBackoff.ts): a worker rendering on
+			// fewer slots claims fewer jobs, so it holds no lease for a job it cannot start.
+			const limit = getOriginBackoff().claimLimit(settings.jobClaimLimit);
+			const { jobs, outcome, retryAfterMs } = await claimJobs(host, limit);
 			switch (outcome) {
 				case 'jobs':
 					health.recordJobs(host);

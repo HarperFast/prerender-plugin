@@ -3,6 +3,7 @@ import { LaunchOptions, Page, ProtocolError, TimeoutError } from 'puppeteer';
 import RenderJob from './RenderJob.js';
 import logger from './util/Logger.js';
 import { RenderQueueConsumer } from './RenderQueueConsumer.js';
+import { getOriginBackoff, originVerdict } from './OriginBackoff.js';
 import { setTimeout } from 'timers/promises';
 import { noop } from './util/noop.js';
 import { getResourceCache } from './ResourceCache.js';
@@ -113,6 +114,10 @@ export default class RenderWorker {
 				other: 0,
 			},
 			expiredSkipped: 0,
+			// Navigations the origin answered / failed (OriginBackoff.ts): a failed one threw, or its document
+			// came back 408, 429 or 5xx. A render that never reached the origin is in neither.
+			originAnswered: 0,
+			originFailed: 0,
 			// Results posted — one per claimed JOB, whereas `completed` counts renders. With plugin >=
 			// 0.66.0 a job renders every device of one URL, so `completed / jobs` is the variants per job.
 			jobs: 0,
@@ -359,11 +364,16 @@ export default class RenderWorker {
 		await filling;
 	}
 
-	/** Hold until a render slot is free. */
+	/**
+	 * Hold until a render slot is free. The slots in use are `CONCURRENCY` scaled down while the origin is
+	 * failing navigations (OriginBackoff.ts), so this LOOPS: after a cut, one render finishing does not
+	 * necessarily bring the in-flight count under the new number.
+	 */
 	private async awaitSlot() {
-		// wait for slot to open up
-		if (this.inflight.size >= this.CONCURRENCY) {
-			this.stats.concurrencyBlocked++;
+		let blocked = false;
+		while (this.inflight.size > 0 && this.inflight.size >= getOriginBackoff().slots(this.CONCURRENCY)) {
+			if (!blocked) this.stats.concurrencyBlocked++;
+			blocked = true;
 			await Promise.race(this.inflight);
 		}
 	}
@@ -627,6 +637,14 @@ export default class RenderWorker {
 				avgConcurrent,
 				coresPerRender,
 				container: cpu.container,
+			},
+			// The navigations this window, and the share of slots the origin backoff leaves in use (1 = all of
+			// `concurrency`). A share under 1 means the origin was failing most navigations (OriginBackoff.ts).
+			originBackoff: {
+				answered: s.originAnswered,
+				failed: s.originFailed,
+				share: getOriginBackoff().share,
+				slots: getOriginBackoff().slots(this.CONCURRENCY),
 			},
 			saturation: {
 				inflight: this.inflight.size,
@@ -1032,6 +1050,15 @@ export default class RenderWorker {
 		}
 
 		job.attemptEnded(error, content);
+
+		// What this navigation says about the origin. Not while shutting down: a render we tore down
+		// ourselves says nothing about the origin, and nor does one that never got a page.
+		if (!this.shuttingDown && page) {
+			const verdict = originVerdict(error, job.httpResponse?.statusCode);
+			getOriginBackoff().record(verdict);
+			if (verdict === 'failed') this.stats.originFailed++;
+			else if (verdict === 'answered') this.stats.originAnswered++;
+		}
 
 		// Per-interval outcome + latency accounting (drained by logStats).
 		this.stats.completed++;
