@@ -531,12 +531,14 @@ export const METRICS = Object.freeze({
 		kind: 'value',
 		emittedBy:
 			'util/backlogSnapshot.js (snapshot gauges), util/reconcile.js (reconcile_*), ' +
-			'util/queueKeeperService.js (keeper_*), resources/RenderQueue.js (claim_granted, claim_stale)',
+			'util/queueKeeperService.js (keeper_*), resources/RenderQueue.js (claim_granted, claim_stale, claim_wedged, ' +
+			'broad_failure_retry)',
 		cadence:
 			'snapshot gauges once per backlog snapshot per node (worker 0, management.backlogSnapshotInterval); ' +
 			'reconcile_* once per sweep per node; keeper_load_ms once per keeper load, keeper_publish_ms once per ' +
 			'keeper publish (worker 0, queue.keeper.publishInterval), keeper_verify_ms, keeper_repaired and ' +
-			'keeper_unschedulable once per verification walk; claim_granted / claim_stale / claim_wedged per claim that had any',
+			'keeper_unschedulable once per verification walk; claim_granted / claim_stale / claim_wedged per claim that had any; ' +
+			'broad_failure_retry once per failed render result judged broad',
 		summary: 'Every queue signal under one name: backlog gauges, the queue keeper, schedule-gap repairs.',
 		usefulFor:
 			'The queue’s alertable surface, readable in ONE get_analytics scan (a metric name is a scan — see the ' +
@@ -565,6 +567,7 @@ export const METRICS = Object.freeze({
 					'keeper_unschedulable',
 					'claim_stale',
 					'claim_wedged',
+					'broad_failure_retry',
 				],
 				description:
 					'overdue = schedule rows already due, INCLUDING in-flight renders (so its healthy floor is the ' +
@@ -596,7 +599,11 @@ export const METRICS = Object.freeze({
 					'claim_wedged = keys a claim held back instead of granting (an exponential hold in the lease table, ' +
 					'capped at the cadence) because their last leases all ended without moving the row — expired with no ' +
 					'result, or (since v0.97.0) released by a result whose commit then failed: a renderer crashing on ' +
-					'the URL, or, when many appear at once, results not reaching this node. The log names them.',
+					'the URL, or, when many appear at once, results not reaching this node. The log names them. ' +
+					'broad_failure_retry = failed render results retried WITHOUT a strike because most renders of their ' +
+					'route were failing on this node at the time (render.failureRetry.broadFailure, plugin v0.109.0): an ' +
+					'origin outage, or a renderer-wide fault, seen from the queue. Zero on a healthy day; the warn line ' +
+					'and the health line\u2019s `failures` section name the route.',
 			},
 			method: {
 				name: 'source (claim_granted)',
