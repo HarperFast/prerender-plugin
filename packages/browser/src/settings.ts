@@ -72,6 +72,24 @@ export type BrowserOptions = {
 		/** Max `job_result` POST retries on 503/5xx/network before dropping (default 3). */
 		resultRetries?: number;
 	};
+	/**
+	 * Render on fewer slots while the origin is failing this worker's navigations (OriginBackoff.ts). Each
+	 * `windowMs`, a window of at least `minNavigations` navigations of which at least `failureShare` failed (a
+	 * navigation that threw, or a 408, 429 or 5xx document) HALVES the share of `concurrency` in use, and of
+	 * `jobClaimLimit`; a healthy window adds `recoverStep` of it back. Never fewer than one slot.
+	 */
+	originBackoff?: {
+		/** Default true. */
+		enabled?: boolean;
+		/** Judging window, ms (default 60000). */
+		windowMs?: number;
+		/** Navigations a window needs before it can cut slots (default 10). */
+		minNavigations?: number;
+		/** Share of a window's navigations that failed at which slots are cut, 0 to 1 (default 0.5). */
+		failureShare?: number;
+		/** Share of the full concurrency added back per healthy window, 0 to 1 (default 0.25). */
+		recoverStep?: number;
+	};
 	/** Chrome launch flags (default: a hardened headless set). */
 	chromeArgs?: string[];
 	/**
@@ -96,6 +114,14 @@ export type ResolvedBackoff = {
 	pausedMs: number;
 	maxIdleMs: number;
 	resultRetries: number;
+};
+
+export type ResolvedOriginBackoff = {
+	enabled: boolean;
+	windowMs: number;
+	minNavigations: number;
+	failureShare: number;
+	recoverStep: number;
 };
 
 export type ResolvedResourceCache = {
@@ -123,6 +149,7 @@ export type Settings = {
 	browserLaunchOptions?: LaunchOptions;
 	resourceCache: ResolvedResourceCache;
 	backoff: ResolvedBackoff;
+	originBackoff: ResolvedOriginBackoff;
 };
 
 const DEFAULT_CHROME_ARGS = [
@@ -168,6 +195,34 @@ export const composeHostResolverRulesArg = (rules?: Record<string, string>): str
 	return maps.length ? `--host-resolver-rules=${maps.join(',')}` : null;
 };
 
+/**
+ * `originBackoff` over its defaults. A value that would make the backoff misbehave (a share outside 0..1, a
+ * window under a second) throws at startup rather than quietly cutting a fleet to one slot or never cutting it.
+ */
+const resolveOriginBackoff = (
+	options: BrowserOptions['originBackoff'],
+	defaults: ResolvedOriginBackoff
+): ResolvedOriginBackoff => {
+	const resolved = {
+		...defaults,
+		...Object.fromEntries(Object.entries(options ?? {}).filter(([, v]) => v !== undefined)),
+	};
+	const share = (name: 'failureShare' | 'recoverStep') => {
+		const value = resolved[name];
+		if (!(typeof value === 'number' && value > 0 && value <= 1)) {
+			throw new Error(`originBackoff.${name} must be a number in (0, 1], got ${String(value)}`);
+		}
+	};
+	share('failureShare');
+	share('recoverStep');
+	if (!(resolved.windowMs >= 1000))
+		throw new Error(`originBackoff.windowMs must be at least 1000, got ${resolved.windowMs}`);
+	if (!(Number.isInteger(resolved.minNavigations) && resolved.minNavigations >= 1)) {
+		throw new Error(`originBackoff.minNavigations must be a positive integer, got ${resolved.minNavigations}`);
+	}
+	return resolved as ResolvedOriginBackoff;
+};
+
 const defaultConcurrency = () => Math.max(1, Math.floor((cpus().length - 3) / 2));
 
 const defaults = (): Settings => ({
@@ -199,6 +254,13 @@ const defaults = (): Settings => ({
 		pausedMs: 30000,
 		maxIdleMs: 60000,
 		resultRetries: 3,
+	},
+	originBackoff: {
+		enabled: true,
+		windowMs: 60000,
+		minNavigations: 10,
+		failureShare: 0.5,
+		recoverStep: 0.25,
 	},
 });
 
@@ -282,6 +344,7 @@ export const resolveSettings = (
 		maxIdleMs: options.backoff?.maxIdleMs ?? fresh.backoff.maxIdleMs,
 		resultRetries: options.backoff?.resultRetries ?? fresh.backoff.resultRetries,
 	};
+	fresh.originBackoff = resolveOriginBackoff(options.originBackoff, fresh.originBackoff);
 
 	Object.assign(settings, fresh);
 	return settings;

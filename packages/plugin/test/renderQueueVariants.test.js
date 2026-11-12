@@ -1597,3 +1597,83 @@ test('a stored SITEMAP render whose canonical moved tells the registry — from 
 		assert.equal(entities.get('https://site.example.com/product/prd-3/')?.canonical, NEW, JSON.stringify(variantOver));
 	}
 });
+
+// ───────────────────────────── broad failure (render.failureRetry.broadFailure) ─────────────────────────────
+
+/** Most of this node's recent results failing, as during an origin outage: 25 failed of 25. */
+const outage = async () => {
+	const bf = await import('../src/util/broadFailure.js');
+	for (let i = 0; i < 25; i++) {
+		bf.recordRenderResult(B);
+		bf.recordRenderFailure(B);
+	}
+};
+const navFailure = (deviceType) => ({
+	deviceType,
+	outcome: 'error',
+	reason: 'error',
+	error: { name: 'TimeoutError', message: 'Navigation timeout of 12000 ms exceeded', phase: 'navigation' },
+});
+const broadRetries = () => analytics.filter((a) => a[1] === 'queue_health' && a[2] === 'broad_failure_retry');
+
+test('a failure while most renders are failing counts NO strike, releases the lease, and retries in retryAfter', async () => {
+	await outage();
+	seedUrlRow({ renderInterval: 48 * 3_600_000, strikes: 1 });
+	await claim();
+	const before = Date.now();
+	await postVariants(A, DEVICES.map(navFailure));
+
+	assert.equal(stores.target.get(A).strikes, 1, 'the strike already on the target stays; none is added');
+	assert.equal(leased(A), false, 'released: no lease is held for the length of an outage');
+	const due = stores.renderSchedule.get(A).nextRenderTime;
+	const wait = config.render.failureRetry.broadFailure.retryAfter;
+	assert.ok(due >= before + wait - 60_000 && due <= before + wait, 'due retryAfter out, not a 48h cadence');
+	assert.equal(stores.renderSchedule.get(A).effectiveInterval, 48 * 3_600_000, 'the cadence is still the cadence');
+	assert.equal(broadRetries().length, 1);
+	assert.deepEqual(outcomes(), [['failed', 'navigation']], 'the outcome is recorded as ever');
+	assert.equal(stores.prerenderedPage.get(key(A, 'desktop')).content, 'old html', 'and the stored pages kept');
+});
+
+test('a page past fastRetries during an outage does not escalate: the outage is not its strike', async () => {
+	const fast = config.render.failureRetry.fastRetries;
+	await outage();
+	seedUrlRow({ renderInterval: 48 * 3_600_000, strikes: fast + 3 });
+	await claim();
+	await postVariants(A, DEVICES.map(navFailure));
+	assert.equal(stores.target.get(A).strikes, fast + 3);
+	assert.ok(stores.renderSchedule.get(A).nextRenderTime < Date.now() + 3_600_000, 'not the multi-day backoff');
+});
+
+test('a CHANGED row keeps its mark through a broad-failure retry', async () => {
+	await outage();
+	const changedAt = Date.now() - 60_000;
+	seedUrlRow();
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), changedAt });
+	await claim();
+	await postVariants(A, DEVICES.map(navFailure));
+	assert.equal(stores.renderSchedule.get(A).changedAt, changedAt);
+});
+
+test('a one-device row beside the rotation keeps its lease during an outage, and still takes no strike', async () => {
+	await outage();
+	config.deviceTypes.default = ['desktop'];
+	stores.target.set(A, { url: A, renderInterval: 3_600_000, strikes: 0 });
+	stores.renderSchedule.set(key(A, 'tablet'), { nextRenderTime: 1, fromSitemap: false });
+	await claim();
+	await postVariants(A, [navFailure('tablet')], { id: key(A, 'tablet'), deviceTypes: ['tablet'] });
+	assert.equal(stores.target.get(A).strikes, 0);
+	assert.equal(leased(key(A, 'tablet')), true, 'its lease paces the retry');
+	assert.ok(stores.renderSchedule.has(key(A, 'tablet')), 'and the one-off is not dropped');
+});
+
+test('with the share under the threshold a failure strikes exactly as before', async () => {
+	const bf = await import('../src/util/broadFailure.js');
+	for (let i = 0; i < 40; i++) bf.recordRenderResult(B); // 40 healthy results
+	for (let i = 0; i < 10; i++) bf.recordRenderFailure(B); // 10 of them failed: 25%
+	seedUrlRow();
+	await claim();
+	await postVariants(A, DEVICES.map(navFailure));
+	assert.equal(stores.target.get(A).strikes, 1);
+	assert.equal(leased(A), true, 'the fast lane');
+	assert.equal(broadRetries().length, 0);
+});

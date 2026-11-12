@@ -379,6 +379,40 @@ const originFetchFailures = new WeakSet();
 export const isOriginFetchFailure = (error) =>
 	error !== null && typeof error === 'object' && originFetchFailures.has(error);
 
+/**
+ * The error a fetch is aborted with when `origin.passthroughDeadline.timeout` passes before the origin's
+ * response headers arrive. Its own class so the bot handler can answer it with the configured status rather
+ * than the 500 an unreachable origin gets. Always also an origin fetch failure (`isOriginFetchFailure`).
+ */
+export class OriginDeadlineError extends Error {
+	constructor(timeoutMs) {
+		super(`the origin sent no response headers within ${timeoutMs}ms (origin.passthroughDeadline.timeout)`);
+		this.name = 'OriginDeadlineError';
+		this.code = 'PRERENDER_ORIGIN_DEADLINE';
+		this.timeoutMs = timeoutMs;
+	}
+}
+
+/** Did `error` come from the pass-through deadline ending the fetch? */
+export const isOriginDeadline = (error) => error instanceof OriginDeadlineError;
+
+/**
+ * An AbortController that fires at the pass-through deadline, or null when no deadline is configured.
+ *
+ * WHY A SIGNAL AND NOT undici's `headersTimeout`. That option starts counting once the request is written,
+ * so the wait for a connection (connect, TLS) comes on top of it; the deadline is a promise about how long a
+ * crawler waits, so it counts from here. The timer is cleared the moment headers arrive (`fetchOriginResource`):
+ * the deadline bounds the wait for an answer, never how long a body may take to stream.
+ */
+const passthroughDeadline = () => {
+	const timeoutMs = config.origin.passthroughDeadline.timeout;
+	if (!(timeoutMs > 0)) return null;
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(new OriginDeadlineError(timeoutMs)), timeoutMs);
+	timer.unref?.();
+	return { signal: controller.signal, clear: () => clearTimeout(timer) };
+};
+
 export const fetchOriginResource = async (request) => {
 	const { url, deviceType, method = 'GET', body, stripValidators = false, reason = 'other', userAgent } = request;
 	const headers = request.headers.asObject;
@@ -395,6 +429,7 @@ export const fetchOriginResource = async (request) => {
 	// the cache didn't answer. statusCode 0 = the fetch itself failed before any status
 	// arrived; the throw still propagates to the caller's own error handling.
 	const fetchStarted = performance.now();
+	const deadline = passthroughDeadline();
 	let response;
 	try {
 		response = await dispatcherFor(stagingIp).request({
@@ -403,11 +438,14 @@ export const fetchOriginResource = async (request) => {
 			method,
 			headers: resolveUpstreamHeaders(headers, deviceType, { stripValidators, userAgent }),
 			body,
+			signal: deadline?.signal,
 		});
 	} catch (e) {
 		metrics.originFetch(performance.now() - fetchStarted, 0, reason);
 		if (e !== null && typeof e === 'object') originFetchFailures.add(e);
 		throw e;
+	} finally {
+		deadline?.clear();
 	}
 	metrics.originFetch(performance.now() - fetchStarted, response.statusCode, reason);
 

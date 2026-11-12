@@ -512,6 +512,10 @@ test('every queue_health series is read or waived, and the console reads none th
 		['paused', 'pause state is read from the overview (QueueControl intent and QueueStatus observed)'],
 		['reconcile_restored', 'the Corpus view reads the repair sweep result from overview.reconcile'],
 		['reconcile_missing', 'the Corpus view reads the repair sweep result from overview.reconcile'],
+		// Plugin v0.109.0. An incident signal, zero on a healthy day: the plugin's warn line names the route as
+		// a spell starts and ends, and the health line's `failures` section says which routes are broad now.
+		// A Queue-view tile beside claim_wedged is the follow-up; waived, not forgotten.
+		['broad_failure_retry', 'incident signal; the warn line and the health line name the route; a tile is a follow-up'],
 	]);
 	for (const name of declared) {
 		if (NOT_CHARTED.has(name)) continue;

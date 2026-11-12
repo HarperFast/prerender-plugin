@@ -66,8 +66,30 @@ Only `harper` is required; everything else has a default.
 | `chromeArgs`                 | hardened headless set                             | Chrome launch flags                                                                         |
 | `browserLaunchOptions`       | built from `chromeArgs`                           | Full Puppeteer launch options (overrides `chromeArgs`)                                      |
 | `resourceCache`              | enabled, ~8 GB in tmp                             | On-disk shared sub-resource cache (`enabled`/`dir`/limits)                                  |
+| `originBackoff`              | enabled, 60 s window, cut at 50% of ≥ 10 failing  | Render on fewer slots while the origin fails most navigations (see below)                   |
 | `renderer`                   | the default renderer                              | Custom renderer (see below)                                                                 |
 | `installSignalHandlers`      | `true`                                            | Own SIGTERM/SIGINT (drain in-flight renders, then close Chrome); `false` to own the process |
+
+## Origin backoff
+
+Each worker judges its own navigations and backs off the origin by itself (`OriginBackoff.ts`). A
+navigation **failed** when `page.goto` threw (a navigation timeout, a refused or reset connection) or
+the document came back 408, 429 or 5xx; anything else the origin answered, a 404 or a redirect
+included, counts as **answered**.
+
+Once per `windowMs` (default 60 s), on the window just closed:
+
+- at least `minNavigations` (10) navigations and at least `failureShare` (0.5) of them failed: the
+  share of `concurrency` in use is **halved**, never below one slot;
+- fewer than `minNavigations` but still failing at that share: **held** (a worker down to one slot
+  sees few navigations, and a thin failing sample is no reason to ramp up);
+- otherwise `recoverStep` (0.25) of the concurrency is **added back**; an empty window counts as
+  healthy.
+
+The claim size (`jobClaimLimit`) follows the same share, so a worker on fewer slots holds no leases
+for jobs it cannot start. Each cut is logged as a warning and each step back as info, and the stats
+line carries `originBackoff` (`answered`, `failed`, `share`, `slots`). `originBackoff.enabled: false`
+turns it off.
 
 ## Queue protocol
 

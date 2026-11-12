@@ -61,3 +61,13 @@ export function changedRetryWait(interval, strikes, fromSitemap) {
 	const leaseScale = config.queue.jobLeaseTime * 2 ** Math.min(30, escalations + 1);
 	return Math.min(backoffWait(interval, strikes, fromSitemap), Math.floor(leaseScale / MINUTE) * MINUTE);
 }
+
+/**
+ * The retry wait for a failure judged BROAD (util/broadFailure.js): `broadFailure.retryAfter`, never later
+ * than the page's own cadence, in whole minutes and at least one. Flat on purpose: no strike was counted, so
+ * there is nothing to escalate on, and the next render after the outage is the one that matters.
+ */
+export function broadRetryWait(interval) {
+	const wait = Math.min(config.render.failureRetry.broadFailure.retryAfter, Math.round(interval));
+	return Math.max(MINUTE, Math.floor(wait / MINUTE) * MINUTE);
+}

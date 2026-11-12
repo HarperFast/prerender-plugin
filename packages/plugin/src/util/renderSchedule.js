@@ -43,6 +43,7 @@
  */
 
 import { config } from '../config.js';
+import { resetBroadFailure } from './broadFailure.js';
 import { CacheKey } from './cacheKey.js';
 import { getSab } from './coordination.js';
 import { resolveRenderInterval } from './routeClass.js';
@@ -649,4 +650,7 @@ export const inFlightLeases = () => leaseTable().scanLive().count;
  */
 export const resetRenderQueueState = () => {
 	leaseTable().resetAll();
+	// The route failure shares are node-wide shared memory too, and a test file's results would otherwise
+	// accumulate across its tests until one of them judged a failure broad.
+	resetBroadFailure();
 };

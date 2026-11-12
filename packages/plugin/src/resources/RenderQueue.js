@@ -18,7 +18,8 @@ import { decideInterval } from '../util/demandLadder.js';
 import { hasObservations, recordReadinessExpectation } from '../util/readinessExpectation.js';
 import { actOnStaleRender, recordPageClaim } from '../util/changeProbe.js';
 import { observeRenderedCanonical } from '../util/entity.js';
-import { backoffWait, changedRetryWait } from '../util/failureBackoff.js';
+import { backoffWait, broadRetryWait, changedRetryWait } from '../util/failureBackoff.js';
+import { isBroadFailure, recordRenderFailure, recordRenderResult } from '../util/broadFailure.js';
 import { recordUnroutedPath } from '../util/unrouted.js';
 import { metrics } from '../metrics.js';
 import { Target, countedStrikes } from './Target.js';
@@ -724,6 +725,8 @@ export class RenderQueue extends Resource {
 	) {
 		const { rowKey, url, asked, variants } = normalizeJobResult(posted);
 		const job = describeJob(rowKey, url);
+		// The denominator of the route's failure share (util/broadFailure.js): every result, whatever it decides.
+		recordRenderResult(url);
 		let held = false;
 		const holdLease = () => {
 			held = true;
@@ -1512,7 +1515,9 @@ export class RenderQueue extends Resource {
 	 * would quietly lengthen a documented wait.
 	 *
 	 * The cost, which belongs in the operator's head: during a broad origin 5xx or a bot-mitigation
-	 * rule change EVERY job takes this lane and no lease is released at all for that window.
+	 * rule change EVERY job would take this lane and no lease would be released at all for that window.
+	 * That is what `retryBroadFailure` is for: when most renders of the URL's route are failing on this
+	 * node (util/broadFailure.js), the failure is nobody's strike and takes neither lane.
 	 *
 	 * @returns {Promise<'fast'|'slow'|'dropped'>} which lane was taken. `'fast'` means the caller
 	 *   must keep the lease; the other two mean release it (the row is now in the future or gone,
@@ -1520,6 +1525,7 @@ export class RenderQueue extends Resource {
 	 */
 	static async retryAfterFailure(job) {
 		const sourceUrl = job.url;
+		recordRenderFailure(sourceUrl);
 		const renderTarget = await Target.get({
 			id: sourceUrl,
 			// `demandInterval` rides along on a point read this path already makes, so the cadence filed
@@ -1530,6 +1536,7 @@ export class RenderQueue extends Resource {
 			// A deferred row is in the future, like a slow-lane backoff: the caller releases the lease.
 			return (await settleTargetless(job, await readTargetlessRow(job))) === 'deferred' ? 'slow' : 'dropped';
 		}
+		if (isBroadFailure(sourceUrl)) return this.retryBroadFailure(job, renderTarget);
 		const strikes = countedStrikes(renderTarget.strikes) + 1;
 		await patchTarget(sourceUrl, { strikes });
 
@@ -1574,6 +1581,41 @@ export class RenderQueue extends Resource {
 			fromSitemap,
 			effectiveInterval: cadence,
 			...marks,
+		});
+		return 'slow';
+	}
+
+	/**
+	 * A failure judged BROAD (util/broadFailure.js): most renders of this URL's route are failing on this node
+	 * right now, so this one says nothing about the page. NO STRIKE is counted (the ones already on the target
+	 * stay), and the row is filed `broadFailure.retryAfter` out, capped at the page's cadence, keeping any
+	 * change mark. The lease is released (`'slow'`): holding it, as the fast lane does, would keep one lease
+	 * per failing page for the whole outage and retry each of them every `queue.jobLeaseTime` against an
+	 * origin that is failing.
+	 *
+	 * A marked page waits the same flat time, longer than its usual lease-scale retry: its page is
+	 * hard-expired either way, and retrying it faster than every other page into a failing origin buys
+	 * nothing.
+	 *
+	 * A one-device row beside the URL's rotation has no row of its own to back off; it keeps its lease and
+	 * retries at lease expiry, still without a strike. There are few of them, and dropping one (the slow
+	 * lane's answer) on a failure that is not its own would lose a render somebody asked for.
+	 */
+	static async retryBroadFailure(job, renderTarget) {
+		const sourceUrl = job.url;
+		metrics.queueHealth(1, 'broad_failure_retry');
+		if (!job.fold) {
+			logger.debug(`Retrying ${job.rowKey} on its claim lease (broad failure on its route, no strike)`);
+			return 'fast';
+		}
+		const cadence = resolveEffectiveInterval(sourceUrl, renderTarget);
+		const wait = broadRetryWait(cadence);
+		logger.debug(`Retrying ${sourceUrl} in ${Math.round(wait / 60000)}m (broad failure on its route, no strike)`);
+		await writeSchedule(sourceUrl, {
+			nextRenderTime: currentMinuteMs() + wait,
+			fromSitemap: !!renderTarget.sitemapUrl,
+			effectiveInterval: cadence,
+			...(await readMarks(sourceUrl)),
 		});
 		return 'slow';
 	}

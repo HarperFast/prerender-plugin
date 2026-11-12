@@ -643,6 +643,22 @@ certificate (the server-side equivalent of a `host-resolver-rules` / `/etc/hosts
 - With the `debugHeader` also present, a staging-served response is tagged with the
   `x-harper-origin: staging` response header so you can confirm it.
 
+### During an origin outage
+
+Each thing that sends traffic to the origin backs off on the errors of its OWN requests; there is no
+node-wide breaker. An outage is often narrower than the origin (one backend behind one kind of page),
+and a breaker fed by crawler misses would stop price checks and renders that are still succeeding.
+
+| Origin traffic                 | What it does when its requests fail                                                                                                                                                                                                                    |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Renders (the fleet)            | Each render worker halves its render slots and claim size while most of its navigations fail, and adds them back a step at a time (`@harperfast/prerender-browser` `originBackoff`, browser v1.43.0).                                                  |
+| Render failures, in this queue | `render.failureRetry.broadFailure`: while most renders of a route are failing on this node, a failure on it counts no strike and retries after a flat 30 minutes, so an outage does not leave pages backed off for a cadence after the origin is back. |
+| The change probe               | Halves its rate on 429, 502, 503, 504 or a timeout, and ends a pass after `changeProbe.abortAfterDistress` (50) distressed calls in a row.                                                                                                             |
+| Crawler misses                 | Proxied as they arrive: a crawler's request is not ours to drop. `origin.passthroughDeadline` bounds how long one waits for the origin's headers (off by default: check what the CDN in front does with Harper's 5xx first).                           |
+
+Stored pages keep serving until `expiresAt + page.swrTtl` and no longer, outage or not: past that, bots
+get the origin's own answer, as users do.
+
 ### Database topology
 
 Database/table names are fixed. Tables are split across databases by write-transaction coupling —

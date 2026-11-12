@@ -28,6 +28,7 @@ import { startHealthLine } from './src/util/health.js';
 import { keeperHealth } from './src/util/renderSchedule.js';
 import { probeHealth } from './src/util/changeProbe.js';
 import { sitemapHealth } from './src/resources/Sitemap.js';
+import { broadFailureHealth } from './src/util/broadFailure.js';
 
 export async function handleApplication(scope) {
 	await scope.ready;
@@ -137,5 +138,5 @@ export async function handleApplication(scope) {
 	// EVERY worker arms the health line's timer, and whichever claims an interval boundary writes that
 	// node's line (util/health.js) — so a busy or restarting worker cannot hold it back. The sections are
 	// read by the writer, from state each module already keeps.
-	startHealthLine({ keeper: keeperHealth, probe: probeHealth, sitemap: sitemapHealth });
+	startHealthLine({ keeper: keeperHealth, probe: probeHealth, sitemap: sitemapHealth, failures: broadFailureHealth });
 }

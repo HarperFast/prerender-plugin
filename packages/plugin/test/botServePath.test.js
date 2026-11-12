@@ -830,3 +830,97 @@ test('the health line counts each request once, by what answered it — analytic
 		{ req: 5, origin: 3, s5xx: 3, own5xx: 1, originUnreachable: 1 }
 	);
 });
+
+// ── origin.passthroughDeadline: a crawler miss is not held for as long as the origin takes ───────────
+
+// An origin that accepts the request and never answers it. The socket is torn down by whoever gives up first.
+const hang = () => {};
+
+const withDeadline = async (deadline, run) => {
+	try {
+		applyOptions({ ...BASE_OPTIONS, origin: { passthroughDeadline: deadline } });
+		await run();
+	} finally {
+		applyOptions(BASE_OPTIONS);
+	}
+};
+
+test('passthroughDeadline: an origin that sends no headers in time is answered 504, empty and no-store, with no Retry-After', async () => {
+	await withDeadline({ timeout: 150 }, async () => {
+		origin.respond = hang;
+		const started = Date.now();
+		const res = await handleBotRequest(request('/desktop/p/hangs'));
+		const waited = Date.now() - started;
+		assert.equal(res.status, 504);
+		assert.equal(res.headers['cache-control'], 'no-store');
+		assert.equal(res.headers['retry-after'], undefined, 'Retry-After has no defined meaning on a 504');
+		assert.equal(res.body, undefined);
+		assert.ok(waited >= 140 && waited < 2_000, `answered at the deadline, not at the origin's leisure (${waited}ms)`);
+		assert.equal(origin.requests.at(-1).url, '/p/hangs', 'the origin was asked');
+		// The abandoned origin request is torn down, not left holding a socket.
+		for (let i = 0; i < 50 && origin.inFlight > 0; i++) await settle(20);
+		assert.equal(origin.inFlight, 0);
+	});
+});
+
+test('passthroughDeadline: status 503 carries Retry-After in whole seconds, and retryAfter 0 omits it', async () => {
+	origin.respond = hang;
+	await withDeadline({ timeout: 100, status: 503, retryAfter: 90_500 }, async () => {
+		const res = await handleBotRequest(request('/desktop/p/hangs-503'));
+		assert.equal(res.status, 503);
+		assert.equal(res.headers['retry-after'], '91', 'rounded up: a crawler told 90 would come back early');
+		assert.equal(res.headers['cache-control'], 'no-store');
+	});
+	await withDeadline({ timeout: 100, status: 503, retryAfter: 0 }, async () => {
+		const res = await handleBotRequest(request('/desktop/p/hangs-503-bare'));
+		assert.equal(res.status, 503);
+		assert.equal(res.headers['retry-after'], undefined);
+	});
+});
+
+test('passthroughDeadline bounds the wait for HEADERS only: a body that streams past it arrives whole', async () => {
+	await withDeadline({ timeout: 150 }, async () => {
+		origin.respond = (_req, res) => {
+			res.writeHead(200, { 'content-type': 'text/html' });
+			res.write('<html>first half ');
+			setTimeout(() => res.end('second half</html>'), 400);
+		};
+		const res = await handleBotRequest(request('/desktop/p/slow-body', 'GET', { 'accept-encoding': 'identity' }));
+		assert.equal(res.status, 200);
+		assert.equal(await drain(res.body), '<html>first half second half</html>');
+		await settle();
+	});
+});
+
+test('passthroughDeadline off (the default) waits for a slow origin as before', async () => {
+	assert.equal(config.origin.passthroughDeadline.timeout, 0, 'off unless configured: the CDN in front decides');
+	origin.respond = (_req, res) => {
+		setTimeout(() => {
+			res.writeHead(200, { 'content-type': 'text/html' });
+			res.end('<html>late</html>');
+		}, 300);
+	};
+	const res = await handleBotRequest(request('/desktop/p/late', 'GET', { 'accept-encoding': 'identity' }));
+	assert.equal(res.status, 200);
+	assert.equal(await drain(res.body), '<html>late</html>');
+	await settle();
+});
+
+test('the health line files a deadline answer as the origin’s (originUnreachable), counted apart as originDeadline, never own5xx', async () => {
+	const { buildHealthLine } = await import('../src/util/health.js');
+	await withDeadline({ timeout: 100 }, async () => {
+		await buildHealthLine(); // start from zero
+		origin.respond = hang;
+		assert.equal((await handleBotRequest(request('/desktop/p/hangs-counted'))).status, 504);
+		// An origin hanging up outright is unreachable but not a deadline.
+		origin.respond = (req) => req.socket.destroy();
+		assert.equal((await handleBotRequest(request('/desktop/p/gone-counted'))).status, 500);
+
+		const { bot, routes } = await buildHealthLine();
+		assert.equal(bot.s5xx, 2);
+		assert.equal(bot.own5xx, 0);
+		assert.equal(bot.originUnreachable, 2);
+		assert.equal(bot.originDeadline, 1);
+		assert.equal(routes['/p/'].originDeadline, 1);
+	});
+});
