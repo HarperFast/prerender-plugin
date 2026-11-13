@@ -1,0 +1,11 @@
+# Benchmark component for an in-memory queue keeper fed by a RenderSchedule subscription.
+#
+# NOT SHIPPED. A dev harness, declared as its own Harper component so it measures a real Harper storage
+# engine and subscription path. `jsResource`, not `pluginModule`: see bench/queue-index/config.yaml.
+rest: true
+
+graphqlSchema:
+  files: 'schema.graphql'
+
+jsResource:
+  files: 'bench.js'
